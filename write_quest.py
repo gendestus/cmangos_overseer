@@ -6,10 +6,10 @@
     python3 write_quest.py Zachadin --show-context     # print what the model would see; no API call
     python3 write_quest.py Zachadin --dry-run          # call the model, show the quest, apply nothing
 
-What the model decides: the wording, which nearby creature to hunt, how many,
-and the reward, all chosen from lists this script gives it.
-What this script decides: the quest id, the giver, the zone, the levels and the
-XP. It then checks every model choice against the same lists before anything
+What the model decides: the wording, which nearby NPC offers the quest, which
+nearby creature to hunt, how many, and the reward, all chosen from lists this
+script gives it.
+What this script decides: the quest id, the zone, the levels and the XP. It then checks every model choice against the same lists before anything
 is written, and asks you before applying.
 
 Needs ANTHROPIC_API_KEY in the environment or the .env beside this file.
@@ -30,16 +30,17 @@ ISSUED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "issued")
 
 RULES = """You are the Overseer, an unseen dungeon master for a small private World of Warcraft (1.12) server with one to three players. You write short bounty quests that fit where a character is and what they can handle.
 
-Voice: an old, amused, slightly unsettling intelligence that has just started paying attention to this world. The quest giver speaks as its herald. Dry, never jokey, never modern, no mention of games, servers or AI.
+Voice: an old, amused, slightly unsettling intelligence that has just started paying attention to this world. It has no body: it speaks through ordinary people of the world, who become its heralds for a moment. Dry, never jokey, never modern, no mention of games, servers or AI.
 
 Rules:
+- Pick the herald only from the list of nearby NPCs. Choose one who suits the errand, and prefer a nearer one unless the story gains from the walk. Write their lines as that person would speak, with something else behind the words; a guard captain, an innkeeper and a priestess should not sound alike.
 - Pick the hunt target only from the list of nearby creatures. The kill count must not exceed that creature's alive count or the stated maximum.
 - Pick the item reward only from the reward list, or give none. A capstone book is a rare prize: offer one only when the hunt is a real effort for this character.
 - Money must not exceed the stated cap.
 - In quest text, write $N for the character's name and $C for their class. Use each at most twice.
 - Keep it short: title up to 40 characters, briefing 2 to 4 sentences, progress and completion 1 to 3 sentences each.
-- The objectives line states plainly what to kill, how many, and to return to the herald.
-- The announcement is one line the whole server sees. Do not name the character in it."""
+- The objectives line states plainly what to kill, how many, and whom to return to, by the herald's name.
+- The announcement is one line the whole server sees. Name the herald in it, so players know where to go. Do not name the character in it."""
 
 CLOSING = "\n\nRespond by calling the submit_quest tool exactly once. Do not reply with prose."
 
@@ -56,6 +57,7 @@ TOOL = {
             "objectives_text": {"type": "string", "description": "One plain line: what to kill, how many, return to the herald."},
             "progress_text": {"type": "string", "description": "What the herald says if the character returns before finishing."},
             "completion_text": {"type": "string", "description": "What the herald says at turn-in."},
+            "giver": {"type": "integer", "description": "Creature id of the herald, from the nearby NPCs list."},
             "target_creature": {"type": "integer", "description": "Creature id, from the nearby creatures list."},
             "kill_count": {"type": "integer", "description": "How many to kill."},
             "reward_money_copper": {"type": "integer", "description": "Coins to pay, in copper. 100 copper is 1 silver."},
@@ -63,7 +65,7 @@ TOOL = {
             "announcement": {"type": "string", "description": "One server-wide line, up to 120 characters."},
             "dm_note": {"type": "string", "description": "One sentence for the log: why this quest suits this character."},
         },
-        "required": ["title", "briefing", "objectives_text", "progress_text", "completion_text",
+        "required": ["title", "briefing", "objectives_text", "progress_text", "completion_text", "giver",
                      "target_creature", "kill_count", "reward_money_copper", "reward_item",
                      "announcement", "dm_note"],
     },
@@ -84,14 +86,14 @@ def gather(name):
         raise NoContext(f"no character named {name}")
     context = {
         "character": who,
-        "giver": world_query.giver(who),
+        "givers": world_query.givers(who),
         "targets": world_query.targets(who),
         "reward_items": world_query.reward_items(who),
         "money_cap": world_query.money_cap(who["level"]),
         "xp_weight": world_query.xp_weight(who["level"]),
     }
-    if not context["giver"]:
-        raise NoContext("none of the allowed quest givers (DM_GIVERS) is spawned on this character's map")
+    if not context["givers"]:
+        raise NoContext("no living, friendly quest giver was found anywhere on this character's map")
     if not context["targets"]:
         raise NoContext("no suitable creatures alive near this character")
     return context
@@ -101,10 +103,13 @@ def user_message(context, hint, story=None):
     who = context["character"]
     lines = [
         f"Character: {who['name']}, level {who['level']} {who['race_name']} {who['class_name']}.",
-        f"The herald offering the quest: {context['giver']['name']}, {context['giver']['distance']} yards from the character.",
         "",
-        "Nearby creatures (id, name, level, alive now, yards away):",
+        "Nearby NPCs the Overseer may speak through (id, name, role, yards away, direction):",
     ]
+    for g in context["givers"]:
+        role = f", {g['title']}" if g["title"] else ""
+        lines.append(f"- {g['creature']}: {g['name']}{role}, {g['distance']} yards {g['direction']}")
+    lines += ["", "Nearby creatures (id, name, level, alive now, yards away):"]
     for t in context["targets"]:
         level = t["min_level"] if t["min_level"] == t["max_level"] else f"{t['min_level']}-{t['max_level']}"
         lines.append(f"- {t['creature']}: {t['name']}, level {level}, {t['alive']} alive, {t['distance']} yards")
@@ -126,6 +131,9 @@ def build_spec(answer, context, quest_id):
     """Turn the model's answer into a full quest spec, enforcing every rule."""
     who = context["character"]
     by_id = {t["creature"]: t for t in context["targets"]}
+    giver = {g["creature"]: g for g in context["givers"]}.get(answer.get("giver"))
+    if not giver:
+        raise Rejected(f"herald {answer.get('giver')} is not in the nearby NPCs list")
     target = by_id.get(answer.get("target_creature"))
     if not target:
         raise Rejected(f"target {answer.get('target_creature')} is not in the nearby creatures list")
@@ -149,8 +157,8 @@ def build_spec(answer, context, quest_id):
         "zone": who["zone"],
         "min_level": max(1, who["level"] - 2),
         "quest_level": max(who["level"], target["max_level"]),
-        "giver": context["giver"]["creature"],
-        "ender": context["giver"]["creature"],
+        "giver": giver["creature"],
+        "ender": giver["creature"],
         "briefing": answer.get("briefing"),
         "objectives_text": answer.get("objectives_text"),
         "progress_text": answer.get("progress_text"),
@@ -166,6 +174,7 @@ def build_spec(answer, context, quest_id):
         },
     }
     hot_quest.validate(spec)        # raises SpecError on bad text or ranges
+    target = dict(target, giver=giver)          # carried along for display and the DM's records
     return spec, target, announcement
 
 
@@ -177,7 +186,7 @@ def show(spec, target, announcement, answer, context, usage):
 --- Proposed quest {spec['id']} -------------------------------------------
 Title:      {spec['title']}
 For:        {context['character']['name']} (level {context['character']['level']} {context['character']['class_name']})
-Giver:      {context['giver']['name']}, {context['giver']['distance']} yards away
+Herald:     {target['giver']['name']}, {target['giver']['distance']} yards {target['giver']['direction']}
 Hunt:       {spec['kill'][0]['count']} x {target['name']} ({target['alive']} alive, {target['distance']} yards away)
 Reward:     {', '.join(reward)}
 Quest level {spec['quest_level']}, offered from level {spec['min_level']}

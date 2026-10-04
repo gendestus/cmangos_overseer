@@ -10,6 +10,7 @@ talks to the game is tested by hand with the smoke tests in the README.
 import json
 import os
 import sqlite3
+import struct
 import sys
 import tempfile
 import unittest
@@ -20,7 +21,9 @@ os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
 import console          # noqa: E402
 import dm               # noqa: E402
 import dm_state         # noqa: E402
+import factions         # noqa: E402
 import hot_quest        # noqa: E402
+import world_query      # noqa: E402
 import write_quest      # noqa: E402
 
 SPEC = {
@@ -34,7 +37,7 @@ SPEC = {
 CONTEXT = {
     "character": {"guid": 1, "name": "Zachadin", "level": 3, "zone": 12, "class": 2, "race": 1,
                   "race_name": "Human", "class_name": "Paladin"},
-    "giver": {"creature": 4991, "name": "World Shaman Trainer", "distance": 20},
+    "givers": [{"creature": 197, "name": "Marshal McBride", "title": "", "distance": 32, "direction": "east"}],
     "targets": [{"creature": 257, "name": "Kobold Worker", "min_level": 3, "max_level": 3,
                  "spawned": 21, "alive": 9, "distance": 300}],
     "reward_items": [{"item": 111520, "name": "Grimoire of Summon Voidwalker", "required_level": 10}],
@@ -43,16 +46,16 @@ CONTEXT = {
 
 ANSWER = {
     "title": "Teeth in the Dark", "briefing": "Go, $N.", "objectives_text": "Slay 8 Kobold Workers.",
-    "progress_text": "Not yet.", "completion_text": "Done.", "target_creature": 257, "kill_count": 8,
+    "progress_text": "Not yet.", "completion_text": "Done.", "giver": 197, "target_creature": 257, "kill_count": 8,
     "reward_money_copper": 400, "reward_item": None, "announcement": "A bounty is posted.", "dm_note": "fits",
 }
 
 ARC = {
     "premise": "A paladin reaching past the Light.", "lure": "Make a knight who wields death.",
     "adversary": "the Scourge",
-    "beats": [{"level_band": "3-10", "intent": "Test obedience."}, {"level_band": "10-20", "intent": "Turn them."},
-              {"level_band": "20-40", "intent": "Pay it off."}],
-    "signature_reward": "grimoire of death coil iii", "dm_note": "obvious candidate",
+    "beats": [{"level_band": "3-5", "intent": "Test obedience."}, {"level_band": "5-8", "intent": "Turn them."},
+              {"level_band": "8-11", "intent": "Pay it off."}],
+    "signature_reward": "grimoire of death coil iii", "previous_outcome": "", "dm_note": "obvious candidate",
 }
 
 
@@ -85,8 +88,14 @@ class ModelAnswerRules(unittest.TestCase):
     def test_good_answer_becomes_a_spec(self):
         spec, target, announcement = self.build()
         self.assertEqual(spec["kill"], [{"creature": 257, "count": 8}])
-        self.assertEqual(spec["giver"], 4991)
+        self.assertEqual(spec["giver"], 197)                     # the herald the model picked
+        self.assertEqual(spec["ender"], 197)
         self.assertEqual(target["name"], "Kobold Worker")
+        self.assertEqual(target["giver"]["name"], "Marshal McBride")
+
+    def test_herald_must_be_on_the_list(self):
+        with self.assertRaises(write_quest.Rejected):
+            self.build(giver=4991)
 
     def test_target_must_be_on_the_list(self):
         with self.assertRaises(write_quest.Rejected):
@@ -115,9 +124,22 @@ class ArcRules(unittest.TestCase):
         self.assertEqual(arc["signature_reward"], "Grimoire of Death Coil III")
         self.assertEqual(len(arc["beats"]), 3)
 
-    def test_arc_needs_three_to_five_beats(self):
+    def test_mini_arc_needs_two_to_four_beats(self):
+        dm.validate_arc(dict(ARC, beats=ARC["beats"][:2]), self.BOOKS)
         with self.assertRaises(write_quest.Rejected):
-            dm.validate_arc(dict(ARC, beats=ARC["beats"][:2]), self.BOOKS)
+            dm.validate_arc(dict(ARC, beats=ARC["beats"][:1]), self.BOOKS)
+        with self.assertRaises(write_quest.Rejected):
+            dm.validate_arc(dict(ARC, beats=ARC["beats"] + ARC["beats"]), self.BOOKS)
+
+    def test_mini_arc_stays_within_reach_of_the_character(self):
+        dm.validate_arc(ARC, self.BOOKS, level=3)                # bands end at 11, within ten levels of 3
+        with self.assertRaises(write_quest.Rejected):
+            dm.validate_arc(ARC, self.BOOKS, level=0)            # same bands, more than ten levels ahead
+
+    def test_arc_is_outgrown_past_its_last_band(self):
+        arc = {"beats": json.dumps(ARC["beats"])}
+        self.assertFalse(dm.arc_outgrown(arc, 12))
+        self.assertTrue(dm.arc_outgrown(arc, 13))
 
     def test_signature_reward_must_be_on_the_list_or_empty(self):
         with self.assertRaises(write_quest.Rejected):
@@ -128,6 +150,58 @@ class ArcRules(unittest.TestCase):
         beats = [dict(ARC["beats"][0], level_band="early")] + ARC["beats"][1:]
         with self.assertRaises(write_quest.Rejected):
             dm.validate_arc(dict(ARC, beats=beats), self.BOOKS)
+
+
+class FriendOrFoe(unittest.TestCase):
+    """The faction logic, against a tiny hand-built pair of data files."""
+
+    @classmethod
+    def setUpClass(cls):
+        folder = tempfile.mkdtemp()
+
+        def write(name, fields, rows):
+            body = b"".join(struct.pack(f"<{fields}I", *row) for row in rows)
+            with open(os.path.join(folder, name), "wb") as handle:
+                handle.write(b"WDBC" + struct.pack("<4I", len(rows), fields, fields * 4, 1) + body + b"\0")
+
+        # id, faction, flags, our mask, friend mask, enemy mask, 4 enemy factions, 4 friend factions
+        write("FactionTemplate.dbc", 14, [
+            (1, 1, 0, 3, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0),       # Human player
+            (2, 2, 0, 5, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0),       # Orc player
+            (12, 72, 0, 2, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0),     # Stormwind townsfolk
+            (14, 14, 0, 8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0),     # monster: enemy of all players
+            (35, 35, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0),     # friendly to everyone
+            (120, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),    # neutral town: neither friend nor foe
+            (900, 900, 0, 2, 2, 4, 1, 0, 0, 0, 0, 0, 0, 0),   # looks Alliance but lists Humans as enemies
+        ])
+        write("ChrRaces.dbc", 3, [(1, 0, 1), (2, 0, 2)])
+        cls.tables = factions.Factions.load(folder)
+
+    def test_city_faction_is_friend_to_one_side_and_foe_to_the_other(self):
+        self.assertTrue(self.tables.is_friendly(12, 1))
+        self.assertFalse(self.tables.is_hostile(12, 1))
+        self.assertTrue(self.tables.is_hostile(12, 2))
+
+    def test_monsters_are_hostile_and_friendly_to_all_is_friendly(self):
+        self.assertTrue(self.tables.is_hostile(14, 1) and self.tables.is_hostile(14, 2))
+        self.assertTrue(self.tables.is_friendly(35, 1) and self.tables.is_friendly(35, 2))
+
+    def test_neutral_is_neither(self):
+        self.assertFalse(self.tables.is_hostile(120, 1))
+        self.assertFalse(self.tables.is_friendly(120, 1))
+
+    def test_an_explicit_enemy_entry_beats_the_masks(self):
+        self.assertTrue(self.tables.is_hostile(900, 1))
+        self.assertFalse(self.tables.is_friendly(900, 1))
+
+    def test_unknown_template_is_unknown(self):
+        self.assertIsNone(self.tables.is_hostile(424242, 1))
+
+    def test_compass_bearing(self):
+        here = {"x": 0.0, "y": 0.0}                              # +x is north, +y is west
+        self.assertEqual(world_query.bearing(here, 100, 0), "north")
+        self.assertEqual(world_query.bearing(here, 0, -100), "east")
+        self.assertEqual(world_query.bearing(here, -100, 100), "south-west")
 
 
 class ConsoleAllowList(unittest.TestCase):

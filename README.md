@@ -8,8 +8,8 @@ It runs beside a [cmangos-deploy](https://github.com/mserajnik/cmangos-deploy) s
 
 1. **Observe.** A tick forces a save and reads the game databases: who is online, where, what they finished, who they are grouped with.
 2. **Remember.** Anything new goes into the DM's own memory file, `state.db`: a chronicle per character, every bounty and how it ended, and a running story summary.
-3. **Plan.** The first time a character is noticed, the model writes a private arc for them: what the Overseer wants them to become, the enemy the story turns toward, and three to five beats. Every bounty after that serves the arc.
-4. **Propose.** When a character has no bounty out, the model is given the arc, the story so far, and real nearby creatures and rewards, and writes the next bounty. The proposal is stored, not applied.
+3. **Plan.** The first time a character is noticed, the model writes a private mini-arc for them: what the Overseer wants them to become over the next few levels, the enemy the story turns toward, and two to four beats. When an arc ends, the next is planned from how it actually went, so the story can turn.
+4. **Propose.** When a character has no bounty out, the model is given the arc, the story so far, and real nearby NPCs, creatures and rewards. It picks which NPC the Overseer speaks through, writes the bounty, and the proposal is stored, not applied.
 5. **Approve.** You review and approve. Only then is the quest written to the game, reloaded through the server's remote console, and announced.
 
 One bounty at a time: a character with a bounty offered or accepted gets no new proposal. An accepted bounty never expires; one nobody accepts is dropped after a day.
@@ -30,6 +30,7 @@ By default nothing reaches the game without `approve`. `DM_AUTO_APPROVE` can swi
 | `dm.py` | The loop and its commands: `tick`, `run`, `pending`, `approve`, `reject`, `story`, `arc`, `context` |
 | `dm_state.py` | The memory file (`state.db`): schema, upgrades, helpers |
 | `world_query.py` | Read-only questions to the game databases |
+| `factions.py` | Friend or foe, read from the server's extracted faction files |
 | `write_quest.py` | One-off: have the model write a bounty for a character, without the story loop |
 | `llm.py` | The only place that calls a model. Add a provider here to switch models |
 | `hot_quest.py` | Checks a quest spec and renders it to SQL |
@@ -38,7 +39,7 @@ By default nothing reaches the game without `approve`. `DM_AUTO_APPROVE` can swi
 | `env.example` | Template for `.env` |
 | `test_quest.json` and the two `test_quest_*.sql` | A fixed quest for smoke-testing the pipeline without a model |
 | `tests/test_offline.py` | Checks that need no server: `python3 -m unittest discover tests` |
-| `server/` | Copies of the two custom-sql files the DM depends on (see step 1) |
+| `server/` | Copies of custom-sql files from the game server (see step 1) |
 | `docs/ai_dm_spec.md` | Design spec |
 | `docs/dev_plan.md` | What is built and what is next |
 
@@ -48,14 +49,11 @@ Not in git: `.env` (secrets), `state.db` (the story), `issued/` (records from `w
 
 Do these in order. Paths assume the server lives in `~/cmangos-deploy`.
 
-### 1. Game content the DM depends on
+### 1. Game content (optional)
 
-Copy both files in `server/` into `~/cmangos-deploy/storage/classic/database/custom-sql/`:
+The DM needs nothing custom to run: it offers bounties through NPCs that are already in the world and pays in gold.
 
-- `npc_spawns.sql` places the World Shaman Trainer (creature 4991) in Northshire. He is the DM's quest giver.
-- `spell_books.sql` creates the capstone spell books the DM offers as rewards. It is a generated file; do not edit it by hand.
-
-`npc_spawns.sql` also places the book vendors, which `spell_books.sql` defines, and one prototype vendor (creature 90000) from an older script. On a server without that older script, delete the 90000 line.
+To let it hand out capstone spell books as rewards, copy `server/spell_books.sql` into `~/cmangos-deploy/storage/classic/database/custom-sql/`. It is a generated file; do not edit it by hand. `server/npc_spawns.sql` places the book vendors that file defines, and is not needed by the DM.
 
 ### 2. Turn on the remote console
 
@@ -106,6 +104,7 @@ Run these in order. Each one tests one more link in the chain.
 
 ```
 python3 -m unittest discover tests               # the rules, with no server involved
+python3 factions.py                              # the faction files are readable and make sense
 python3 console.py "server info"                 # the remote console answers
 python3 world_query.py <Character>               # the database is readable
 python3 apply_quest.py test_quest.json           # a fixed quest goes live
@@ -113,7 +112,7 @@ python3 apply_quest.py test_quest.json --remove  # and comes down again
 python3 write_quest.py <Character> --dry-run     # the model writes a quest; nothing applied
 ```
 
-`<Character>` must be an existing character on the same continent as the quest giver.
+`factions.py` prints how seven well-known factions treat a Human and an Orc, with the answers to expect. `world_query.py` lists the nearby NPCs the DM could speak through. The fixed test quest is offered by Marshal McBride in Northshire, so it needs an Alliance character to take it.
 
 ### 6. Run it
 
@@ -145,7 +144,7 @@ python3 dm.py run --every 300
 | `dm.py approve <n>` | Put proposal `n` into effect |
 | `dm.py reject <n> "reason"` | Discard it. The reason is passed to the model next time |
 | `dm.py story <Character>` | The chronicle: story so far, bounties and how each ended, events |
-| `dm.py arc <Character>` | The Overseer's private plan. A spoiler if you play that character |
+| `dm.py arc <Character>` | The arc in force and the ones that have ended. A spoiler if you play that character |
 | `dm.py arc <Character> --seed "..."` | Have a new arc written around your direction |
 | `dm.py context <Character>` | Exactly what the model would be told next. No model call |
 
@@ -175,7 +174,7 @@ All settings are read from the environment, or from `.env` in this folder.
 | `DM_COMPOSE_DIR` | `~/cmangos-deploy` | Folder holding `compose.yaml` |
 | `ANTHROPIC_API_KEY` | none | Claude API key |
 | `DM_MODEL` | `claude-sonnet-5-5` | Model that writes quests |
-| `DM_GIVERS` | `4991` | Creature ids allowed to hand out DM quests, comma separated |
+| `DM_DBC_DIR` | inside `DM_COMPOSE_DIR` | Folder of the server's extracted `.dbc` files |
 | `DM_COOLDOWN_MINUTES` | `20` | Wait after a bounty ends before proposing the next |
 | `DM_STALE_HOURS` | `24` | An offered bounty nobody accepts is dropped after this |
 | `DM_MAX_PROPOSALS_HOUR` | `6` | Ceiling on model calls per hour |
@@ -204,11 +203,11 @@ Known gap: the scripts reach the database as its root user through the container
 
 ## Known limits
 
-- **One quest giver.** Only the World Shaman Trainer in Northshire, so a character elsewhere on the continent has to walk to him. Characters on the other continent get no proposal.
+- **Heralds are existing quest NPCs.** A bounty is offered through a living NPC that already gives quests, has a single spawn, and is not hostile to the character. The search widens from 300 yards until it finds some. An NPC that is not a quest giver cannot be used without a server restart.
 - **Bounties are visible to everyone** at the giver, not only the character they were written for. The chronicle records who actually completed each one.
 - **Quest markers are not pushed.** A player already standing near the giver will not see the "!" for a new quest until the NPC comes back into view. Every bounty is announced for this reason.
 - **A tick is a sample.** Company during a hunt is whoever was grouped or nearby when a tick ran. The server does not record who landed a kill.
-- **"Hostile" is a heuristic.** The target search filters out guards, vendors and city factions by rule. Approval is the backstop.
+- **Friend or foe comes from the game's own faction files.** If they cannot be read, the DM falls back to rough rules: only "friendly to all" NPCs as heralds, and city factions excluded as targets.
 - **Zone names** come from a built-in table of about 45 zones. Others show as "zone 123".
 
 ## Troubleshooting
@@ -218,7 +217,8 @@ Known gap: the scripts reach the database as its root user through the container
 | `Unavailable: cannot reach http://127.0.0.1:7878/` | Remote console off, port not mapped, or server down (step 2) |
 | `AuthFailed: server rejected the account name or password` | Wrong `DM_SOAP_USER` or `DM_SOAP_PASS` |
 | `AuthFailed: account level is too low` | The account is not level 3 (step 3) |
-| `none of the allowed quest givers (DM_GIVERS) is spawned on this character's map` | `npc_spawns.sql` not installed, or the character is on the other continent |
+| `no living, friendly quest giver was found anywhere on this character's map` | The faction files could not be read (run `factions.py`), or the character is inside an instance |
+| `factions: cannot read the faction files` | `DM_DBC_DIR` or `DM_COMPOSE_DIR` points at the wrong place |
 | `no suitable creatures alive near this character` | Nothing at the right level within 400 yards, or the area is hunted out under long respawns |
 | `preflight found a problem; nothing was written` | The spec points at a creature or item that does not exist on this server |
 | `Claude API returned HTTP 401` | Missing or wrong `ANTHROPIC_API_KEY` |

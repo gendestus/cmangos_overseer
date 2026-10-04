@@ -13,7 +13,11 @@
 
 One bounty at a time: a character with a bounty offered or accepted gets no new proposal.
 An accepted bounty never expires; one that is never accepted is dropped after DM_STALE_HOURS.
-A character gets an arc before their first bounty, and every bounty after serves it.
+A character gets a mini-arc before their first bounty, and every bounty serves the arc in force.
+A mini-arc covers a few levels. It ends when its finale is turned in or the character outgrows
+it, and the next one is planned from how it ended.
+Quest givers are not configured: each bounty is offered through a nearby friendly NPC the model
+picks from a list built from the live world.
 
 Unless you set DM_AUTO_APPROVE, a tick never puts a quest live. It only:
   - forces a save and reads the game databases,
@@ -59,7 +63,7 @@ Continuity:
 - If the character ignored or was slow with the last bounty, the Overseer has noticed.
 - Other named characters in these notes are real players. When someone helped this character, was helped by them, or claimed a bounty meant for them, use it: the Overseer notices alliances and debts. Name them plainly in the text. Never invent a player.
 - You may have a private arc for this character (shown below when there is one). Each bounty should serve its current beat: nudge toward the lure, bring the adversary closer, foreshadow the signature reward. Do it through what the herald says and what is hunted. Never state the plan to the player. If nothing nearby fits the beat, keep the thread alive in the text.
-- beat_progress: "advance" if this bounty begins the next beat because the character has done enough or outgrown the level band, "hold" to stay on the current beat, "detour" if this bounty steps aside from the arc because of something the character did. With no arc, answer "hold".
+- beat_progress: "advance" if this bounty begins the next beat because the character has done enough or outgrown the level band, "hold" to stay on the current beat, "detour" if this bounty steps aside from the arc because of something the character did, "conclude" if this bounty is the arc's finale. Use "conclude" only on the last beat: turning it in ends the arc, so make it a payoff or a twist, and offer the signature reward if it is on the reward list. With no arc, answer "hold".
 - story_beat: one sentence, past tense, the Overseer's view of what this bounty adds to the story.
 - story_so_far: rewrite the running summary in at most 120 words: who this character is becoming in the Overseer's eyes, what has happened, and one or two open threads. It is your only memory next time, so keep what matters and drop what does not."""
 
@@ -71,21 +75,22 @@ TOOL["input_schema"]["properties"]["story_beat"] = {
 TOOL["input_schema"]["properties"]["story_so_far"] = {
     "type": "string", "description": "The rewritten running summary, at most 120 words."}
 TOOL["input_schema"]["properties"]["beat_progress"] = {
-    "type": "string", "enum": ["advance", "hold", "detour"],
+    "type": "string", "enum": ["advance", "hold", "detour", "conclude"],
     "description": "How this bounty relates to the arc's current beat."}
 TOOL["input_schema"]["required"] += ["story_beat", "story_so_far", "beat_progress"]
 
-ARC_SYSTEM = """You are the Overseer, an unseen dungeon master for a small private World of Warcraft (1.12) server with one to three players. You have just taken notice of a character, and you are deciding in secret what you want to make of them.
+ARC_SYSTEM = """You are the Overseer, an unseen dungeon master for a small private World of Warcraft (1.12) server with one to three players. You are deciding in secret what you want to make of one character next.
 
-Write an arc: a private plan for where to lead this character across many bounties.
+Write a mini-arc: a short private plan that covers only the next few levels, about four to eight. A character's story is a chain of these. Each one ends, and what happened in it shapes the next, so the story can twist.
 
-- premise: one or two sentences on what the Overseer sees in this character.
-- lure: what you want them to become or to do. It can tempt, corrupt, ennoble or test, and it should be specific to their race and class.
-- adversary: one enemy group or kind of creature from Azeroth as it is in 1.12 that the story will turn toward. It must suit the levels ahead of this character and be reachable for their faction.
-- beats: three to five steps. Each has a level band such as "1-10" and one sentence of intent. The first beat starts at the character's current level, the beats escalate, and the last is a payoff.
-- signature_reward: the name of one book from the list given, or an empty string. It is the power the arc builds toward. Prefer a power that is not the character's own by class when it fits the lure.
+- premise: one or two sentences on what the Overseer sees in this character now.
+- lure: what you want them to become or to do in this stretch. It can tempt, corrupt, ennoble or test, and it should be specific to their race and class.
+- adversary: one enemy group or kind of creature from Azeroth as it is in 1.12 that this stretch turns toward. It must suit the levels just ahead and be reachable for their faction.
+- beats: two to four steps. Each has a level band such as "6-9" and one sentence of intent. The first beat starts at the character's current level, the bands stay within about eight levels of it, and the last beat is a payoff or a twist that leaves a hook for whatever comes next.
+- signature_reward: the name of one book from the list given, or an empty string. It is the prize of this arc. Prefer a power that is not the character's own by class when it fits the lure.
+- previous_outcome: if an earlier arc has just ended, one or two sentences on how it actually ended, judged from the record of its bounties and not from how it was planned. Otherwise an empty string.
+- If earlier arcs exist, this one must follow from their outcomes. Do not repeat an adversary unless the story calls for a return. A turn is welcome: an ally revealed as a rival, a victory with a cost, a temptation refused.
 - If the server owner gives a direction, build the arc around it.
-- If the character already has a history, the arc must fit what has happened.
 
 This plan is never shown to the player.
 
@@ -93,30 +98,33 @@ Respond by calling the submit_arc tool exactly once. Do not reply with prose."""
 
 ARC_TOOL = {
     "name": "submit_arc",
-    "description": "Submit the private arc for this character.",
+    "description": "Submit the private mini-arc for this character.",
     "input_schema": {
         "type": "object",
         "properties": {
             "premise": {"type": "string", "description": "One or two sentences."},
             "lure": {"type": "string", "description": "What the Overseer wants this character to become or do."},
-            "adversary": {"type": "string", "description": "The enemy group the story turns toward."},
+            "adversary": {"type": "string", "description": "The enemy group this stretch turns toward."},
             "beats": {
-                "type": "array", "minItems": 3, "maxItems": 5,
+                "type": "array", "minItems": 2, "maxItems": 4,
                 "items": {
                     "type": "object",
                     "properties": {
-                        "level_band": {"type": "string", "description": "Levels this beat covers, like 10-20."},
+                        "level_band": {"type": "string", "description": "Levels this beat covers, like 6-9."},
                         "intent": {"type": "string", "description": "One sentence: what this step does."},
                     },
                     "required": ["level_band", "intent"],
                 },
             },
             "signature_reward": {"type": "string", "description": "A book name from the list, or an empty string."},
+            "previous_outcome": {"type": "string", "description": "How the arc that just ended actually ended, or an empty string."},
             "dm_note": {"type": "string", "description": "One sentence for the log: why this arc for this character."},
         },
-        "required": ["premise", "lure", "adversary", "beats", "signature_reward", "dm_note"],
+        "required": ["premise", "lure", "adversary", "beats", "signature_reward", "previous_outcome", "dm_note"],
     },
 }
+
+ARC_REACH = 10          # an arc's bands and its signature reward stay within this many levels of the character
 
 BEAT_STATE = ("done", "current", "later")
 
@@ -307,6 +315,11 @@ def observe_bounties(db, players, progress, say):
             say(f"    how it ended: {ended}")
             if not quest["retired_at"]:
                 retire(db, quest, say)
+            finale = db.execute("SELECT * FROM arcs WHERE id = ? AND status = 'active'",
+                                (quest["concludes_arc"],)).fetchone() if quest["concludes_arc"] else None
+            if finale:
+                dm_state.end_arc(db, finale, "resolved")
+                say(f"  {row['name']}: the arc against {finale['adversary']} has ended; a new one will be planned")
 
     stale = dm_state.now() - int(setting("DM_STALE_HOURS", 24) * 3600)
     for quest in db.execute("SELECT * FROM quests WHERE status = 'offered' AND issued_at < ?", (stale,)).fetchall():
@@ -360,8 +373,9 @@ def story_section(db, who):
                 "offered": "posted, not yet accepted",
                 "ignored": "ignored; it expired unaccepted",
             }[quest["status"]]
-            lines.append(f"- \"{quest['title']}\" ({hunt}), posted {dm_state.ago(quest['issued_at'])} ago: {outcome}. "
-                         f"Beat: {quest['story_beat']}")
+            through = f", offered through {quest['giver']}" if quest["giver"] else ""
+            lines.append(f"- \"{quest['title']}\" ({hunt}){through}, posted {dm_state.ago(quest['issued_at'])} ago: "
+                         f"{outcome}. Beat: {quest['story_beat']}")
             if quest["circumstances"]:
                 lines.append(f"  How it ended: {quest['circumstances']}")
         lines.append("")
@@ -387,6 +401,9 @@ def story_section(db, who):
     else:
         lines.append("- nothing new")
 
+    saga = saga_lines(db, who["guid"])
+    if saga:
+        lines += ["", "Earlier arcs, now ended, oldest first:"] + saga
     arc = dm_state.active_arc(db, who["guid"])
     if arc:
         lines += ["", arc_text(arc, "Your private arc for this character (never state it to the player):")]
@@ -411,36 +428,69 @@ def arc_text(arc, heading):
     return "\n".join(lines)
 
 
-def validate_arc(answer, book_names):
+def validate_arc(answer, book_names, level=None):
     """Check the model's arc and return it in stored form. Raises write_quest.Rejected."""
     arc = {}
-    for field, limit in (("premise", 400), ("lure", 300), ("adversary", 120)):
+    for field, limit in (("premise", 400), ("lure", 400), ("adversary", 120)):
         text = " ".join(str(answer.get(field, "")).split())
         if not text or len(text) > limit:
             raise write_quest.Rejected(f"arc {field} is missing or over {limit} characters")
         arc[field] = text
     beats = answer.get("beats")
-    if not isinstance(beats, list) or not 3 <= len(beats) <= 5:
-        raise write_quest.Rejected("an arc needs three to five beats")
+    if not isinstance(beats, list) or not 2 <= len(beats) <= 4:
+        raise write_quest.Rejected("a mini-arc needs two to four beats")
     arc["beats"] = []
     for beat in beats:
         band = "".join(str(beat.get("level_band", "")).split()) if isinstance(beat, dict) else ""
         intent = " ".join(str(beat.get("intent", "")).split()) if isinstance(beat, dict) else ""
         if not re.fullmatch(r"\d{1,2}-\d{1,2}", band) or not intent or len(intent) > 300:
-            raise write_quest.Rejected("each beat needs a level band like 10-20 and one sentence of intent")
+            raise write_quest.Rejected("each beat needs a level band like 6-9 and one sentence of intent")
+        low, high = (int(part) for part in band.split("-"))
+        if low > high or (level is not None and high > level + ARC_REACH):
+            raise write_quest.Rejected(f"beat band {band} runs backwards or reaches more than {ARC_REACH} levels ahead")
         arc["beats"].append({"level_band": band, "intent": intent})
     wanted = " ".join(str(answer.get("signature_reward", "")).split())
     by_lower = {name.lower(): name for name in book_names}
     if wanted and wanted.lower() not in by_lower:
         raise write_quest.Rejected(f"signature reward \"{wanted}\" is not one of the books on the list")
     arc["signature_reward"] = by_lower.get(wanted.lower(), "")
+    arc["previous_outcome"] = " ".join(str(answer.get("previous_outcome", "")).split())[:500]
     arc["dm_note"] = " ".join(str(answer.get("dm_note", "")).split())
     return arc
+
+
+def saga_lines(db, guid):
+    """Earlier arcs as short lines: what was planned and how each ended."""
+    lines = []
+    for arc in dm_state.past_arcs(db, guid):
+        ended = {"resolved": "its finale was turned in", "outgrown": "the character outgrew it unfinished",
+                 "replaced": "the server owner replaced it"}.get(arc["end_reason"], "it ended")
+        lines.append(f"- Against {arc['adversary']}: {arc['lure']} Ended: {ended}."
+                     + (f" Outcome: {arc['outcome']}" if arc["outcome"] else ""))
+    return lines
 
 
 def arc_message(db, who, books, seed):
     known = dm_state.get_character(db, who["guid"])
     lines = [f"Character: {world_query.describe(who)}, currently in {world_query.zone_name(who['zone'])}.", ""]
+
+    saga = saga_lines(db, who["guid"])
+    if saga:
+        lines += ["Earlier arcs for this character, oldest first:"] + saga + [""]
+        last = dm_state.past_arcs(db, who["guid"])[-1]
+        if not last["outcome"]:
+            lines.append("The arc that just ended, as planned:")
+            lines.append(arc_text(last, "(write previous_outcome for this one)"))
+            during = db.execute("SELECT * FROM quests WHERE guid = ? AND issued_at >= ? ORDER BY issued_at",
+                                (who["guid"], last["created_at"])).fetchall()
+            lines.append("What actually happened in its bounties:")
+            for quest in during:
+                how = quest["circumstances"] or f"status: {quest['status']}"
+                lines.append(f"- \"{quest['title']}\" ({quest['target']}). Beat: {quest['story_beat']} {how}")
+            if not during:
+                lines.append("- no bounty was posted under it")
+            lines.append("")
+
     events = dm_state.events_since(db, who["guid"], 0, limit=30)
     lines.append("What you know of them so far:")
     lines += [f"- {event['text'].split(' [')[0]}" for event in events] or ["- nothing yet"]
@@ -460,9 +510,9 @@ def arc_message(db, who, books, seed):
 
 def propose_arc(db, who, seed, say):
     """Ask the model for an arc and store it as a proposal. Returns the proposal number."""
-    books = world_query.reward_items(who, reach=60, limit=40)
+    books = world_query.reward_items(who, reach=ARC_REACH, limit=40)
     answer, usage = llm.ask_for_tool_call(ARC_SYSTEM, arc_message(db, who, books, seed), ARC_TOOL, max_tokens=4096)
-    arc = validate_arc(answer, [book["name"] for book in books])
+    arc = validate_arc(answer, [book["name"] for book in books], who["level"])
     arc["seed"] = seed or ""
     db.execute("INSERT INTO proposals (ts, guid, name, type, payload, dm_note, model, tokens_in, tokens_out) "
                "VALUES (?, ?, ?, 'arc', ?, ?, ?, ?, ?)",
@@ -471,6 +521,12 @@ def propose_arc(db, who, seed, say):
     number = db.execute("SELECT last_insert_rowid()").fetchone()[0]
     say(f"  {who['name']}: arc proposal {number} written (adversary: {arc['adversary']})")
     return number
+
+
+def arc_outgrown(arc, level):
+    """Has the character levelled past the arc's last beat?"""
+    last_band = json.loads(arc["beats"])[-1]["level_band"]
+    return level > int(last_band.split("-")[1]) + 1
 
 
 def wants_bounty(db, who):
@@ -500,10 +556,19 @@ def propose(db, who, say):
         raise write_quest.Rejected("the model left out the story beat or the story summary")
     if len(summary.split()) > 160:
         raise write_quest.Rejected("the story summary is far over 120 words")
-    progress = answer.get("beat_progress") if answer.get("beat_progress") in ("advance", "hold", "detour") else "hold"
+    progress = answer.get("beat_progress")
+    if progress not in ("advance", "hold", "detour", "conclude"):
+        progress = "hold"
+    arc = dm_state.active_arc(db, who["guid"])
+    payload = {"beat_progress": progress}
+    if progress == "conclude":
+        if arc and arc["current_beat"] >= len(json.loads(arc["beats"])) - 1:
+            payload["concludes_arc"] = arc["id"]
+        else:
+            payload["beat_progress"] = "hold"       # a finale before the last beat is just another bounty
     db.execute("INSERT INTO proposals (ts, guid, name, type, payload, spec, target, announcement, dm_note, story_beat, "
                "story_so_far, model, tokens_in, tokens_out) VALUES (?, ?, ?, 'bounty', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-               (dm_state.now(), who["guid"], who["name"], json.dumps({"beat_progress": progress}), json.dumps(spec),
+               (dm_state.now(), who["guid"], who["name"], json.dumps(payload), json.dumps(spec),
                 json.dumps(target), announcement, answer.get("dm_note", ""), beat, summary, usage.get("model"),
                 usage.get("input_tokens"), usage.get("output_tokens")))
     number = db.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -516,8 +581,12 @@ def approve_proposal(db, row, say):
     stamp = dm_state.now()
     if row["type"] == "arc":
         arc = json.loads(row["payload"])
-        db.execute("UPDATE arcs SET status = 'superseded', updated_at = ? WHERE guid = ? AND status = 'active'",
-                   (stamp, row["guid"]))
+        in_force = dm_state.active_arc(db, row["guid"])
+        if in_force:                                    # a reseed replaces the arc in force
+            dm_state.end_arc(db, in_force, "replaced")
+        ended = dm_state.past_arcs(db, row["guid"])
+        if ended and not ended[-1]["outcome"] and arc.get("previous_outcome"):
+            db.execute("UPDATE arcs SET outcome = ? WHERE id = ?", (arc["previous_outcome"], ended[-1]["id"]))
         db.execute("INSERT INTO arcs (guid, premise, lure, adversary, beats, signature_reward, seed, model, "
                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                    (row["guid"], arc["premise"], arc["lure"], arc["adversary"], json.dumps(arc["beats"]),
@@ -536,15 +605,18 @@ def approve_proposal(db, row, say):
     except console.ConsoleError as error:
         say(f"warning: the quest is in the database but the console step failed: {error}\n"
             f"  Run `.reload all_quest` in game to load it.")
-    db.execute("INSERT INTO quests (quest, guid, title, target, spec, announcement, dm_note, story_beat, model, "
-               "issued_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-               (spec["id"], row["guid"], spec["title"], json.loads(row["target"])["name"], json.dumps(spec),
-                row["announcement"], row["dm_note"], row["story_beat"], row["model"], stamp))
+    target = json.loads(row["target"])
+    payload = json.loads(row["payload"] or "{}")
+    db.execute("INSERT INTO quests (quest, guid, title, target, giver, concludes_arc, spec, announcement, dm_note, "
+               "story_beat, model, issued_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               (spec["id"], row["guid"], spec["title"], target["name"], (target.get("giver") or {}).get("name"),
+                payload.get("concludes_arc"), json.dumps(spec), row["announcement"], row["dm_note"],
+                row["story_beat"], row["model"], stamp))
     db.execute("UPDATE characters SET story_so_far = ? WHERE guid = ?", (row["story_so_far"], row["guid"]))
     db.execute("UPDATE proposals SET status = 'approved', decided_at = ? WHERE id = ?", (stamp, row["id"]))
     dm_state.add_event(db, row["guid"], "overseer", f"the Overseer posted the bounty \"{spec['title']}\"")
     arc = dm_state.active_arc(db, row["guid"])
-    progress = json.loads(row["payload"] or "{}").get("beat_progress", "hold")
+    progress = payload.get("beat_progress", "hold")
     if arc and progress == "advance":
         last = len(json.loads(arc["beats"])) - 1
         db.execute("UPDATE arcs SET current_beat = ?, updated_at = ? WHERE id = ?",
@@ -588,6 +660,11 @@ def tick(db, say=print):
     ceiling = setting("DM_MAX_PROPOSALS_HOUR", 6)
     for who in players:
         try:
+            # A mini-arc the character has levelled past is closed, so the next one can be planned.
+            arc = dm_state.active_arc(db, who["guid"])
+            if arc and not dm_state.open_quest(db, who["guid"]) and arc_outgrown(arc, who["level"]):
+                dm_state.end_arc(db, arc, "outgrown")
+                say(f"  {who['name']}: outgrew the arc against {arc['adversary']}; a new one will be planned")
             # An arc comes first: no bounty is written for a character without an approved plan.
             if not dm_state.active_arc(db, who["guid"]):
                 if dm_state.pending_proposal(db, who["guid"], "arc"):
@@ -630,9 +707,12 @@ def show_proposal(row):
     spec, target = json.loads(row["spec"]), json.loads(row["target"])
     reward = [f"{spec['reward']['money_copper']} copper"] + [f"item {i['item']}" for i in spec["reward"]["items"]]
     progress = json.loads(row["payload"] or "{}").get("beat_progress", "hold")
+    giver = target.get("giver")
+    herald = f"{giver['name']}, {giver['distance']} yards {giver['direction']}" if giver else "unknown"
     print(f"""
 === Proposal {row['id']}: BOUNTY for {row['name']}  ({dm_state.ago(row['ts'])} ago, {row['status']}) ===
 Title:    {spec['title']}
+Herald:   {herald}
 Hunt:     {spec['kill'][0]['count']} x {target['name']} ({target['alive']} alive when written)
 Reward:   {', '.join(reward)}
 Briefing:
@@ -680,7 +760,7 @@ def cmd_reject(db, args):
 
 
 def cmd_arc(db, args):
-    """Show a character's arc, or have a new one written from a direction of yours."""
+    """Show a character's arcs, or have a new one written from a direction of yours."""
     who = world_query.character(args.character)
     if not who:
         sys.exit(f"dm: no character named {args.character}")
@@ -696,11 +776,16 @@ def cmd_arc(db, args):
             sys.exit(f"dm: no arc written: {error}")
         db.commit()
         return
+    print(f"=== Arcs for {who['name']} (spoilers if you play this character) ===")
+    saga = saga_lines(db, who["guid"])
+    if saga:
+        print("\nEnded, oldest first:")
+        print("\n".join(saga))
     arc = dm_state.active_arc(db, who["guid"])
     if not arc:
-        print("no arc in force. One is written on the next tick, or give a direction with --seed.")
+        print("\nNo arc in force. One is written on the next tick, or give a direction with --seed.")
         return
-    print(arc_text(arc, f"=== Arc for {who['name']} (a spoiler if you play this character) ==="))
+    print("\n" + arc_text(arc, "In force:"))
     if arc["seed"]:
         print(f"Your direction: {arc['seed']}")
 

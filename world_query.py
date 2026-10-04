@@ -10,9 +10,10 @@ Settings (environment or the .env beside this file):
     DM_COMPOSE_DIR        folder holding compose.yaml (default ~/cmangos-deploy)
     DM_DB_QUERY_COMMAND   command that reads SQL on stdin and prints raw rows;
                           default runs the mariadb client in the database container
-    DM_GIVERS             creature ids allowed to hand out DM quests (default 4991)
+    DM_DBC_DIR            folder of extracted .dbc files, for friend-or-foe checks (see factions.py)
 """
 import json
+import math
 import os
 import re
 import shlex
@@ -20,6 +21,7 @@ import subprocess
 import sys
 
 import console
+import factions
 import hot_quest
 
 DEFAULT_QUERY_COMMAND = (
@@ -34,9 +36,9 @@ CLASSES = {1: "Warrior", 2: "Paladin", 3: "Hunter", 4: "Rogue", 5: "Priest", 7: 
 # Creature types never offered as kill targets: critters, totems, vanity pets.
 SKIP_CREATURE_TYPES = (8, 11, 12)
 GUARD_FLAG = 1024
-# Faction templates of the player cities and "friendly to all". The database
-# has no hostility table, so this list plus the guard flag is a heuristic; the
-# human approval step is the backstop.
+# Faction templates of the player cities and "friendly to all". Used only when
+# the game's faction files cannot be read (see factions.py); with them, friend
+# or foe is decided exactly, per race.
 PLAYER_FACTIONS = (11, 12, 35, 53, 55, 57, 64, 79, 80, 84, 85, 29, 68, 71, 98, 104, 105, 118, 122, 126, 875, 876, 877)
 
 
@@ -76,15 +78,26 @@ def character(name):
     return who
 
 
+def bearing(who, x, y):
+    """Compass direction from the character to a point. In this game +x is north and +y is west."""
+    north, west = x - who["x"], y - who["y"]
+    if abs(north) < 1 and abs(west) < 1:
+        return "here"
+    angle = math.degrees(math.atan2(-west, north)) % 360          # 0 = north, 90 = east
+    return ("north", "north-east", "east", "south-east", "south", "south-west", "west", "north-west")[
+        int((angle + 22.5) // 45) % 8]
+
+
 def targets(who, radius=400, below=3, above=2, limit=12):
-    """Hostile-looking creatures spawned near the character and close to its level.
+    """Creatures spawned near the character, close to its level, that it may fairly hunt.
 
     `alive` discounts spawns that are dead and waiting on their respawn timer.
+    A creature that counts this character's race as a friend is never offered.
     """
     level = who["level"]
     found = rows(f"""
         SELECT JSON_OBJECT('creature', t.Entry, 'name', t.Name, 'min_level', t.MinLevel, 'max_level', t.MaxLevel,
-                           'spawned', COUNT(*), 'alive', SUM(r.guid IS NULL),
+                           'faction', t.Faction, 'spawned', COUNT(*), 'alive', SUM(r.guid IS NULL),
                            'distance', ROUND(MIN(SQRT(POW(c.position_x - ({who['x']}), 2) + POW(c.position_y - ({who['y']}), 2)))))
         FROM {hot_quest.WORLD_DB}.creature c
         JOIN {hot_quest.WORLD_DB}.creature_template t ON t.Entry = c.id
@@ -94,35 +107,60 @@ def targets(who, radius=400, below=3, above=2, limit=12):
           AND t.NpcFlags = 0 AND t.LootId <> 0 AND t.Civilian = 0 AND t.`Rank` = 0
           AND (t.ExtraFlags & {GUARD_FLAG}) = 0
           AND t.CreatureType NOT IN {SKIP_CREATURE_TYPES}
-          AND t.Faction NOT IN {PLAYER_FACTIONS}
           AND t.MaxLevel BETWEEN {max(1, level - below)} AND {level + above}
         GROUP BY t.Entry
         HAVING SUM(r.guid IS NULL) >= 3
         ORDER BY MIN(SQRT(POW(c.position_x - ({who['x']}), 2) + POW(c.position_y - ({who['y']}), 2)))
-        LIMIT {limit};""")
+        LIMIT {limit * 4};""")
+    tables = factions.get()
+    fair = []
     for row in found:                   # the database returns aggregates as text
         for key in ("spawned", "alive", "distance"):
             row[key] = int(float(row[key]))
-    return found
+        friendly = tables.is_friendly(row["faction"], who["race"]) if tables else row["faction"] in PLAYER_FACTIONS
+        if not friendly:
+            fair.append(row)
+    return fair[:limit]
 
 
-def giver(who):
-    """The nearest spawned NPC that is allowed to hand out DM quests, or None."""
-    allowed = [int(part) for part in os.environ.get("DM_GIVERS", "4991").split(",") if part.strip().isdigit()]
-    if not allowed:
-        return None
-    found = rows(f"""
-        SELECT JSON_OBJECT('creature', t.Entry, 'name', t.Name,
-                           'distance', ROUND(SQRT(POW(c.position_x - ({who['x']}), 2) + POW(c.position_y - ({who['y']}), 2))))
-        FROM {hot_quest.WORLD_DB}.creature c
-        JOIN {hot_quest.WORLD_DB}.creature_template t ON t.Entry = c.id
-        WHERE c.map = {who['map']} AND t.Entry IN ({', '.join(map(str, allowed))}) AND (t.NpcFlags & 2) <> 0
-        ORDER BY POW(c.position_x - ({who['x']}), 2) + POW(c.position_y - ({who['y']}), 2)
-        LIMIT 1;""")
-    if not found:
-        return None
-    found[0]["distance"] = int(float(found[0]["distance"]))
-    return found[0]
+def givers(who, limit=8):
+    """Nearby NPCs the Overseer could speak through: alive, able to give quests, and not hostile to this character.
+
+    The search widens until it finds some. With the game's faction files, any
+    non-hostile quest giver qualifies; without them, only NPCs of the
+    "friendly to all" faction do.
+    """
+    tables = factions.get()
+    for radius in (300, 800, 2000, 6000):
+        found = rows(f"""
+            SELECT JSON_OBJECT('creature', t.Entry, 'name', t.Name, 'title', IFNULL(t.SubName, ''), 'faction', t.Faction,
+                               'x', ROUND(c.position_x, 1), 'y', ROUND(c.position_y, 1),
+                               'spawns', (SELECT COUNT(*) FROM {hot_quest.WORLD_DB}.creature c2 WHERE c2.id = t.Entry))
+            FROM {hot_quest.WORLD_DB}.creature c
+            JOIN {hot_quest.WORLD_DB}.creature_template t ON t.Entry = c.id
+            LEFT JOIN {hot_quest.CHAR_DB}.creature_respawn r ON r.guid = c.guid AND r.respawntime > UNIX_TIMESTAMP()
+            WHERE c.map = {who['map']} AND (t.NpcFlags & 2) <> 0 AND r.guid IS NULL
+              AND POW(c.position_x - ({who['x']}), 2) + POW(c.position_y - ({who['y']}), 2) < {radius * radius}
+            ORDER BY POW(c.position_x - ({who['x']}), 2) + POW(c.position_y - ({who['y']}), 2)
+            LIMIT 80;""")
+        chosen, seen = [], set()
+        for row in found:
+            if row["creature"] in seen or int(row["spawns"]) != 1:      # one spawn, so "return to X" is unambiguous
+                continue
+            if tables:
+                if tables.is_hostile(row["faction"], who["race"]) is not False:
+                    continue
+            elif row["faction"] != 35:
+                continue
+            seen.add(row["creature"])
+            row["distance"] = round(math.hypot(row["x"] - who["x"], row["y"] - who["y"]))
+            row["direction"] = bearing(who, row["x"], row["y"])
+            chosen.append({key: row[key] for key in ("creature", "name", "title", "distance", "direction")})
+            if len(chosen) == limit:
+                break
+        if chosen:
+            return chosen
+    return []
 
 
 def reward_items(who, reach=10, limit=6):
@@ -300,7 +338,8 @@ def main():
         who = character(sys.argv[1])
         if not who:
             sys.exit(f"world_query: no character named {sys.argv[1]}")
-        report = {"character": who, "giver": giver(who), "targets": targets(who),
+        report = {"character": who, "faction_files_found": factions.get() is not None,
+                  "givers": givers(who), "targets": targets(who),
                   "reward_items": reward_items(who), "xp_weight": xp_weight(who["level"]),
                   "money_cap_copper": money_cap(who["level"]), "next_quest_id": next_quest_id()}
     except QueryError as error:

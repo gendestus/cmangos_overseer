@@ -6,7 +6,8 @@ Order follows the owner's ranking. Estimates are rough guesses for one person wo
 | Phase | Result | Estimate | Status |
 |---|---|---|---|
 | 0 | One-bounty rule made explicit; typed proposals; offline tests | An evening | Built |
-| 4a | Arcs: written at first notice, approved, carried into every bounty | Pulled forward | Built |
+| 4a | Mini-arcs: written at first notice, carried into every bounty, ended and succeeded | Pulled forward | Built |
+| G | Dynamic heralds: the model picks a nearby friendly quest NPC; no configured list | An evening | Built |
 | 1 | Richer bounties: six kinds, chains, spell rewards | Two weekends | Next |
 | 2 | Overseer mail, both directions | A weekend | |
 | 3 | Extra rewards with a budget | A weekend | |
@@ -19,6 +20,8 @@ Order follows the owner's ranking. Estimates are rough guesses for one person wo
 3. **Reward budgets** start as rough numbers and get tuned in play.
 4. **The goal is a fully automatic DM.** Approval is a setting per proposal type, `DM_AUTO_APPROVE`, so turning automation on later is a configuration change, not a rewrite. It defaults to `letter`.
 5. **Arc setup was pulled forward** and is built.
+6. **Arcs are mini-arcs** (decided 2026-10-04): each covers about four to eight levels with two to four beats. It ends when its finale bounty is turned in or the character out-levels it, and the next is planned from how it actually ended.
+7. **Quest givers are chosen, not configured** (decided 2026-10-04). `DM_GIVERS` is gone. Friend or foe is read from the server's extracted faction files, which also replaces the old hostility heuristic for targets.
 
 ## Ground rules (unchanged)
 
@@ -53,6 +56,8 @@ Add `tests/` with canned model answers and a script that runs the loop with `DM_
 Today every bounty is "kill N of one normal creature within 400 yards".
 
 ### 1.1 Target search v2 (`world_query.targets`)
+
+Already done as part of the herald work: friend or foe is exact, and compass bearings exist. Still to do:
 
 - Include elites, rares and single named spawns, each labelled with its rank.
 - Two distance tiers: near (400 yards) and far (about 1,500 yards, same continent).
@@ -173,7 +178,7 @@ Triggers: level milestones, helping another player's bounty, returning after a l
 
 ## Phase 4: character throughlines
 
-Built so far (4a): 4.1, 4.2 and 4.3. Remaining (4b): 4.4, 4.5, and delivering the signature reward through the Phase 3 catalogue.
+Built so far (4a): 4.1, 4.2 and 4.3, as mini-arcs with succession. Remaining (4b): mid-arc revision (4.4), grounding the adversary (4.5), and delivering the signature reward through the Phase 3 catalogue. Until then, a finale bounty can offer the signature reward only when the book is on that bounty's reward list.
 
 ### 4.1 The arc
 
@@ -182,7 +187,7 @@ New table `arcs`, one active arc per character:
 - **Premise:** one or two sentences.
 - **Lure:** what the Overseer wants this character to become ("lead this priest down a dark path").
 - **Adversary:** the enemy group the story turns toward ("the Naga").
-- **Beats:** three to five planned steps, each with a level band and an intent.
+- **Beats:** two to four planned steps, each with a level band and an intent, all within about ten levels of the character.
 - **Signature reward:** one capstone book the arc builds toward, chosen from the books that character's class can use. Warriors, rogues and hunters cannot use the books, so their arcs have none.
 
 The arc is never shown to players.

@@ -9,4 +9,3 @@ DELETE FROM quest_template WHERE entry = 30000;
 
 -- Forget every character's progress and completion of it.
 DELETE FROM characters.character_queststatus WHERE quest = 30000;
-

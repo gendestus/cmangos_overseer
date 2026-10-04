@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS proposals (
 CREATE TABLE IF NOT EXISTS seen_letters (id INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS arcs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, guid INTEGER,
-    status TEXT NOT NULL DEFAULT 'active',       -- active, superseded
+    status TEXT NOT NULL DEFAULT 'active',       -- active, completed, superseded
     premise TEXT, lure TEXT, adversary TEXT,
     beats TEXT,                                  -- JSON list of {level_band, intent}
     current_beat INTEGER NOT NULL DEFAULT 0,     -- index into beats
@@ -60,6 +60,11 @@ ADDED_COLUMNS = (
     ("quests", "circumstances", "TEXT"),
     ("proposals", "type", "TEXT NOT NULL DEFAULT 'bounty'"),   # bounty, arc (letter and gift to come)
     ("proposals", "payload", "TEXT"),                          # JSON for whatever the type needs
+    ("quests", "giver", "TEXT"),                               # name of the NPC the bounty was offered through
+    ("quests", "concludes_arc", "INTEGER"),                    # arc id this bounty is the finale of, if any
+    ("arcs", "outcome", "TEXT"),                               # how it ended, written when the next arc is planned
+    ("arcs", "ended_at", "INTEGER"),
+    ("arcs", "end_reason", "TEXT"),                            # resolved, outgrown, replaced
 )
 
 
@@ -154,6 +159,19 @@ def pending_proposal(db, guid, kind=None):
         return db.execute("SELECT * FROM proposals WHERE guid = ? AND status = 'pending' AND type = ?",
                           (guid, kind)).fetchone()
     return db.execute("SELECT * FROM proposals WHERE guid = ? AND status = 'pending'", (guid,)).fetchone()
+
+
+def past_arcs(db, guid, limit=6):
+    """Arcs that have ended for this character, oldest first."""
+    found = db.execute("SELECT * FROM arcs WHERE guid = ? AND status <> 'active' ORDER BY id DESC LIMIT ?",
+                       (guid, limit)).fetchall()
+    return list(reversed(found))
+
+
+def end_arc(db, arc, reason):
+    """Close an arc. reason: resolved (its finale was turned in), outgrown, or replaced."""
+    db.execute("UPDATE arcs SET status = ?, end_reason = ?, ended_at = ?, updated_at = ? WHERE id = ?",
+               ("superseded" if reason == "replaced" else "completed", reason, now(), now(), arc["id"]))
 
 
 def active_arc(db, guid):
