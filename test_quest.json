@@ -1,0 +1,26 @@
+{
+  "id": 30000,
+  "title": "The Overseer's First Test",
+  "zone": 9,
+  "min_level": 1,
+  "quest_level": 2,
+  "giver": 4991,
+  "ender": 4991,
+  "briefing": "So you are $N. I have been told to expect a $C with more curiosity than sense.\n\nSomething new is watching this valley, and it wants to know what you are made of. The kobolds east of the abbey will do for a first measure. Thin them out and come back to me.",
+  "objectives_text": "Slay 4 Kobold Vermin in Northshire Valley, then return to the Overseer's herald.",
+  "progress_text": "The Overseer is patient, $N. The kobolds are not going anywhere. Well, four of them are.",
+  "completion_text": "Four fewer vermin, and you are still standing. The Overseer has taken note.\n\nTake this. It was never meant for a $C, which is exactly why you are getting it.",
+  "kill": [
+    { "creature": 6, "count": 4 }
+  ],
+  "collect": [],
+  "reward": {
+    "money_copper": 500,
+    "xp_weight": 102,
+    "items": [
+      { "item": 111520, "count": 1 }
+    ],
+    "choice_items": [],
+    "teach_spell": null
+  }
+}
