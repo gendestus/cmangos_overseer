@@ -1,0 +1,225 @@
+# Overseer dev plan: richer bounties, mail, rewards, throughlines
+
+Status: plan for review. Nothing here is built.
+Order follows the owner's ranking. Estimates are rough guesses for one person working with a coding agent.
+
+| Phase | Result | Estimate | Needs a server restart |
+|---|---|---|---|
+| 0 | One-bounty rule made explicit; shared plumbing | An evening | No |
+| 1 | Richer bounties: six kinds, chains, spell rewards | Two weekends | Only for 1.7 |
+| 2 | Overseer mail, both directions | A weekend | Once, for a config line |
+| 3 | Extra rewards with a budget | A weekend | No |
+| 4 | Character throughlines | A weekend | No |
+
+## Ground rules (unchanged)
+
+- Nothing reaches the game without approval.
+- The model fills in a form. It never writes SQL or console commands.
+- Every model choice is checked against lists the script built from the live database.
+- Console commands go through the allow-list in `console.py`.
+
+## Phase 0: one active bounty, and shared plumbing
+
+### 0.1 The one-bounty rule
+
+The loop already refuses to propose while a character has a bounty that is offered or accepted, or a proposal waiting. The one exception today: a bounty that is offered but never accepted is dropped after `DM_STALE_HOURS` (24), and a new one may then be proposed.
+
+Changes:
+
+- State the rule in the README and in `dm.py`'s docstring.
+- An accepted bounty never expires. (Already true; add a test.)
+- Decide what happens to a bounty that is never accepted. See open decision 1.
+- A chain (1.4) counts as one bounty: no new proposal while any step is open.
+
+### 0.2 Proposals become typed
+
+Phases 2 to 4 add things to approve that are not bounties. Generalise the `proposals` table with a `type` column: `bounty`, `letter`, `gift`, `arc`, `arc_revision`. `dm.py pending`, `approve` and `reject` handle every type.
+
+### 0.3 A test harness in the repo
+
+Add `tests/` with canned model answers and a script that runs the loop with `DM_LLM_PROVIDER=stub` against a throwaway `state.db`. Every phase below adds fixtures here.
+
+## Phase 1: richer bounties
+
+Today every bounty is "kill N of one normal creature within 400 yards".
+
+### 1.1 Target search v2 (`world_query.targets`)
+
+- Include elites, rares and single named spawns, each labelled with its rank.
+- Two distance tiers: near (400 yards) and far (about 1,500 yards, same continent).
+- Add a compass bearing and distance to each target, so quest text can say "north-east along the coast".
+- Skip targets used in the character's last two bounties.
+- Know the party: its size and levels, so elites are only offered to a group.
+
+Accept when: `world_query.py <Character>` lists ranked, far and named targets with bearings.
+
+### 1.2 Bounty kinds
+
+The model picks a `kind`; each kind has its own checks.
+
+| Kind | Objective | Check |
+|---|---|---|
+| hunt | Kill N of a normal creature (today's bounty) | N within alive count and cap |
+| mark | Kill one named, rare or elite creature | Target alive; elite only with a party or a level margin |
+| trophy | Collect N of an item nearby creatures drop | Expected kills within alive count and cap |
+| trial | A hunt against a timer | Time limit within set bounds |
+| journey | A hunt or mark in the far tier | Distance stated in the text |
+| party | Two objectives, written for the group | Character is in a party |
+
+Up to two objectives per quest to start; the quest format allows four.
+
+### 1.3 Trophy objectives from stock loot
+
+- New query: items dropped by eligible nearby creatures, with drop chance.
+- Offer only items with a drop chance of 30% or more, or quest-only drops. Quest-only drops appear for any quest that needs the item, including a DM quest (verified in the loot code).
+- The validator computes expected kills (count divided by chance) and rejects a hunt the area cannot supply.
+- Prefer kill objectives for parties: most stock items give one copy per corpse.
+
+### 1.4 Chains
+
+- New spec field `requires_quest`, written to the quest's `PrevQuestId`.
+- A follow-up is then offered only to characters who finished the earlier quest, which also stops other players seeing a story step meant for one character.
+- Retired quests stay in the quest table, so the link stays valid.
+- State: add `chain_id` and `step` to `quests`.
+
+### 1.5 A spell as the reward
+
+- `hot_quest.py` already supports this. Add a `reward_spell` choice to the model's form, drawn from the capstone list.
+- Checks: the character does not know it, and is at or above the level the book would require.
+
+### 1.6 Timed trials
+
+- New spec field `time_limit_minutes`, written to `LimitTime`. The server treats a quest with a time limit as timed when it loads (seen in the loader).
+- Spike first: confirm the timer shows in benilla and that failing it behaves sensibly.
+
+### 1.7 DM-owned trophy items (optional, needs one restart)
+
+A pool of about 30 generic items ("Marked Insignia", "Strange Idol") created once by custom-sql. The DM then adds one to a creature's loot live (`creature_loot_template` is hot-reloadable) as a guaranteed quest-only drop that every party member can loot. This removes the drop-chance problem in 1.3.
+
+### 1.8 Prompt, form, display
+
+- Tool schema: `kind`, up to two objectives, `requires_quest`, `reward_spell`, `time_limit_minutes`.
+- XP and money caps scale by kind.
+- `dm.py pending` and `story` show the kind and chain position.
+
+## Phase 2: Overseer mail
+
+### 2.1 Outbound letters
+
+- New module `mailer.py` over the console's `send mail`, `send items` and `send money`.
+- Console mail arrives on GM stationery with no sender name (the sender id is 0 in the server code), so every letter signs itself.
+- Spike first: how quotes and line breaks in the body survive the command. The console rejects raw line breaks, so a line-break code has to be found or letters kept to one paragraph.
+
+### 2.2 Reactions
+
+A second, smaller model call writes a letter when something notable happens.
+
+- Triggers: a bounty turned in, a bounty ignored, a level milestone, two players first seen grouped.
+- Throttle: one letter per character per set number of hours.
+- Letters are proposals of type `letter`. A setting can let gift-free letters send without approval.
+
+### 2.3 Inbound letters
+
+The reading code exists; it needs a recipient.
+
+- Manual setup: log in once on the OVERSEER account and create a character named for the DM. Set `DM_MAIL_CHARACTER`.
+- If players are on both factions, set `AllowTwoSide.Interaction.Mail = 1` in `mangosd.conf`. It is 0 by default, which blocks cross-faction mail. This is the one restart in this phase.
+- A new letter triggers a reply proposal and is included in the next bounty's context.
+- Attachments from players are ignored.
+
+### 2.4 Player text is untrusted
+
+A letter is the first place a player's own words reach the model. Treat it as in-fiction speech: it can steer tone and requests, but it cannot grant anything. The reward budget (3.1) and the validator's lists apply regardless of what a letter asks for.
+
+### 2.5 State
+
+New table `letters`: time, character, direction, subject, body, gift, status. The chronicle and the model's context show the last three exchanged.
+
+## Phase 3: extra rewards
+
+### 3.1 Ledger and budget
+
+- New table `rewards`: time, character, what, why, and which quest or letter delivered it.
+- One budget for every channel: gold per day, items per week, and capstones per level span, by level band.
+- The validator checks the budget for quest rewards, mailed gifts and seeded drops alike.
+
+### 3.2 Reward catalogue
+
+Extend `world_query.reward_items` into a catalogue with a budget cost per entry:
+
+- Capstone books (exists).
+- Other classes' vendor books, as a minor boon.
+- Stock gear the class can use, at the character's level, from the item table.
+- Consumables by level.
+
+### 3.3 Delivery
+
+- **Quest reward with a choice:** up to six items, player picks one. `hot_quest.py` already supports choice items.
+- **Gift by mail:** through Phase 2.
+- **Seeded drop:** add an item to one creature's loot, live, and remove it once it has dropped or expired.
+
+### 3.4 Unprompted gifts
+
+Triggers: level milestones, helping another player's bounty, returning after a long absence, an arc beat (Phase 4).
+
+## Phase 4: character throughlines
+
+### 4.1 The arc
+
+New table `arcs`, one active arc per character:
+
+- **Premise:** one or two sentences.
+- **Lure:** what the Overseer wants this character to become ("lead this priest down a dark path").
+- **Adversary:** the enemy group the story turns toward ("the Naga").
+- **Beats:** three to five planned steps, each with a level band and an intent.
+- **Signature reward:** the capstone family the arc builds toward.
+
+The arc is never shown to players.
+
+### 4.2 Laying it down
+
+- When a character is first noticed, a model call writes an arc from their race, class, level and the capstones their class could borrow.
+- The owner can seed it: `dm.py arc <Character> --seed "lead this priest down a dark path"`.
+- An arc is a proposal of type `arc` and needs approval before any bounty uses it.
+- Characters the DM already knows get an arc written from their chronicle.
+
+### 4.3 Using it
+
+- Every bounty and letter prompt carries the premise, the current beat and the next one.
+- The model reports `beat_progress`: advance, hold, or detour, with a reason.
+- Signature rewards come from the Phase 3 catalogue, filtered by the arc.
+
+### 4.4 Revising it
+
+When the player's actions contradict the arc (refusing the dark path, out-levelling a beat), the model may propose a revision. Revisions need approval.
+
+### 4.5 Grounding the adversary
+
+- New query `find_creatures(name pattern, level range)`: where matching creatures spawn, with distance and bearing from the character.
+- Limit: the world database has no zone for a spawn, only coordinates. The model knows from lore which zones hold Naga; the query can confirm they exist at the right levels on this continent and how far away, but cannot name the zone.
+- This depends on the far tier and bearings from 1.1.
+
+## Dependencies
+
+- 1.1 is the base for most of Phase 1 and for 4.5.
+- Phase 3's gift delivery needs Phase 2.
+- Phase 4's signature rewards need Phase 3's catalogue.
+- Throughlines are ranked last but cheap to lay down. If the arc table and its approval flow (4.1, 4.2) were pulled forward, every bounty written in Phases 1 to 3 would already have a direction.
+
+## Spikes before building
+
+| Spike | Answers |
+|---|---|
+| Chain a second quest behind quest 30000 with `requires_quest`, reload, check who is offered it | 1.4 |
+| Timed quest in benilla | 1.6 |
+| `send mail` with quotes and a line-break code; how the letter looks in game | 2.1 |
+| Mail a letter to the DM character and read it back | 2.3 |
+| Add an item to a creature's loot, reload, kill it | 1.7, 3.3 |
+
+## Open decisions
+
+1. **A bounty nobody accepts.** Keep the 24-hour expiry, lengthen it, or never expire and wait.
+2. **Letters without approval.** Whether gift-free letters may send unattended.
+3. **Generosity.** The actual budget numbers in 3.1, especially how often a capstone appears.
+4. **Arc visibility to the owner.** Arcs are spoilers. Whether the owner who also plays wants to approve them, or have them hidden and auto-approved.
+5. **Pulling 4.1 and 4.2 forward.** See Dependencies.
