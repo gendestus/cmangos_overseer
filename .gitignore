@@ -1,0 +1,8 @@
+.env
+state.db
+state.db-journal
+issued/
+__pycache__/
+*.pyc
+paused
+.env.bak

@@ -35,13 +35,14 @@ By default nothing reaches the game without `approve`. `DM_AUTO_APPROVE` can swi
 | `llm.py` | The only place that calls a model. Add a provider here to switch models |
 | `hot_quest.py` | Checks a quest spec and renders it to SQL |
 | `apply_quest.py` | Puts a quest spec live, retires it, or removes it |
-| `console.py` | Client for the server's remote console, with the command allow-list |
+| `console.py` | Client for the server's remote console, with the command allow-list and the kill switch |
+| `db_users.py` | Creates the two narrow database users and proves what each may do |
 | `env.example` | Template for `.env` |
-| `test_quest.json` and the two `test_quest_*.sql` | A fixed quest for smoke-testing the pipeline without a model |
+| `tests/test_quest.json` and the two `tests/test_quest_*.sql` | A fixed quest for smoke-testing the pipeline without a model |
 | `tests/test_offline.py` | Checks that need no server: `python3 -m unittest discover tests` |
 | `server/` | Copies of custom-sql files from the game server (see step 1) |
 | `docs/ai_dm_spec.md` | Design spec |
-| `docs/dev_plan.md` | What is built and what is next |
+| `docs/DEV_PLAN.md` | What is built and what is next |
 
 Not in git: `.env` (secrets), `state.db` (the story), `issued/` (records from `write_quest.py`).
 
@@ -98,23 +99,38 @@ cp env.example .env
 
 Edit `.env` and set at least `DM_SOAP_PASS` and `ANTHROPIC_API_KEY`. If the server is not in `~/cmangos-deploy`, set `DM_COMPOSE_DIR`.
 
-### 5. Smoke tests
+### 5. Narrow database users
+
+Out of the box the scripts would reach the database as its root user. Make two users that cannot do more than they need:
+
+```
+python3 db_users.py --create --write-env
+```
+
+This creates `dm_read`, which can only read, and `dm_write`, which can only insert into and delete from the three tables a bounty lives in, plus the players' record of it. It writes their passwords into `.env` (keeping a copy of the old file as `.env.bak`) and then proves the grants: the reader is refused a write, and the writer is refused the accounts database, a player's mail, and any change to a creature or an item.
+
+`python3 db_users.py` shows what exists; `--check` re-runs the proofs; `--drop` removes both users, after which the scripts fall back to root.
+
+A later phase that writes to a new table needs a line added to `WRITE_GRANTS` in `db_users.py` and a re-run of `--create`. An offline test fails if the renderer writes to a table the writer has no grant for.
+
+### 6. Smoke tests
 
 Run these in order. Each one tests one more link in the chain.
 
 ```
 python3 -m unittest discover tests               # the rules, with no server involved
+python3 db_users.py --check                      # each database user can do its job and no more
 python3 factions.py                              # the faction files are readable and make sense
 python3 console.py "server info"                 # the remote console answers
 python3 world_query.py <Character>               # the database is readable
-python3 apply_quest.py test_quest.json           # a fixed quest goes live
-python3 apply_quest.py test_quest.json --remove  # and comes down again
+python3 apply_quest.py tests/test_quest.json     # a fixed quest goes live
+python3 apply_quest.py tests/test_quest.json --remove   # and comes down again
 python3 write_quest.py <Character> --dry-run     # the model writes a quest; nothing applied
 ```
 
 `factions.py` prints how seven well-known factions treat a Human and an Orc, with the answers to expect. `world_query.py` lists the nearby NPCs the DM could speak through. The fixed test quest is offered by Marshal McBride in Northshire, so it needs an Alliance character to take it.
 
-### 6. Run it
+### 7. Run it
 
 With a character online:
 
@@ -147,6 +163,9 @@ python3 dm.py run --every 300
 | `dm.py arc <Character>` | The arc in force and the ones that have ended. A spoiler if you play that character |
 | `dm.py arc <Character> --seed "..."` | Have a new arc written around your direction |
 | `dm.py context <Character>` | Exactly what the model would be told next. No model call |
+| `dm.py pause "why"` | Stop everything that reaches the game. Reading still works |
+| `dm.py resume` | Undo it |
+| `dm.py purge` | Take every DM quest back out of the game, after confirmation |
 
 A tick does three things without asking: it forces a save, it stops offering a bounty once its character has turned it in, and it calls the model when a character has no bounty out.
 
@@ -198,8 +217,9 @@ For testing against something other than the live server: `DM_DB_COMMAND`, `DM_D
 - **Preflight.** Nothing is written if the giver, target or reward is missing.
 - **Reserved ids.** DM quests use ids 30000 to 39999, so they are easy to find and remove.
 - **Approval.** By default a quest reaches the game only through `approve` or an explicit `apply_quest.py` run. With `bounty` in `DM_AUTO_APPROVE`, the checks above are the only gate.
-
-Known gap: the scripts reach the database as its root user through the container. A dedicated user with narrow permissions is still to do.
+- **Narrow database users.** Reads go through a user that cannot write; writes through a user that can only touch `quest_template`, the two giver link tables and `character_queststatus`. It cannot read a player's mail, reach the account database, or change a creature or an item. See setup step 5.
+- **A kill switch.** `dm.py pause "why"` stops every path to the game: no tick, no model call, no quest written, no console command, whichever script is run. Reading is unaffected, so the chronicle still reads while it is off. `DM_PAUSE=1` does the same from the environment.
+- **One command undoes everything.** `dm.py purge` lists every quest in the DM's id range that is in the world database, asks for confirmation, then deletes each one, its giver links and every character's record of it. It reads the live database rather than the DM's memory, so a quest whose record was lost is still cleaned up. The chronicle is kept.
 
 ## Known limits
 

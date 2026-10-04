@@ -10,6 +10,9 @@
     python3 dm.py arc Zachadin         the Overseer's private plan for a character (a spoiler)
     python3 dm.py arc Zachadin --seed "lead this priest down a dark path"
     python3 dm.py context Zachadin     what the model would be told next; no model call
+    python3 dm.py pause "why"          the kill switch: nothing reaches the game
+    python3 dm.py resume               undo it
+    python3 dm.py purge                take every DM quest back out of the game
 
 One bounty at a time: a character with a bounty offered or accepted gets no new proposal.
 An accepted bounty never expires; one that is never accepted is dropped after DM_STALE_HOURS.
@@ -37,6 +40,12 @@ Settings, on top of the ones the other scripts use:
     DM_IGNORE_CHARACTERS    names the DM should not track, comma separated
     DM_MAIL_CHARACTER       name of a character the DM owns; mail sent to it is read as
                             letters to the Overseer (optional)
+    DM_PAUSE                set to 1 to pause without the flag file (`pause` writes the file)
+    DM_PAUSE_FILE           where the flag file lives (default: `paused` beside this script)
+
+Paused means paused: no tick, no model call, no quest written and no console
+command sent, whichever script is run. Reading is unaffected, so `story`,
+`arc`, `context` and `pending` still answer.
 """
 import argparse
 import copy
@@ -640,6 +649,11 @@ def settle(db, number, say):
 
 
 def tick(db, say=print):
+    stopped = console.paused()
+    if stopped:
+        say(f"tick: the DM is paused ({stopped}). Nothing observed, nothing proposed.")
+        say("resume with: python3 dm.py resume")
+        return
     try:
         console.run("saveall")
     except console.ConsoleError as error:
@@ -729,6 +743,9 @@ Model's note: {row['dm_note']}   [{row['model']}, tokens {row['tokens_in']}/{row
 
 
 def cmd_pending(db, _args):
+    stopped = console.paused()
+    if stopped:
+        print(f"** the DM is paused ({stopped}). Nothing can reach the game until you resume. **\n")
     found = db.execute("SELECT * FROM proposals WHERE status = 'pending' ORDER BY id").fetchall()
     if not found:
         print("no proposals waiting.")
@@ -739,6 +756,10 @@ def cmd_pending(db, _args):
 
 
 def cmd_approve(db, args):
+    stopped = console.paused()
+    if stopped:
+        sys.exit(f"dm: the DM is paused ({stopped}); nothing was applied.\n"
+                 f"    resume with: python3 dm.py resume")
     row = db.execute("SELECT * FROM proposals WHERE id = ? AND status = 'pending'", (args.number,)).fetchone()
     if not row:
         sys.exit(f"dm: no pending proposal {args.number}")
@@ -788,6 +809,89 @@ def cmd_arc(db, args):
     print("\n" + arc_text(arc, "In force:"))
     if arc["seed"]:
         print(f"Your direction: {arc['seed']}")
+
+
+def cmd_pause(db, args):
+    """The kill switch. Writes a flag file; every path to the game checks it."""
+    reason = args.reason or "paused by hand"
+    with open(console.pause_file(), "w", encoding="utf-8") as handle:
+        handle.write(reason + "\n")
+    dm_state.add_event(db, 0, "paused", reason)
+    db.commit()
+    print(f"paused: {reason}\n"
+          "No tick will observe or propose, no quest will be written, no console command will be sent.\n"
+          "Reading still works: story, arc, context and pending.\n"
+          "resume with: python3 dm.py resume")
+
+
+def cmd_resume(db, _args):
+    stopped = console.paused()
+    if not stopped:
+        print("not paused.")
+        return
+    try:
+        os.remove(console.pause_file())
+    except OSError:
+        pass
+    if console.paused():            # DM_PAUSE in the environment, not the flag file
+        sys.exit("dm: still paused because DM_PAUSE is set in the environment or .env; unset it to resume.")
+    dm_state.add_event(db, 0, "resumed", f"was: {stopped}")
+    db.commit()
+    print("resumed. The next tick will observe and propose again.")
+
+
+def live_dm_quests():
+    """Every quest in the DM's id range that is in the world database right now.
+
+    Read from the game, not from the DM's memory: a quest written by hand or by
+    a run whose record was lost still has to be cleanable.
+    """
+    low, high = hot_quest.QUEST_ID_RANGE
+    return world_query.rows(
+        f"SELECT JSON_OBJECT('id', entry, 'title', Title) "
+        f"FROM {hot_quest.WORLD_DB}.quest_template WHERE entry BETWEEN {low} AND {high} ORDER BY entry;")
+
+
+def cmd_purge(db, args):
+    """Take every DM quest out of the game. The DM's own memory is kept."""
+    live = live_dm_quests()
+    low, high = hot_quest.QUEST_ID_RANGE
+    if not live:
+        print(f"nothing to purge: no quest in {low} to {high} is in the world database.")
+        return
+    print(f"{len(live)} DM quest(s) in the world database:")
+    for quest in live:
+        print(f"  {quest['id']}  {quest['title']}")
+    print("\nPurging deletes each one, its giver links, and every character's record of it.\n"
+          "The DM's memory (state.db) is kept, so the chronicle still reads correctly.")
+    if not args.yes:
+        if input("\ntype the word purge to go ahead: ").strip() != "purge":
+            print("nothing was done.")
+            return
+    gone, failed = [], []
+    for quest in live:
+        try:
+            apply_quest.run_sql(hot_quest.render_remove_by_id(quest["id"], quest["title"]))
+            gone.append(quest["id"])
+        except (apply_quest.StepFailed, hot_quest.SpecError) as error:
+            failed.append((quest["id"], error))
+        db.execute("UPDATE quests SET status = 'purged', retired_at = ? WHERE quest = ?",
+                   (dm_state.now(), quest["id"]))
+    db.commit()
+    if gone:
+        dm_state.add_event(db, 0, "purged", f"removed quests: {', '.join(str(i) for i in gone)}")
+        db.commit()
+        print(f"\nremoved {len(gone)} quest(s): {', '.join(str(i) for i in gone)}")
+    for quest_id, error in failed:
+        print(f"could not remove {quest_id}: {error}")
+    try:
+        print(f"console: reload all_quest -> {console.run('reload all_quest') or 'ok'}")
+    except console.ConsoleError as error:
+        print(f"the database is clean but the server was not told to re-read quests ({error}).\n"
+              "Run `.reload all_quest` in game.")
+    print("Anyone holding one of these should relog.")
+    if failed:
+        sys.exit(1)
 
 
 def cmd_story(db, args):
@@ -862,6 +966,13 @@ def main():
     arc.add_argument("character")
     arc.add_argument("--seed", metavar="TEXT", help="a direction; a new arc is written around it")
     arc.set_defaults(run=cmd_arc)
+    pause = commands.add_parser("pause", help="stop everything reaching the game")
+    pause.add_argument("reason", nargs="?", default="", help="noted in the chronicle and shown on every refusal")
+    pause.set_defaults(run=cmd_pause)
+    commands.add_parser("resume", help="undo pause").set_defaults(run=cmd_resume)
+    purge = commands.add_parser("purge", help="remove every DM quest from the game")
+    purge.add_argument("--yes", action="store_true", help="skip the confirmation")
+    purge.set_defaults(run=cmd_purge)
     context = commands.add_parser("context", help="show what the model would be told; no model call")
     context.add_argument("character")
     context.set_defaults(run=cmd_context)

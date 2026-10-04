@@ -1,6 +1,6 @@
 # Overseer dev plan: richer bounties, mail, rewards, throughlines
 
-Status: decisions taken 2026-10-04. Phase 0 and the first half of Phase 4 are built; Phases 1 to 3 are not.
+Status: decisions taken 2026-10-04. Phase 0 (including 0.4), the first half of Phase 4 and dynamic heralds are built; Phases 1 to 3 are not.
 Order follows the owner's ranking. Estimates are rough guesses for one person working with a coding agent.
 
 | Phase | Result | Estimate | Status |
@@ -8,6 +8,7 @@ Order follows the owner's ranking. Estimates are rough guesses for one person wo
 | 0 | One-bounty rule made explicit; typed proposals; offline tests | An evening | Built |
 | 4a | Mini-arcs: written at first notice, carried into every bounty, ended and succeeded | Pulled forward | Built |
 | G | Dynamic heralds: the model picks a nearby friendly quest NPC; no configured list | An evening | Built |
+| 0.4 | Narrow database users, a kill switch, and one command that undoes everything | An evening | Built |
 | 1 | Richer bounties: six kinds, chains, spell rewards | Two weekends | Next |
 | 2 | Overseer mail, both directions | A weekend | |
 | 3 | Extra rewards with a budget | A weekend | |
@@ -21,7 +22,8 @@ Order follows the owner's ranking. Estimates are rough guesses for one person wo
 4. **The goal is a fully automatic DM.** Approval is a setting per proposal type, `DM_AUTO_APPROVE`, so turning automation on later is a configuration change, not a rewrite. It defaults to `letter`.
 5. **Arc setup was pulled forward** and is built.
 6. **Arcs are mini-arcs** (decided 2026-10-04): each covers about four to eight levels with two to four beats. It ends when its finale bounty is turned in or the character out-levels it, and the next is planned from how it actually ended.
-7. **Quest givers are chosen, not configured** (decided 2026-10-04). `DM_GIVERS` is gone. Friend or foe is read from the server's extracted faction files, which also replaces the old hostility heuristic for targets.
+7. **The spec's own guardrails come before new content** (decided 2026-10-04). Reading `ai_dm_spec.md` back against the code turned up three things it asks for that the plan had dropped: narrow database users (spec section 3), a kill switch and a purge script (section 6). They became Phase 0.4 and were built first, because Phases 1 to 3 each widen what the DM writes.
+8. **Quest givers are chosen, not configured** (decided 2026-10-04). `DM_GIVERS` is gone. Friend or foe is read from the server's extracted faction files, which also replaces the old hostility heuristic for targets.
 
 ## Ground rules (unchanged)
 
@@ -29,6 +31,8 @@ Order follows the owner's ranking. Estimates are rough guesses for one person wo
 - The model fills in a form. It never writes SQL or console commands.
 - Every model choice is checked against lists the script built from the live database.
 - Console commands go through the allow-list in `console.py`.
+- The DM reaches the database as two narrow users, never as root (0.4).
+- One flag stops everything; one command undoes everything (0.4).
 
 ## Phase 0: one active bounty, and shared plumbing (built)
 
@@ -51,13 +55,38 @@ Phases 2 to 4 add things to approve that are not bounties. Generalise the `propo
 
 Add `tests/` with canned model answers and a script that runs the loop with `DM_LLM_PROVIDER=stub` against a throwaway `state.db`. Every phase below adds fixtures here.
 
+## Phase 0.4: the spec's guardrails (built)
+
+### 0.4.1 Two narrow database users
+
+`db_users.py` creates `dm_read` and `dm_write` and points `DM_DB_QUERY_COMMAND` and `DM_DB_COMMAND` at them, so no script speaks to the game as root any more.
+
+- The reader gets SELECT on the world and characters databases and nothing else.
+- The writer gets SELECT on the four tables the preflight reads, INSERT and DELETE on `quest_template` and the two giver link tables, and SELECT plus DELETE on `character_queststatus`. MariaDB needs the SELECT there because a DELETE's WHERE clause reads a column.
+- `--check` proves it both ways: each user can do its job, and the writer is refused the accounts database, a player's mail, and any change to a creature or an item. Fourteen probes, all passing.
+- An offline test compares the writer's grants against the tables the renderer actually writes, so a later phase that adds a table fails a test instead of failing in play.
+
+Still root: `db_users.py` itself, which creates the users. It reads the root password inside the container and never handles it.
+
+### 0.4.2 The kill switch
+
+`dm.py pause "why"` writes a flag file; `console.paused()` is the single source of truth and every path to the game checks it: `console.run`, `apply_quest.run_sql`, `dm.tick`, `dm.approve` and `write_quest`. `DM_PAUSE=1` does the same from the environment. Reading is deliberately unaffected, so the chronicle still reads while the DM is off. The allow-list still refuses a forbidden command first, so pausing never widens anything.
+
+### 0.4.3 Purge
+
+`dm.py purge` enumerates every quest in 30000 to 39999 **in the world database**, not in `state.db`, then removes each one with its giver links and every character's record of it. Reading the live database matters: the first run found quest 30000 live and unknown to the DM's memory.
+
+Removal needs only an id (`hot_quest.render_remove_by_id`), so a quest whose spec is lost or whose title would fail the authoring rules is still cleanable. The id range check still applies, so purge cannot touch a stock quest. The DM's own memory is kept and the quests are marked `purged`.
+
+Not covered, and worth knowing: mailed items cannot be recalled, and a purge erases a player's record of having completed a DM quest, so the same quest could be offered again. Phase 2's letters and Phase 3's gifts will need their own undo.
+
 ## Phase 1: richer bounties
 
 Today every bounty is "kill N of one normal creature within 400 yards".
 
 ### 1.1 Target search v2 (`world_query.targets`)
 
-Already done as part of the herald work: friend or foe is exact, and compass bearings exist. Still to do:
+The herald work delivered two pieces of groundwork: friend or foe is exact (`factions.py`), and `world_query.bearing()` exists. `targets()` itself is unchanged — still a 400-yard radius, `Rank = 0` only, no bearing on a target. All four bullets are still to do:
 
 - Include elites, rares and single named spawns, each labelled with its rank.
 - Two distance tiers: near (400 yards) and far (about 1,500 yards, same continent).

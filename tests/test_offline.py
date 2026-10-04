@@ -9,6 +9,7 @@ talks to the game is tested by hand with the smoke tests in the README.
 """
 import json
 import os
+import re
 import sqlite3
 import struct
 import sys
@@ -18,7 +19,9 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
 
+import apply_quest      # noqa: E402
 import console          # noqa: E402
+import db_users         # noqa: E402
 import dm               # noqa: E402
 import dm_state         # noqa: E402
 import factions         # noqa: E402
@@ -215,6 +218,112 @@ class ConsoleAllowList(unittest.TestCase):
                         "announce hi\naccount delete X"):
             with self.assertRaises(console.NotAllowed):
                 console.check_allowed(console.normalise(command))
+
+
+class KillSwitch(unittest.TestCase):
+    """One flag stops everything that reaches the game; reading is unaffected."""
+
+    def setUp(self):
+        self.flag = os.path.join(tempfile.mkdtemp(), "paused")
+        os.environ["DM_PAUSE_FILE"] = self.flag
+        os.environ.pop("DM_PAUSE", None)
+
+    def tearDown(self):
+        os.environ.pop("DM_PAUSE_FILE", None)
+        os.environ.pop("DM_PAUSE", None)
+
+    def write_flag(self, reason):
+        with open(self.flag, "w", encoding="utf-8") as handle:
+            handle.write(reason)
+
+    def test_not_paused_by_default(self):
+        self.assertIsNone(console.paused())
+
+    def test_the_flag_file_carries_its_reason(self):
+        self.write_flag("a player complained")
+        self.assertEqual(console.paused(), "a player complained")
+
+    def test_an_empty_flag_file_still_pauses(self):
+        self.write_flag("   \n")
+        self.assertEqual(console.paused(), "paused, with no reason given")
+
+    def test_the_environment_pauses_too(self):
+        os.environ["DM_PAUSE"] = "1"
+        self.assertEqual(console.paused(), "DM_PAUSE is set")
+
+    def test_no_console_command_is_sent_while_paused(self):
+        self.write_flag("testing")
+        with self.assertRaises(console.Paused):
+            console.run("server info")
+
+    def test_nothing_is_written_while_paused(self):
+        self.write_flag("testing")
+        with self.assertRaises(apply_quest.StepFailed):
+            apply_quest.run_sql("SELECT 1;")
+
+    def test_an_allow_list_refusal_still_comes_first(self):
+        self.write_flag("testing")
+        with self.assertRaises(console.NotAllowed):          # not Paused: the command was never allowed
+            console.run("account delete Bob")
+
+
+class Purge(unittest.TestCase):
+    def test_removal_needs_only_an_id(self):
+        sql = hot_quest.render_remove_by_id(30001)
+        self.assertIn("DELETE FROM quest_template WHERE entry = 30001", sql)
+        self.assertIn("character_queststatus WHERE quest = 30001", sql)
+
+    def test_a_title_the_authoring_rules_would_refuse_is_still_removable(self):
+        sql = hot_quest.render_remove_by_id(30001, "x" * 200)       # validate() caps a title at 80
+        self.assertIn("DELETE FROM quest_template WHERE entry = 30001", sql)
+
+    def test_a_title_cannot_break_out_of_its_comment(self):
+        sql = hot_quest.render_remove_by_id(30001, "oops\nDELETE FROM creature;")
+        lines = sql.splitlines()
+        self.assertIn("oops DELETE FROM creature;", lines[0])    # folded onto the comment, where it is inert
+        for line in lines[1:]:                                   # and nowhere a statement could run
+            self.assertNotIn("creature;", line)
+
+    def test_only_the_dm_range_can_be_purged(self):
+        for quest_id in (1, 29999, 40000):
+            with self.assertRaises(hot_quest.SpecError):
+                hot_quest.render_remove_by_id(quest_id)
+
+
+class NarrowDatabaseUsers(unittest.TestCase):
+    """The writer's grants must cover every table the renderer writes, and no more.
+
+    This is the test that fails when a later phase writes to a new table and
+    nobody widens the grant; the symptom in play would be a refused query.
+    """
+
+    def granted(self, grants):
+        return {target.split(".", 1)[-1] for _, target in grants}
+
+    def written_tables(self):
+        quest = hot_quest.validate(SPEC)
+        sql = hot_quest.render_apply(quest) + hot_quest.render_remove(quest) + hot_quest.render_retire(quest)
+        found = set()
+        for statement in ("REPLACE INTO", "INSERT INTO", "DELETE FROM", "UPDATE"):
+            for match in re.finditer(statement + r" ([a-zA-Z_][\w.]*)", sql):
+                found.add(match.group(1).split(".", 1)[-1])
+        return found
+
+    def test_every_table_written_is_granted(self):
+        missing = self.written_tables() - self.granted(db_users.WRITE_GRANTS)
+        self.assertEqual(missing, set(), f"the writer has no grant for: {sorted(missing)}")
+
+    def test_the_writer_cannot_touch_anything_it_does_not_write(self):
+        for table in ("creature", "creature_template", "item_template", "mail", "characters"):
+            for privilege, target in db_users.WRITE_GRANTS:
+                if target.endswith("." + table):
+                    self.assertNotIn("INSERT", privilege, f"{table} should be read-only to the writer")
+                    if table != "character_queststatus":
+                        self.assertNotIn("DELETE", privilege, f"{table} should be read-only to the writer")
+
+    def test_the_reader_is_granted_nothing_but_select(self):
+        for privilege, _ in db_users.READ_GRANTS:
+            self.assertEqual(privilege, "SELECT")
 
 
 class MemoryFile(unittest.TestCase):

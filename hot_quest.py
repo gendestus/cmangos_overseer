@@ -213,9 +213,12 @@ INSERT INTO creature_involvedrelation (id, quest) VALUES ({q['ender']}, {qid});
 """
 
 
-def render_remove(q):
-    qid = q["id"]
-    return f"""-- Remove DM quest {qid}: {q['title']}
+def render_remove_by_id(quest_id, label=""):
+    """Removal SQL for one quest id. Needs nothing but the id, so it can clean
+    up a quest whose spec is lost or whose text no longer passes validate()."""
+    qid = as_int(quest_id, "id", *QUEST_ID_RANGE)
+    label = " ".join(str(label or "").split())      # a title from the database stays on the comment line
+    return f"""-- Remove DM quest {qid}{f": {label}" if label else ""}
 -- Apply, run `.reload all_quest`, and have anyone holding the quest relog.
 
 USE {WORLD_DB};
@@ -227,6 +230,10 @@ DELETE FROM quest_template WHERE entry = {qid};
 -- Forget every character's progress and completion of it.
 DELETE FROM {CHAR_DB}.character_queststatus WHERE quest = {qid};
 """
+
+
+def render_remove(q):
+    return render_remove_by_id(q["id"], q["title"])
 
 
 def render_retire(q):

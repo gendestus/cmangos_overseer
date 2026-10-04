@@ -215,6 +215,9 @@ def main():
     parser.add_argument("--yes", action="store_true", help="apply without asking")
     args = parser.parse_args()
     console.load_env()
+    stopped = console.paused()
+    if stopped and not args.show_context:
+        sys.exit(f"write_quest: the DM is paused ({stopped}). Resume with `python3 dm.py resume`.")
 
     try:
         try:

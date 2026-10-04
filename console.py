@@ -53,6 +53,9 @@ ENVELOPE = (
 )
 
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
 class ConsoleError(Exception):
     """Base class: the command did not run successfully."""
 
@@ -73,9 +76,34 @@ class CommandFailed(ConsoleError):
     """The server ran the command and reported failure."""
 
 
+class Paused(ConsoleError):
+    """The DM is paused, so nothing may reach the game."""
+
+
+def pause_file():
+    return os.environ.get("DM_PAUSE_FILE") or os.path.join(HERE, "paused")
+
+
+def paused():
+    """Why the DM is stopped, or None. The kill switch: nothing reaches the game.
+
+    Set either way round: `dm.py pause "reason"` writes the flag file, or
+    DM_PAUSE=1 in the environment. Reading the game is still allowed, so the
+    chronicle and `pending` keep working while it is off.
+    """
+    load_env()
+    if os.environ.get("DM_PAUSE", "").strip().lower() in ("1", "true", "yes", "on"):
+        return "DM_PAUSE is set"
+    try:
+        with open(pause_file(), encoding="utf-8") as handle:
+            return handle.read().strip() or "paused, with no reason given"
+    except OSError:
+        return None
+
+
 def load_env(path=None):
     """Read KEY=VALUE lines from a .env file without overriding real env vars."""
-    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    path = path or os.path.join(HERE, ".env")
     if not os.path.exists(path):
         return
     with open(path, encoding="utf-8") as handle:
@@ -120,6 +148,9 @@ def run(command, timeout=30):
     load_env()
     command = normalise(command)
     check_allowed(command)
+    stopped = paused()
+    if stopped:
+        raise Paused(f"the DM is paused ({stopped}); `{command}` was not sent")
 
     url = os.environ.get("DM_SOAP_URL", "http://127.0.0.1:7878/")
     user = os.environ.get("DM_SOAP_USER", "")

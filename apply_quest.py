@@ -42,6 +42,9 @@ class StepFailed(Exception):
 
 def run_sql(sql):
     """Feed SQL to the database and return its printed output."""
+    stopped = console.paused()
+    if stopped:
+        raise StepFailed(f"the DM is paused ({stopped}); nothing was written")
     command = shlex.split(os.environ.get("DM_DB_COMMAND", DEFAULT_DB_COMMAND))
     folder = os.path.expanduser(os.environ.get("DM_COMPOSE_DIR", "~/cmangos-deploy"))
     try:

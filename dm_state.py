@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS quests (
     quest INTEGER PRIMARY KEY, guid INTEGER, title TEXT, target TEXT, spec TEXT, announcement TEXT,
     dm_note TEXT, story_beat TEXT, model TEXT,
     issued_at INTEGER, accepted_at INTEGER, completed_at INTEGER, retired_at INTEGER,
-    status TEXT NOT NULL DEFAULT 'offered'       -- offered, accepted, completed, ignored
+    status TEXT NOT NULL DEFAULT 'offered'       -- offered, accepted, completed, ignored, purged
 );
 CREATE TABLE IF NOT EXISTS proposals (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, guid INTEGER, name TEXT, spec TEXT,
