@@ -381,7 +381,8 @@ def story_section(db, who):
                 "accepted": "accepted, not finished yet",
                 "offered": "posted, not yet accepted",
                 "ignored": "ignored; it expired unaccepted",
-            }[quest["status"]]
+                "purged": "withdrawn by the server owner",
+            }.get(quest["status"], quest["status"])
             through = f", offered through {quest['giver']}" if quest["giver"] else ""
             lines.append(f"- \"{quest['title']}\" ({hunt}){through}, posted {dm_state.ago(quest['issued_at'])} ago: "
                          f"{outcome}. Beat: {quest['story_beat']}")
@@ -553,9 +554,27 @@ def wants_bounty(db, who):
     return None
 
 
+def recent_targets(db, guid, count=2):
+    """Creature ids from this character's last few bounties, so a target is not reused.
+
+    Read from each bounty's spec, where the creature is an id. The `target`
+    column holds only the creature's name.
+    """
+    found = []
+    for quest in dm_state.quest_history(db, guid, limit=count):
+        try:
+            spec = json.loads(quest["spec"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        for objective in spec.get("kill") or []:
+            if objective.get("creature"):
+                found.append(int(objective["creature"]))
+    return found
+
+
 def propose(db, who, say):
     """Ask the model for the next bounty and store it as a proposal. Returns the proposal number."""
-    context = write_quest.gather(who["name"])
+    context = write_quest.gather(who["name"], skip=recent_targets(db, who["guid"]))
     message = write_quest.user_message(context, None, story=story_section(db, context["character"]))
     answer, usage = llm.ask_for_tool_call(SYSTEM, message, TOOL, max_tokens=4096)
     spec, target, announcement = write_quest.build_spec(answer, context, hot_quest.QUEST_ID_RANGE[0])
@@ -916,12 +935,15 @@ def cmd_story(db, args):
 
 def cmd_context(db, args):
     """Print exactly what the model would be told about a character. No model call."""
+    who = world_query.character(args.character)
+    if not who:
+        sys.exit(f"dm: no character named {args.character}")
+    if not dm_state.get_character(db, who["guid"]):
+        sys.exit("dm: the Overseer has not noticed this character yet; run a tick while they are online")
     try:
-        context = write_quest.gather(args.character)
+        context = write_quest.gather(args.character, skip=recent_targets(db, who["guid"]))
     except write_quest.NoContext as error:
         sys.exit(f"dm: {error}")
-    if not dm_state.get_character(db, context["character"]["guid"]):
-        sys.exit("dm: the Overseer has not noticed this character yet; run a tick while they are online")
     print(write_quest.user_message(context, None, story=story_section(db, context["character"])))
 
 

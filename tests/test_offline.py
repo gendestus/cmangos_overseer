@@ -41,8 +41,13 @@ CONTEXT = {
     "character": {"guid": 1, "name": "Zachadin", "level": 3, "zone": 12, "class": 2, "race": 1,
                   "race_name": "Human", "class_name": "Paladin"},
     "givers": [{"creature": 197, "name": "Marshal McBride", "title": "", "distance": 32, "direction": "east"}],
-    "targets": [{"creature": 257, "name": "Kobold Worker", "min_level": 3, "max_level": 3,
-                 "spawned": 21, "alive": 9, "distance": 300}],
+    "party": [],
+    "targets": [{"creature": 257, "name": "Kobold Worker", "rank": "normal", "min_level": 3, "max_level": 3,
+                 "spawned": 21, "alive": 9, "distance": 300, "direction": "north", "tier": "near",
+                 "unique": False, "needs_party": False},
+                {"creature": 471, "name": "Narg the Taskmaster", "rank": "rare", "min_level": 4, "max_level": 4,
+                 "spawned": 1, "alive": 1, "distance": 900, "direction": "south-west", "tier": "far",
+                 "unique": True, "needs_party": False}],
     "reward_items": [{"item": 111520, "name": "Grimoire of Summon Voidwalker", "required_level": 10}],
     "money_cap": 650, "xp_weight": 100,
 }
@@ -220,6 +225,87 @@ class ConsoleAllowList(unittest.TestCase):
                 console.check_allowed(console.normalise(command))
 
 
+class TargetSearch(unittest.TestCase):
+    """What the model is allowed to be shown. The query itself needs a server."""
+
+    def rows(self, **overrides):
+        row = {"rank": "normal", "tier": "near", "unique": False, "needs_party": False}
+        row.update(overrides)
+        return row
+
+    def test_the_far_tier_cannot_crowd_out_what_is_near(self):
+        near = [self.rows(tier="near", creature=i) for i in range(20)]
+        distant = [self.rows(tier="far", creature=100 + i) for i in range(20)]
+        kept = world_query.trim(near + distant, 12)
+        self.assertEqual(len(kept), 12)
+        self.assertEqual(len([r for r in kept if r["tier"] == "near"]), 8)
+        self.assertEqual(len([r for r in kept if r["tier"] == "far"]), 4)
+
+    def test_the_far_tier_fills_the_list_when_little_is_near(self):
+        near = [self.rows(tier="near", creature=1)]
+        distant = [self.rows(tier="far", creature=100 + i) for i in range(20)]
+        kept = world_query.trim(near + distant, 12)
+        self.assertEqual(len(kept), 12)
+        self.assertEqual(kept[0]["creature"], 1)         # the near one is still first
+
+    def test_a_short_list_is_left_alone(self):
+        self.assertEqual(len(world_query.trim([self.rows(tier="near", creature=1)], 12)), 1)
+        self.assertEqual(world_query.trim([], 12), [])
+
+    def test_every_rank_has_a_window_and_a_threshold(self):
+        for name in world_query.RANK_NAMES.values():
+            self.assertIn(name, world_query.RANK_WINDOW)
+            self.assertIn(name, world_query.RANK_NEEDS_ALIVE)
+        self.assertNotIn(3, world_query.RANK_NAMES)      # a world boss is never offered
+
+    def test_a_hunt_needs_a_crowd_and_a_named_creature_does_not(self):
+        self.assertGreater(world_query.RANK_NEEDS_ALIVE["normal"], 1)
+        for named in ("rare", "elite", "rare elite"):
+            self.assertEqual(world_query.RANK_NEEDS_ALIVE[named], 1)
+
+    def test_the_party_note_reads_naturally(self):
+        who = {"name": "Zachadin"}
+        self.assertEqual(world_query.party_note(who, []), "Zachadin is alone.")
+        self.assertEqual(world_query.party_note(who, [{"name": "Bo", "level": 9, "online": 0}]),
+                         "Zachadin is alone.")           # offline company is no help
+        self.assertEqual(world_query.party_note(who, [{"name": "Bo", "level": 9, "online": 1}]),
+                         "Zachadin is in a party of 2, with Bo, level 9.")
+
+
+class WhatTheModelIsTold(unittest.TestCase):
+    def message(self, context=None):
+        return write_quest.user_message(context or CONTEXT, None)
+
+    def test_a_target_carries_its_rank_bearing_and_count(self):
+        line = [l for l in self.message().splitlines() if "Kobold Worker" in l][0]
+        self.assertIn("normal", line)
+        self.assertIn("9 alive", line)
+        self.assertIn("300 yards north", line)
+
+    def test_a_far_target_is_called_a_journey(self):
+        line = [l for l in self.message().splitlines() if "Narg" in l][0]
+        self.assertIn("a journey", line)
+        self.assertIn("the only one", line)              # a single spawn is not a crowd
+        self.assertIn("rare", line)
+
+    def test_an_elite_says_it_needs_the_party(self):
+        context = dict(CONTEXT, targets=[dict(CONTEXT["targets"][0], name="Hogger", rank="elite",
+                                              needs_party=True)])
+        self.assertIn("needs the party", self.message(context))
+
+    def test_the_party_is_stated(self):
+        self.assertIn("Zachadin is alone.", self.message())
+        with_party = dict(CONTEXT, party=[{"name": "Bo", "level": 4, "online": 1}])
+        self.assertIn("party of 2", self.message(with_party))
+
+    def test_a_named_target_caps_the_kill_count_at_one(self):
+        answer = dict(ANSWER, target_creature=471, kill_count=3)
+        with self.assertRaises(write_quest.Rejected):     # only one is alive
+            write_quest.build_spec(answer, CONTEXT, 30000)
+        spec, _, _ = write_quest.build_spec(dict(answer, kill_count=1), CONTEXT, 30000)
+        self.assertEqual(spec["kill"], [{"creature": 471, "count": 1}])
+
+
 class KillSwitch(unittest.TestCase):
     """One flag stops everything that reaches the game; reading is unaffected."""
 
@@ -364,6 +450,42 @@ class MemoryFile(unittest.TestCase):
         self.assertEqual(dm.wants_bounty(db, who), "a bounty is already out")       # accepted: blocks, never expires
         db.execute("UPDATE quests SET status = 'completed', completed_at = 1")
         self.assertIsNone(dm.wants_bounty(db, who))                                 # finished long ago: free again
+        db.close()
+
+    def test_a_target_is_not_reused_from_the_last_bounties(self):
+        os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
+        db = dm_state.connect()
+        self.assertEqual(dm.recent_targets(db, 1), [])
+        for quest, creature, at in ((30000, 69, 1), (30001, 257, 2), (30002, 38, 3)):
+            db.execute("INSERT INTO quests (quest, guid, title, target, spec, issued_at, status) "
+                       "VALUES (?, 1, 'T', 'name only', ?, ?, 'completed')",
+                       (quest, json.dumps({"kill": [{"creature": creature, "count": 4}]}), at))
+        # The creature comes from the spec; the target column holds only a name.
+        self.assertEqual(sorted(dm.recent_targets(db, 1)), [38, 257])
+        self.assertEqual(sorted(dm.recent_targets(db, 1, count=3)), [38, 69, 257])
+        db.close()
+
+    def test_a_bounty_with_an_unreadable_spec_is_skipped_not_fatal(self):
+        os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
+        db = dm_state.connect()
+        db.execute("INSERT INTO quests (quest, guid, title, spec, issued_at, status) "
+                   "VALUES (30000, 1, 'T', 'not json', 1, 'completed')")
+        self.assertEqual(dm.recent_targets(db, 1), [])
+        db.close()
+
+    def test_every_bounty_status_can_be_described(self):
+        """story_section builds the model's prompt; an unknown status must not stop it."""
+        os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
+        db = dm_state.connect()
+        who = {"guid": 1, "name": "Zachadin", "race": 1, "class": 2, "level": 4, "zone": 12}
+        dm_state.save_character(db, who, [], [], [], first=True)
+        for i, status in enumerate(("completed", "accepted", "offered", "ignored", "purged", "something new")):
+            db.execute("INSERT INTO quests (quest, guid, title, target, spec, issued_at, completed_at, "
+                       "story_beat, status) VALUES (?, 1, 'T', 'Wolf', ?, 1, 2, 'b', ?)",
+                       (30000 + i, json.dumps({"kill": [{"creature": 69, "count": 4}]}), status))
+        text = dm.story_section(db, who)                 # must not raise
+        self.assertIn("withdrawn by the server owner", text)
+        self.assertIn("something new", text)
         db.close()
 
     def test_elapsed_time_reads_naturally(self):

@@ -9,7 +9,7 @@ It runs beside a [cmangos-deploy](https://github.com/mserajnik/cmangos-deploy) s
 1. **Observe.** A tick forces a save and reads the game databases: who is online, where, what they finished, who they are grouped with.
 2. **Remember.** Anything new goes into the DM's own memory file, `state.db`: a chronicle per character, every bounty and how it ended, and a running story summary.
 3. **Plan.** The first time a character is noticed, the model writes a private mini-arc for them: what the Overseer wants them to become over the next few levels, the enemy the story turns toward, and two to four beats. When an arc ends, the next is planned from how it actually went, so the story can turn.
-4. **Propose.** When a character has no bounty out, the model is given the arc, the story so far, and real nearby NPCs, creatures and rewards. It picks which NPC the Overseer speaks through, writes the bounty, and the proposal is stored, not applied.
+4. **Propose.** When a character has no bounty out, the model is given the arc, the story so far, and real NPCs, creatures and rewards. Creatures come with their rank, how many are alive, and the distance and compass bearing of the nearest one, in two tiers: nearby, and far enough to be worth a journey. A named elite is offered only to a character with company or a wide level margin, and the last two bounties' targets are left out. It picks which NPC the Overseer speaks through, writes the bounty, and the proposal is stored, not applied.
 5. **Approve.** You review and approve. Only then is the quest written to the game, reloaded through the server's remote console, and announced.
 
 One bounty at a time: a character with a bounty offered or accepted gets no new proposal. An accepted bounty never expires; one nobody accepts is dropped after a day.
@@ -225,6 +225,7 @@ For testing against something other than the live server: `DM_DB_COMMAND`, `DM_D
 
 - **Heralds are existing quest NPCs.** A bounty is offered through a living NPC that already gives quests, has a single spawn, and is not hostile to the character. The search widens from 300 yards until it finds some. An NPC that is not a quest giver cannot be used without a server restart.
 - **Bounties are visible to everyone** at the giver, not only the character they were written for. The chronicle records who actually completed each one.
+- **A party can disband after a bounty is written.** An elite is offered on the strength of who was online and grouped at that moment. Nothing re-checks it at turn-in.
 - **Quest markers are not pushed.** A player already standing near the giver will not see the "!" for a new quest until the NPC comes back into view. Every bounty is announced for this reason.
 - **A tick is a sample.** Company during a hunt is whoever was grouped or nearby when a tick ran. The server does not record who landed a kill.
 - **Friend or foe comes from the game's own faction files.** If they cannot be read, the DM falls back to rough rules: only "friendly to all" NPCs as heralds, and city factions excluded as targets.

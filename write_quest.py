@@ -34,7 +34,9 @@ Voice: an old, amused, slightly unsettling intelligence that has just started pa
 
 Rules:
 - Pick the herald only from the list of nearby NPCs. Choose one who suits the errand, and prefer a nearer one unless the story gains from the walk. Write their lines as that person would speak, with something else behind the words; a guard captain, an innkeeper and a priestess should not sound alike.
-- Pick the hunt target only from the list of nearby creatures. The kill count must not exceed that creature's alive count or the stated maximum.
+- Pick the hunt target only from the list of creatures. The kill count must not exceed that creature's alive count or the stated maximum.
+- A rare, elite or rare elite is one named creature, not a crowd: ask for one kill and write the quest as a hunt for a specific enemy, by name. Only a normal creature supports killing several.
+- A target marked "a journey" is far enough away to be worth saying so: name the direction in the quest text, so the character knows where to walk.
 - Pick the item reward only from the reward list, or give none. A capstone book is a rare prize: offer one only when the hunt is a real effort for this character.
 - Money must not exceed the stated cap.
 - In quest text, write $N for the character's name and $C for their class. Use each at most twice.
@@ -80,14 +82,17 @@ class NoContext(Exception):
     """There is nothing sensible to offer this character right now."""
 
 
-def gather(name):
+def gather(name, skip=()):
+    """Everything the model is shown. `skip` is creature ids a bounty should not reuse."""
     who = world_query.character(name)
     if not who:
         raise NoContext(f"no character named {name}")
+    party = world_query.parties().get(who["guid"], [])
     context = {
         "character": who,
+        "party": party,
         "givers": world_query.givers(who),
-        "targets": world_query.targets(who),
+        "targets": world_query.targets(who, party=party, skip=skip),
         "reward_items": world_query.reward_items(who),
         "money_cap": world_query.money_cap(who["level"]),
         "xp_weight": world_query.xp_weight(who["level"]),
@@ -109,10 +114,16 @@ def user_message(context, hint, story=None):
     for g in context["givers"]:
         role = f", {g['title']}" if g["title"] else ""
         lines.append(f"- {g['creature']}: {g['name']}{role}, {g['distance']} yards {g['direction']}")
-    lines += ["", "Nearby creatures (id, name, level, alive now, yards away):"]
+    lines += ["", world_query.party_note(who, context.get("party", []))]
+    lines += ["", "Creatures the Overseer may send them against:"]
     for t in context["targets"]:
         level = t["min_level"] if t["min_level"] == t["max_level"] else f"{t['min_level']}-{t['max_level']}"
-        lines.append(f"- {t['creature']}: {t['name']}, level {level}, {t['alive']} alive, {t['distance']} yards")
+        where = f"{t['distance']} yards {t['direction']}"
+        if t["tier"] == "far":
+            where += ", a journey"
+        count = "the only one" if t["unique"] else f"{t['alive']} alive"
+        note = " - needs the party" if t.get("needs_party") else ""
+        lines.append(f"- {t['creature']}: {t['name']}, {t['rank']}, level {level}, {count}, {where}{note}")
     lines += ["", f"Maximum kill count: {MAX_KILLS}.", f"Money cap: {context['money_cap']} copper.", ""]
     if context["reward_items"]:
         lines.append("Reward list (id, name, level needed to use it):")

@@ -9,7 +9,8 @@ Order follows the owner's ranking. Estimates are rough guesses for one person wo
 | 4a | Mini-arcs: written at first notice, carried into every bounty, ended and succeeded | Pulled forward | Built |
 | G | Dynamic heralds: the model picks a nearby friendly quest NPC; no configured list | An evening | Built |
 | 0.4 | Narrow database users, a kill switch, and one command that undoes everything | An evening | Built |
-| 1 | Richer bounties: six kinds, chains, spell rewards | Two weekends | Next |
+| 1.1 | Target search v2: ranks, two distance tiers, bearings, party awareness | An evening | Built |
+| 1 | The rest of richer bounties: six kinds, chains, spell rewards | Two weekends | Next |
 | 2 | Overseer mail, both directions | A weekend | |
 | 3 | Extra rewards with a budget | A weekend | |
 | 4b | Arc revision, grounding the adversary, signature rewards | An evening or two | |
@@ -86,15 +87,17 @@ Today every bounty is "kill N of one normal creature within 400 yards".
 
 ### 1.1 Target search v2 (`world_query.targets`)
 
-The herald work delivered two pieces of groundwork: friend or foe is exact (`factions.py`), and `world_query.bearing()` exists. `targets()` itself is unchanged — still a 400-yard radius, `Rank = 0` only, no bearing on a target. All four bullets are still to do:
+Built. `targets()` is one window-function query that returns the nearest spawn of each eligible creature with its rank, both counts, distance and bearing.
 
-- Include elites, rares and single named spawns, each labelled with its rank.
-- Two distance tiers: near (400 yards) and far (about 1,500 yards, same continent).
-- Add a compass bearing and distance to each target, so quest text can say "north-east along the coast".
-- Skip targets used in the character's last two bounties.
-- Know the party: its size and levels, so elites are only offered to a group.
+- **Ranks.** `creature_template.Rank`: 0 normal, 1 elite, 2 rare elite, 4 rare. A world boss (3) is never offered. Each rank has its own level window and its own threshold for how many must be alive: a hunt of several needs three, a named creature needs one. A single spawn is flagged `unique`, so quest text can treat it as an individual.
+- **Two tiers.** `near` is within 400 yards, `far` reaches 1,500 on the same continent. `trim()` keeps the list short without letting the far tier crowd out what is nearby.
+- **Bearings.** Distance and compass bearing of the nearest spawn, from `bearing()`. The prompt marks a far target "a journey" and the rules tell the model to name the direction.
+- **No repeats.** `dm.recent_targets` reads the creature ids out of the last two bounties' specs and `gather(skip=...)` leaves them out. The ids come from the spec, not the `target` column, which holds only a name.
+- **The party.** `parties()` feeds `targets(party=...)`. An elite is offered only to a character with online company, or one `SOLO_ELITE_MARGIN` (4) levels above it; those offered on the party's strength are flagged `needs_party`, which 1.2's validator should re-check at approval time, because a party can disband in between.
 
-Accept when: `world_query.py <Character>` lists ranked, far and named targets with bearings.
+Also relaxed: the `LootId <> 0` filter now applies only to normal creatures. A named elite with no loot table of its own is still worth facing.
+
+Accepted: `world_query.py Gendestus` lists ranked, far and named targets with bearings. Verified against the live world at two levels — a level 4 in Northshire gets eleven normal targets across both tiers, a level 12 in Goldshire gets five rares solo and two party-gated elites (Felinni, Hogger).
 
 ### 1.2 Bounty kinds
 

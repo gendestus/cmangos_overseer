@@ -88,39 +88,118 @@ def bearing(who, x, y):
         int((angle + 22.5) // 45) % 8]
 
 
-def targets(who, radius=400, below=3, above=2, limit=12):
-    """Creatures spawned near the character, close to its level, that it may fairly hunt.
+# Creature ranks, from creature_template.Rank. Rank 3 is a world boss and is
+# never offered. A rare is a named creature one player is meant to beat; an
+# elite is not, unless the character has help or a wide level margin.
+RANK_NAMES = {0: "normal", 1: "elite", 2: "rare elite", 4: "rare"}
+NEAR_YARDS = 400
+FAR_YARDS = 1500
+# Level window per rank, as (levels below the character, levels above).
+RANK_WINDOW = {"normal": (3, 2), "rare": (4, 2), "elite": (6, 1), "rare elite": (6, 1)}
+# How many must be alive for the rank to be worth offering: a hunt of several
+# needs a crowd, a named creature is one body.
+RANK_NEEDS_ALIVE = {"normal": 3, "rare": 1, "elite": 1, "rare elite": 1}
+# An elite is fair for one player only this far below them.
+SOLO_ELITE_MARGIN = 4
+
+
+def targets(who, party=(), skip=(), limit=14, far=True):
+    """Creatures the character may fairly hunt, near and far, each labelled.
+
+    Two tiers: `near` is within 400 yards, `far` reaches 1,500 on the same
+    continent, so a bounty can send someone on a journey. Every row carries its
+    rank, how many are alive, and the distance and compass bearing of the
+    nearest one, so quest text can say "north-east along the coast".
 
     `alive` discounts spawns that are dead and waiting on their respawn timer.
-    A creature that counts this character's race as a friend is never offered.
+    A creature that counts this character's race as a friend is never offered,
+    and nor is a world boss.
+
+    party: the other members from `parties()`. Their presence is what makes an
+           elite fair; alone, an elite is offered only well below level.
+    skip:  creature ids to leave out, so a bounty does not repeat its target.
     """
     level = who["level"]
+    reach = FAR_YARDS if far else NEAR_YARDS
+    widest = max(below for below, _ in RANK_WINDOW.values())
+    highest = max(above for _, above in RANK_WINDOW.values())
     found = rows(f"""
-        SELECT JSON_OBJECT('creature', t.Entry, 'name', t.Name, 'min_level', t.MinLevel, 'max_level', t.MaxLevel,
-                           'faction', t.Faction, 'spawned', COUNT(*), 'alive', SUM(r.guid IS NULL),
-                           'distance', ROUND(MIN(SQRT(POW(c.position_x - ({who['x']}), 2) + POW(c.position_y - ({who['y']}), 2)))))
-        FROM {hot_quest.WORLD_DB}.creature c
-        JOIN {hot_quest.WORLD_DB}.creature_template t ON t.Entry = c.id
-        LEFT JOIN {hot_quest.CHAR_DB}.creature_respawn r ON r.guid = c.guid AND r.respawntime > UNIX_TIMESTAMP()
-        WHERE c.map = {who['map']}
-          AND POW(c.position_x - ({who['x']}), 2) + POW(c.position_y - ({who['y']}), 2) < {radius * radius}
-          AND t.NpcFlags = 0 AND t.LootId <> 0 AND t.Civilian = 0 AND t.`Rank` = 0
-          AND (t.ExtraFlags & {GUARD_FLAG}) = 0
-          AND t.CreatureType NOT IN {SKIP_CREATURE_TYPES}
-          AND t.MaxLevel BETWEEN {max(1, level - below)} AND {level + above}
-        GROUP BY t.Entry
-        HAVING SUM(r.guid IS NULL) >= 3
-        ORDER BY MIN(SQRT(POW(c.position_x - ({who['x']}), 2) + POW(c.position_y - ({who['y']}), 2)))
-        LIMIT {limit * 4};""")
+        SELECT JSON_OBJECT('creature', Entry, 'name', Name, 'rank', `Rank`, 'loot', LootId,
+                           'min_level', MinLevel, 'max_level', MaxLevel, 'faction', Faction,
+                           'spawned', spawned, 'alive', alive,
+                           'distance', ROUND(distance), 'x', x, 'y', y)
+        FROM (
+            SELECT t.Entry, t.Name, t.`Rank`, t.LootId, t.MinLevel, t.MaxLevel, t.Faction,
+                   ROUND(c.position_x, 1) AS x, ROUND(c.position_y, 1) AS y,
+                   SQRT(POW(c.position_x - ({who['x']}), 2) + POW(c.position_y - ({who['y']}), 2)) AS distance,
+                   COUNT(*) OVER (PARTITION BY t.Entry) AS spawned,
+                   SUM(r.guid IS NULL) OVER (PARTITION BY t.Entry) AS alive,
+                   ROW_NUMBER() OVER (PARTITION BY t.Entry
+                                      ORDER BY POW(c.position_x - ({who['x']}), 2)
+                                             + POW(c.position_y - ({who['y']}), 2)) AS nearest
+            FROM {hot_quest.WORLD_DB}.creature c
+            JOIN {hot_quest.WORLD_DB}.creature_template t ON t.Entry = c.id
+            LEFT JOIN {hot_quest.CHAR_DB}.creature_respawn r ON r.guid = c.guid AND r.respawntime > UNIX_TIMESTAMP()
+            WHERE c.map = {who['map']}
+              AND POW(c.position_x - ({who['x']}), 2) + POW(c.position_y - ({who['y']}), 2) < {reach * reach}
+              AND t.NpcFlags = 0 AND t.Civilian = 0 AND t.`Rank` <> 3
+              AND (t.ExtraFlags & {GUARD_FLAG}) = 0
+              AND t.CreatureType NOT IN {SKIP_CREATURE_TYPES}
+              AND t.MaxLevel BETWEEN {max(1, level - widest)} AND {level + highest}
+        ) spawns
+        WHERE nearest = 1
+        ORDER BY distance;""")
+
     tables = factions.get()
+    helpers = [other for other in party if other.get("online")]
+    leave_out = {int(ident) for ident in skip}
     fair = []
     for row in found:                   # the database returns aggregates as text
-        for key in ("spawned", "alive", "distance"):
+        for key in ("spawned", "alive", "distance", "loot"):
             row[key] = int(float(row[key]))
+        row["rank"] = RANK_NAMES.get(int(row["rank"]))
+        if row["rank"] is None or row["creature"] in leave_out:
+            continue
         friendly = tables.is_friendly(row["faction"], who["race"]) if tables else row["faction"] in PLAYER_FACTIONS
-        if not friendly:
-            fair.append(row)
-    return fair[:limit]
+        if friendly or row["alive"] < RANK_NEEDS_ALIVE[row["rank"]]:
+            continue
+        # A hunt of several needs a creature that drops something. A named one
+        # is worth facing whether or not it has a loot table of its own.
+        if row["rank"] == "normal" and not row["loot"]:
+            continue
+        below, above = RANK_WINDOW[row["rank"]]
+        if not max(1, level - below) <= row["max_level"] <= level + above:
+            continue
+        row["needs_party"] = False
+        if row["rank"] in ("elite", "rare elite"):
+            if level - row["max_level"] >= SOLO_ELITE_MARGIN:
+                pass                                  # far enough below to take alone
+            elif helpers:
+                row["needs_party"] = True             # fair only while the party holds
+            else:
+                continue
+        row["tier"] = "near" if row["distance"] <= NEAR_YARDS else "far"
+        row["unique"] = row["spawned"] == 1
+        row["direction"] = bearing(who, float(row.pop("x")), float(row.pop("y")))
+        fair.append(row)
+    return trim(fair, limit)
+
+
+def trim(found, limit):
+    """Keep the list short without letting the far tier crowd out what is near."""
+    near = [row for row in found if row["tier"] == "near"]
+    distant = [row for row in found if row["tier"] == "far"]
+    room = max(limit // 3, limit - len(near))
+    return near[:limit - min(len(distant), room)] + distant[:room]
+
+
+def party_note(who, party):
+    """One line about the company this character keeps, for the prompt."""
+    helpers = [other for other in party if other.get("online")]
+    if not helpers:
+        return f"{who['name']} is alone."
+    levels = ", ".join(f"{other['name']}, level {other['level']}" for other in helpers)
+    return f"{who['name']} is in a party of {len(helpers) + 1}, with {levels}."
 
 
 def givers(who, limit=8):
@@ -338,8 +417,10 @@ def main():
         who = character(sys.argv[1])
         if not who:
             sys.exit(f"world_query: no character named {sys.argv[1]}")
+        party = parties().get(who["guid"], [])
         report = {"character": who, "faction_files_found": factions.get() is not None,
-                  "givers": givers(who), "targets": targets(who),
+                  "party": party,
+                  "givers": givers(who), "targets": targets(who, party=party),
                   "reward_items": reward_items(who), "xp_weight": xp_weight(who["level"]),
                   "money_cap_copper": money_cap(who["level"]), "next_quest_id": next_quest_id()}
     except QueryError as error:
