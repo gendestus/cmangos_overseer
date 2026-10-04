@@ -10,8 +10,9 @@ Settings:
     DM_LLM_PROVIDER     "anthropic" (default) or "stub"
     ANTHROPIC_API_KEY   key for the Claude API
     DM_MODEL            model id (default claude-sonnet-5-5)
-    DM_LLM_STUB         for the stub provider: path to a JSON file holding the
-                        tool arguments to return, for testing without a key
+    DM_LLM_STUB         for the stub provider: a JSON file holding the tool arguments
+                        to return, or a folder of <tool name>.json files, for
+                        testing without a key
 """
 import json
 import os
@@ -31,14 +32,16 @@ def ask_for_tool_call(system, user, tool, max_tokens=2048):
     """Return (tool_arguments, usage) where usage has input and output token counts."""
     provider = os.environ.get("DM_LLM_PROVIDER", "anthropic").lower()
     if provider == "stub":
-        return _stub()
+        return _stub(tool)
     if provider == "anthropic":
         return _anthropic(system, user, tool, max_tokens)
     raise LLMError(f"unknown DM_LLM_PROVIDER '{provider}'")
 
 
-def _stub():
+def _stub(tool):
     path = os.environ.get("DM_LLM_STUB", "")
+    if os.path.isdir(path):                 # a folder holds one canned answer per tool name
+        path = os.path.join(path, tool["name"] + ".json")
     try:
         with open(path, encoding="utf-8") as handle:
             return json.load(handle), {"input_tokens": 0, "output_tokens": 0, "model": "stub"}

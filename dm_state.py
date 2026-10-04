@@ -37,6 +37,14 @@ CREATE TABLE IF NOT EXISTS proposals (
     decided_at INTEGER, reason TEXT
 );
 CREATE TABLE IF NOT EXISTS seen_letters (id INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS arcs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, guid INTEGER,
+    status TEXT NOT NULL DEFAULT 'active',       -- active, superseded
+    premise TEXT, lure TEXT, adversary TEXT,
+    beats TEXT,                                  -- JSON list of {level_band, intent}
+    current_beat INTEGER NOT NULL DEFAULT 0,     -- index into beats
+    signature_reward TEXT, seed TEXT, model TEXT, created_at INTEGER, updated_at INTEGER
+);
 CREATE TABLE IF NOT EXISTS companions (
     quest INTEGER, guid INTEGER, name TEXT, descr TEXT,
     how TEXT,                                    -- party, shared (also took the bounty), nearby
@@ -50,6 +58,8 @@ ADDED_COLUMNS = (
     ("characters", "party", "TEXT NOT NULL DEFAULT '[]'"),     # who they were last seen grouped with
     ("quests", "completed_by", "TEXT"),
     ("quests", "circumstances", "TEXT"),
+    ("proposals", "type", "TEXT NOT NULL DEFAULT 'bounty'"),   # bounty, arc (letter and gift to come)
+    ("proposals", "payload", "TEXT"),                          # JSON for whatever the type needs
 )
 
 
@@ -138,8 +148,18 @@ def events_since(db, guid, ts, limit=25):
                       (guid, ts, limit)).fetchall()
 
 
-def pending_proposal(db, guid):
+def pending_proposal(db, guid, kind=None):
+    """A proposal for this character still waiting for a decision; optionally of one type."""
+    if kind:
+        return db.execute("SELECT * FROM proposals WHERE guid = ? AND status = 'pending' AND type = ?",
+                          (guid, kind)).fetchone()
     return db.execute("SELECT * FROM proposals WHERE guid = ? AND status = 'pending'", (guid,)).fetchone()
+
+
+def active_arc(db, guid):
+    """The private plan the Overseer is following for this character, if one is approved."""
+    return db.execute("SELECT * FROM arcs WHERE guid = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+                      (guid,)).fetchone()
 
 
 def proposals_in_last_hour(db):

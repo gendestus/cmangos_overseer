@@ -7,9 +7,15 @@
     python3 dm.py approve 3            put proposal 3 live
     python3 dm.py reject 3 "too easy"  discard it, with a reason the story keeps
     python3 dm.py story Zachadin       the chronicle for one character
+    python3 dm.py arc Zachadin         the Overseer's private plan for a character (a spoiler)
+    python3 dm.py arc Zachadin --seed "lead this priest down a dark path"
     python3 dm.py context Zachadin     what the model would be told next; no model call
 
-A tick never puts a quest live. It only:
+One bounty at a time: a character with a bounty offered or accepted gets no new proposal.
+An accepted bounty never expires; one that is never accepted is dropped after DM_STALE_HOURS.
+A character gets an arc before their first bounty, and every bounty after serves it.
+
+Unless you set DM_AUTO_APPROVE, a tick never puts a quest live. It only:
   - forces a save and reads the game databases,
   - writes what it noticed to its own memory (state.db),
   - notes who is in a party with whom, and who is nearby while a bounty is under way,
@@ -22,6 +28,8 @@ Settings, on top of the ones the other scripts use:
     DM_COOLDOWN_MINUTES     wait after a bounty is finished before the next (default 20)
     DM_STALE_HOURS          an offered bounty nobody accepts is dropped after this (default 24)
     DM_MAX_PROPOSALS_HOUR   ceiling on model calls per hour (default 6)
+    DM_AUTO_APPROVE         proposal types that go live without review, comma separated:
+                            bounty, arc, letter (default: letter)
     DM_IGNORE_CHARACTERS    names the DM should not track, comma separated
     DM_MAIL_CHARACTER       name of a character the DM owns; mail sent to it is read as
                             letters to the Overseer (optional)
@@ -30,6 +38,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import sys
 import time
 
@@ -49,6 +58,8 @@ Continuity:
 - Do not reuse the target of either of the last two bounties unless the story calls for it.
 - If the character ignored or was slow with the last bounty, the Overseer has noticed.
 - Other named characters in these notes are real players. When someone helped this character, was helped by them, or claimed a bounty meant for them, use it: the Overseer notices alliances and debts. Name them plainly in the text. Never invent a player.
+- You may have a private arc for this character (shown below when there is one). Each bounty should serve its current beat: nudge toward the lure, bring the adversary closer, foreshadow the signature reward. Do it through what the herald says and what is hunted. Never state the plan to the player. If nothing nearby fits the beat, keep the thread alive in the text.
+- beat_progress: "advance" if this bounty begins the next beat because the character has done enough or outgrown the level band, "hold" to stay on the current beat, "detour" if this bounty steps aside from the arc because of something the character did. With no arc, answer "hold".
 - story_beat: one sentence, past tense, the Overseer's view of what this bounty adds to the story.
 - story_so_far: rewrite the running summary in at most 120 words: who this character is becoming in the Overseer's eyes, what has happened, and one or two open threads. It is your only memory next time, so keep what matters and drop what does not."""
 
@@ -59,7 +70,64 @@ TOOL["input_schema"]["properties"]["story_beat"] = {
     "type": "string", "description": "One sentence, past tense: what this bounty adds to the story."}
 TOOL["input_schema"]["properties"]["story_so_far"] = {
     "type": "string", "description": "The rewritten running summary, at most 120 words."}
-TOOL["input_schema"]["required"] += ["story_beat", "story_so_far"]
+TOOL["input_schema"]["properties"]["beat_progress"] = {
+    "type": "string", "enum": ["advance", "hold", "detour"],
+    "description": "How this bounty relates to the arc's current beat."}
+TOOL["input_schema"]["required"] += ["story_beat", "story_so_far", "beat_progress"]
+
+ARC_SYSTEM = """You are the Overseer, an unseen dungeon master for a small private World of Warcraft (1.12) server with one to three players. You have just taken notice of a character, and you are deciding in secret what you want to make of them.
+
+Write an arc: a private plan for where to lead this character across many bounties.
+
+- premise: one or two sentences on what the Overseer sees in this character.
+- lure: what you want them to become or to do. It can tempt, corrupt, ennoble or test, and it should be specific to their race and class.
+- adversary: one enemy group or kind of creature from Azeroth as it is in 1.12 that the story will turn toward. It must suit the levels ahead of this character and be reachable for their faction.
+- beats: three to five steps. Each has a level band such as "1-10" and one sentence of intent. The first beat starts at the character's current level, the beats escalate, and the last is a payoff.
+- signature_reward: the name of one book from the list given, or an empty string. It is the power the arc builds toward. Prefer a power that is not the character's own by class when it fits the lure.
+- If the server owner gives a direction, build the arc around it.
+- If the character already has a history, the arc must fit what has happened.
+
+This plan is never shown to the player.
+
+Respond by calling the submit_arc tool exactly once. Do not reply with prose."""
+
+ARC_TOOL = {
+    "name": "submit_arc",
+    "description": "Submit the private arc for this character.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "premise": {"type": "string", "description": "One or two sentences."},
+            "lure": {"type": "string", "description": "What the Overseer wants this character to become or do."},
+            "adversary": {"type": "string", "description": "The enemy group the story turns toward."},
+            "beats": {
+                "type": "array", "minItems": 3, "maxItems": 5,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "level_band": {"type": "string", "description": "Levels this beat covers, like 10-20."},
+                        "intent": {"type": "string", "description": "One sentence: what this step does."},
+                    },
+                    "required": ["level_band", "intent"],
+                },
+            },
+            "signature_reward": {"type": "string", "description": "A book name from the list, or an empty string."},
+            "dm_note": {"type": "string", "description": "One sentence for the log: why this arc for this character."},
+        },
+        "required": ["premise", "lure", "adversary", "beats", "signature_reward", "dm_note"],
+    },
+}
+
+BEAT_STATE = ("done", "current", "later")
+
+
+class ApproveFailed(Exception):
+    pass
+
+
+def auto_approved():
+    """Proposal types that go live without waiting for a person."""
+    return {part.strip().lower() for part in os.environ.get("DM_AUTO_APPROVE", "letter").split(",") if part.strip()}
 
 
 def setting(name, default):
@@ -319,17 +387,95 @@ def story_section(db, who):
     else:
         lines.append("- nothing new")
 
+    arc = dm_state.active_arc(db, who["guid"])
+    if arc:
+        lines += ["", arc_text(arc, "Your private arc for this character (never state it to the player):")]
+
     rejected = db.execute("SELECT reason FROM proposals WHERE guid = ? AND status = 'rejected' AND reason <> '' "
-                          "ORDER BY decided_at DESC LIMIT 2", (who["guid"],)).fetchall()
+                          "AND type = 'bounty' ORDER BY decided_at DESC LIMIT 2", (who["guid"],)).fetchall()
     if rejected:
         lines += ["", "The server owner turned down your recent ideas for this character, saying:"]
         lines += [f"- {row['reason']}" for row in rejected]
     return "\n".join(lines)
 
 
+def arc_text(arc, heading):
+    """An arc as plain text, with each beat marked done, current or later."""
+    beats = json.loads(arc["beats"]) if isinstance(arc["beats"], str) else arc["beats"]
+    current = arc["current_beat"] if "current_beat" in arc.keys() else 0
+    lines = [heading, f"Premise: {arc['premise']}", f"Lure: {arc['lure']}", f"Adversary: {arc['adversary']}",
+             f"Signature reward: {arc['signature_reward'] or 'none chosen'}", "Beats:"]
+    for index, beat in enumerate(beats):
+        state = BEAT_STATE[0] if index < current else BEAT_STATE[1] if index == current else BEAT_STATE[2]
+        lines.append(f"{index + 1}. [{state}] levels {beat['level_band']}: {beat['intent']}")
+    return "\n".join(lines)
+
+
+def validate_arc(answer, book_names):
+    """Check the model's arc and return it in stored form. Raises write_quest.Rejected."""
+    arc = {}
+    for field, limit in (("premise", 400), ("lure", 300), ("adversary", 120)):
+        text = " ".join(str(answer.get(field, "")).split())
+        if not text or len(text) > limit:
+            raise write_quest.Rejected(f"arc {field} is missing or over {limit} characters")
+        arc[field] = text
+    beats = answer.get("beats")
+    if not isinstance(beats, list) or not 3 <= len(beats) <= 5:
+        raise write_quest.Rejected("an arc needs three to five beats")
+    arc["beats"] = []
+    for beat in beats:
+        band = "".join(str(beat.get("level_band", "")).split()) if isinstance(beat, dict) else ""
+        intent = " ".join(str(beat.get("intent", "")).split()) if isinstance(beat, dict) else ""
+        if not re.fullmatch(r"\d{1,2}-\d{1,2}", band) or not intent or len(intent) > 300:
+            raise write_quest.Rejected("each beat needs a level band like 10-20 and one sentence of intent")
+        arc["beats"].append({"level_band": band, "intent": intent})
+    wanted = " ".join(str(answer.get("signature_reward", "")).split())
+    by_lower = {name.lower(): name for name in book_names}
+    if wanted and wanted.lower() not in by_lower:
+        raise write_quest.Rejected(f"signature reward \"{wanted}\" is not one of the books on the list")
+    arc["signature_reward"] = by_lower.get(wanted.lower(), "")
+    arc["dm_note"] = " ".join(str(answer.get("dm_note", "")).split())
+    return arc
+
+
+def arc_message(db, who, books, seed):
+    known = dm_state.get_character(db, who["guid"])
+    lines = [f"Character: {world_query.describe(who)}, currently in {world_query.zone_name(who['zone'])}.", ""]
+    events = dm_state.events_since(db, who["guid"], 0, limit=30)
+    lines.append("What you know of them so far:")
+    lines += [f"- {event['text'].split(' [')[0]}" for event in events] or ["- nothing yet"]
+    if known and known["story_so_far"]:
+        lines += ["", "Story so far (your own summary):", known["story_so_far"]]
+    lines += ["", "Books a signature reward may be chosen from (name, level needed to use it):"]
+    lines += [f"- {book['name']}, level {book['required_level']}" for book in books] or ["- none available"]
+    turned_down = db.execute("SELECT reason FROM proposals WHERE guid = ? AND status = 'rejected' AND reason <> '' "
+                             "AND type = 'arc' ORDER BY decided_at DESC LIMIT 2", (who["guid"],)).fetchall()
+    if turned_down:
+        lines += ["", "The server owner turned down your earlier arcs for this character, saying:"]
+        lines += [f"- {row['reason']}" for row in turned_down]
+    if seed:
+        lines += ["", f"Direction from the server owner: {seed}"]
+    return "\n".join(lines)
+
+
+def propose_arc(db, who, seed, say):
+    """Ask the model for an arc and store it as a proposal. Returns the proposal number."""
+    books = world_query.reward_items(who, reach=60, limit=40)
+    answer, usage = llm.ask_for_tool_call(ARC_SYSTEM, arc_message(db, who, books, seed), ARC_TOOL, max_tokens=4096)
+    arc = validate_arc(answer, [book["name"] for book in books])
+    arc["seed"] = seed or ""
+    db.execute("INSERT INTO proposals (ts, guid, name, type, payload, dm_note, model, tokens_in, tokens_out) "
+               "VALUES (?, ?, ?, 'arc', ?, ?, ?, ?, ?)",
+               (dm_state.now(), who["guid"], who["name"], json.dumps(arc), arc["dm_note"], usage.get("model"),
+                usage.get("input_tokens"), usage.get("output_tokens")))
+    number = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    say(f"  {who['name']}: arc proposal {number} written (adversary: {arc['adversary']})")
+    return number
+
+
 def wants_bounty(db, who):
     """Why this character should not get a proposal right now, or None if it should."""
-    if dm_state.pending_proposal(db, who["guid"]):
+    if dm_state.pending_proposal(db, who["guid"], "bounty"):
         return "a proposal is already waiting for approval"
     if dm_state.open_quest(db, who["guid"]):
         return "a bounty is already out"
@@ -343,6 +489,7 @@ def wants_bounty(db, who):
 
 
 def propose(db, who, say):
+    """Ask the model for the next bounty and store it as a proposal. Returns the proposal number."""
     context = write_quest.gather(who["name"])
     message = write_quest.user_message(context, None, story=story_section(db, context["character"]))
     answer, usage = llm.ask_for_tool_call(SYSTEM, message, TOOL, max_tokens=4096)
@@ -353,13 +500,71 @@ def propose(db, who, say):
         raise write_quest.Rejected("the model left out the story beat or the story summary")
     if len(summary.split()) > 160:
         raise write_quest.Rejected("the story summary is far over 120 words")
-    db.execute("INSERT INTO proposals (ts, guid, name, spec, target, announcement, dm_note, story_beat, story_so_far, "
-               "model, tokens_in, tokens_out) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-               (dm_state.now(), who["guid"], who["name"], json.dumps(spec), json.dumps(target), announcement,
-                answer.get("dm_note", ""), beat, summary, usage.get("model"),
+    progress = answer.get("beat_progress") if answer.get("beat_progress") in ("advance", "hold", "detour") else "hold"
+    db.execute("INSERT INTO proposals (ts, guid, name, type, payload, spec, target, announcement, dm_note, story_beat, "
+               "story_so_far, model, tokens_in, tokens_out) VALUES (?, ?, ?, 'bounty', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               (dm_state.now(), who["guid"], who["name"], json.dumps({"beat_progress": progress}), json.dumps(spec),
+                json.dumps(target), announcement, answer.get("dm_note", ""), beat, summary, usage.get("model"),
                 usage.get("input_tokens"), usage.get("output_tokens")))
     number = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-    say(f"  {who['name']}: proposal {number} written, \"{spec['title']}\". Review with: python3 dm.py pending")
+    say(f"  {who['name']}: bounty proposal {number} written, \"{spec['title']}\"")
+    return number
+
+
+def approve_proposal(db, row, say):
+    """Carry out one pending proposal. Raises ApproveFailed if nothing was done."""
+    stamp = dm_state.now()
+    if row["type"] == "arc":
+        arc = json.loads(row["payload"])
+        db.execute("UPDATE arcs SET status = 'superseded', updated_at = ? WHERE guid = ? AND status = 'active'",
+                   (stamp, row["guid"]))
+        db.execute("INSERT INTO arcs (guid, premise, lure, adversary, beats, signature_reward, seed, model, "
+                   "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   (row["guid"], arc["premise"], arc["lure"], arc["adversary"], json.dumps(arc["beats"]),
+                    arc["signature_reward"], arc.get("seed", ""), row["model"], stamp, stamp))
+        db.execute("UPDATE proposals SET status = 'approved', decided_at = ? WHERE id = ?", (stamp, row["id"]))
+        db.commit()
+        say(f"arc for {row['name']} is now in force.")
+        return
+
+    spec = json.loads(row["spec"])
+    spec["id"] = world_query.next_quest_id()        # the id is fixed only now, so it cannot collide
+    try:
+        apply_quest.apply_spec(spec, announce=row["announcement"], say=lambda _line: None)
+    except (apply_quest.StepFailed, hot_quest.SpecError) as error:
+        raise ApproveFailed(str(error)) from None
+    except console.ConsoleError as error:
+        say(f"warning: the quest is in the database but the console step failed: {error}\n"
+            f"  Run `.reload all_quest` in game to load it.")
+    db.execute("INSERT INTO quests (quest, guid, title, target, spec, announcement, dm_note, story_beat, model, "
+               "issued_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               (spec["id"], row["guid"], spec["title"], json.loads(row["target"])["name"], json.dumps(spec),
+                row["announcement"], row["dm_note"], row["story_beat"], row["model"], stamp))
+    db.execute("UPDATE characters SET story_so_far = ? WHERE guid = ?", (row["story_so_far"], row["guid"]))
+    db.execute("UPDATE proposals SET status = 'approved', decided_at = ? WHERE id = ?", (stamp, row["id"]))
+    dm_state.add_event(db, row["guid"], "overseer", f"the Overseer posted the bounty \"{spec['title']}\"")
+    arc = dm_state.active_arc(db, row["guid"])
+    progress = json.loads(row["payload"] or "{}").get("beat_progress", "hold")
+    if arc and progress == "advance":
+        last = len(json.loads(arc["beats"])) - 1
+        db.execute("UPDATE arcs SET current_beat = ?, updated_at = ? WHERE id = ?",
+                   (min(arc["current_beat"] + 1, last), stamp, arc["id"]))
+    db.commit()
+    say(f"quest {spec['id']} is live for {row['name']}; the story has moved on.")
+
+
+def settle(db, number, say):
+    """Approve a fresh proposal on the spot if its type is set to go without review."""
+    row = db.execute("SELECT * FROM proposals WHERE id = ?", (number,)).fetchone()
+    if row["type"] not in auto_approved():
+        say(f"    waiting for you: python3 dm.py pending")
+        return False
+    try:
+        approve_proposal(db, row, lambda line: say(f"    auto-approved: {line}"))
+        return True
+    except ApproveFailed as error:
+        say(f"    auto-approval failed, left pending: {error}")
+        return False
 
 
 def tick(db, say=print):
@@ -380,20 +585,32 @@ def tick(db, say=print):
     observe_letters(db, say)
     db.commit()
 
+    ceiling = setting("DM_MAX_PROPOSALS_HOUR", 6)
     for who in players:
-        reason = wants_bounty(db, who)
-        if reason:
-            say(f"  {who['name']}: no proposal ({reason})")
-            continue
-        if dm_state.proposals_in_last_hour(db) >= setting("DM_MAX_PROPOSALS_HOUR", 6):
-            say("  hourly ceiling on model calls reached; no more proposals this tick")
-            break
         try:
-            propose(db, who, say)
+            # An arc comes first: no bounty is written for a character without an approved plan.
+            if not dm_state.active_arc(db, who["guid"]):
+                if dm_state.pending_proposal(db, who["guid"], "arc"):
+                    say(f"  {who['name']}: no proposal (an arc is waiting for approval)")
+                    continue
+                if dm_state.proposals_in_last_hour(db) >= ceiling:
+                    say("  hourly ceiling on model calls reached; no more proposals this tick")
+                    break
+                if not settle(db, propose_arc(db, who, None, say), say):
+                    db.commit()
+                    continue
+            reason = wants_bounty(db, who)
+            if reason:
+                say(f"  {who['name']}: no proposal ({reason})")
+                continue
+            if dm_state.proposals_in_last_hour(db) >= ceiling:
+                say("  hourly ceiling on model calls reached; no more proposals this tick")
+                break
+            settle(db, propose(db, who, say), say)
         except write_quest.NoContext as error:
             say(f"  {who['name']}: no proposal ({error})")
         except (write_quest.Rejected, hot_quest.SpecError) as error:
-            say(f"  {who['name']}: the model's bounty was rejected ({error}); it will try again next tick")
+            say(f"  {who['name']}: the model's answer was rejected ({error}); it will try again next tick")
         except llm.LLMError as error:
             say(f"  {who['name']}: model call failed ({error})")
         db.commit()
@@ -402,10 +619,19 @@ def tick(db, say=print):
 # ---- commands ---------------------------------------------------------------
 
 def show_proposal(row):
+    if row["type"] == "arc":
+        arc = json.loads(row["payload"])
+        print(f"\n=== Proposal {row['id']}: ARC for {row['name']}  ({dm_state.ago(row['ts'])} ago, {row['status']}) ===")
+        print(arc_text(arc, "A private plan. Reading it is a spoiler if you play this character."))
+        if arc.get("seed"):
+            print(f"Your direction: {arc['seed']}")
+        print(f"Model's note: {row['dm_note']}   [{row['model']}, tokens {row['tokens_in']}/{row['tokens_out']}]")
+        return
     spec, target = json.loads(row["spec"]), json.loads(row["target"])
     reward = [f"{spec['reward']['money_copper']} copper"] + [f"item {i['item']}" for i in spec["reward"]["items"]]
+    progress = json.loads(row["payload"] or "{}").get("beat_progress", "hold")
     print(f"""
-=== Proposal {row['id']} for {row['name']}  ({dm_state.ago(row['ts'])} ago, {row['status']}) ===
+=== Proposal {row['id']}: BOUNTY for {row['name']}  ({dm_state.ago(row['ts'])} ago, {row['status']}) ===
 Title:    {spec['title']}
 Hunt:     {spec['kill'][0]['count']} x {target['name']} ({target['alive']} alive when written)
 Reward:   {', '.join(reward)}
@@ -418,6 +644,7 @@ At turn-in:
 Announcement: {row['announcement']}
 Story beat:   {row['story_beat']}
 Story so far: {row['story_so_far']}
+Arc:          {progress}
 Model's note: {row['dm_note']}   [{row['model']}, tokens {row['tokens_in']}/{row['tokens_out']}]""")
 
 
@@ -435,25 +662,10 @@ def cmd_approve(db, args):
     row = db.execute("SELECT * FROM proposals WHERE id = ? AND status = 'pending'", (args.number,)).fetchone()
     if not row:
         sys.exit(f"dm: no pending proposal {args.number}")
-    spec = json.loads(row["spec"])
-    spec["id"] = world_query.next_quest_id()        # the id is fixed only now, so it cannot collide
     try:
-        apply_quest.apply_spec(spec, announce=row["announcement"])
-    except (apply_quest.StepFailed, hot_quest.SpecError) as error:
+        approve_proposal(db, row, print)
+    except ApproveFailed as error:
         sys.exit(f"dm: not applied: {error}")
-    except console.ConsoleError as error:
-        print(f"warning: the quest is in the database but the console step failed: {error}\n"
-              f"  Run `.reload all_quest` in game to load it.")
-    stamp = dm_state.now()
-    db.execute("INSERT INTO quests (quest, guid, title, target, spec, announcement, dm_note, story_beat, model, "
-               "issued_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-               (spec["id"], row["guid"], spec["title"], json.loads(row["target"])["name"], json.dumps(spec),
-                row["announcement"], row["dm_note"], row["story_beat"], row["model"], stamp))
-    db.execute("UPDATE characters SET story_so_far = ? WHERE guid = ?", (row["story_so_far"], row["guid"]))
-    db.execute("UPDATE proposals SET status = 'approved', decided_at = ? WHERE id = ?", (stamp, row["id"]))
-    dm_state.add_event(db, row["guid"], "overseer", f"the Overseer posted the bounty \"{spec['title']}\"")
-    db.commit()
-    print(f"quest {spec['id']} is live for {row['name']}; the story has moved on.")
 
 
 def cmd_reject(db, args):
@@ -463,8 +675,34 @@ def cmd_reject(db, args):
     db.execute("UPDATE proposals SET status = 'rejected', decided_at = ?, reason = ? WHERE id = ?",
                (dm_state.now(), args.reason or "", row["id"]))
     db.commit()
-    print(f"proposal {row['id']} rejected. A new one will be written on the next tick"
+    print(f"proposal {row['id']} rejected. A new {row['type']} will be written on the next tick"
           + (", with your reason passed to the model." if args.reason else "."))
+
+
+def cmd_arc(db, args):
+    """Show a character's arc, or have a new one written from a direction of yours."""
+    who = world_query.character(args.character)
+    if not who:
+        sys.exit(f"dm: no character named {args.character}")
+    if not dm_state.get_character(db, who["guid"]):
+        sys.exit("dm: the Overseer has not noticed this character yet; run a tick while they are online")
+    if args.seed:
+        waiting = dm_state.pending_proposal(db, who["guid"], "arc")
+        if waiting:
+            sys.exit(f"dm: arc proposal {waiting['id']} is already waiting; approve or reject it first")
+        try:
+            settle(db, propose_arc(db, who, args.seed, print), print)
+        except (write_quest.Rejected, llm.LLMError) as error:
+            sys.exit(f"dm: no arc written: {error}")
+        db.commit()
+        return
+    arc = dm_state.active_arc(db, who["guid"])
+    if not arc:
+        print("no arc in force. One is written on the next tick, or give a direction with --seed.")
+        return
+    print(arc_text(arc, f"=== Arc for {who['name']} (a spoiler if you play this character) ==="))
+    if arc["seed"]:
+        print(f"Your direction: {arc['seed']}")
 
 
 def cmd_story(db, args):
@@ -535,6 +773,10 @@ def main():
     story = commands.add_parser("story", help="the chronicle for one character")
     story.add_argument("character")
     story.set_defaults(run=cmd_story)
+    arc = commands.add_parser("arc", help="show a character's private arc, or reseed it")
+    arc.add_argument("character")
+    arc.add_argument("--seed", metavar="TEXT", help="a direction; a new arc is written around it")
+    arc.set_defaults(run=cmd_arc)
     context = commands.add_parser("context", help="show what the model would be told; no model call")
     context.add_argument("character")
     context.set_defaults(run=cmd_context)

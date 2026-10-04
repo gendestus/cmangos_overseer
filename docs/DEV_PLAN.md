@@ -1,15 +1,24 @@
 # Overseer dev plan: richer bounties, mail, rewards, throughlines
 
-Status: plan for review. Nothing here is built.
+Status: decisions taken 2026-10-04. Phase 0 and the first half of Phase 4 are built; Phases 1 to 3 are not.
 Order follows the owner's ranking. Estimates are rough guesses for one person working with a coding agent.
 
-| Phase | Result | Estimate | Needs a server restart |
+| Phase | Result | Estimate | Status |
 |---|---|---|---|
-| 0 | One-bounty rule made explicit; shared plumbing | An evening | No |
-| 1 | Richer bounties: six kinds, chains, spell rewards | Two weekends | Only for 1.7 |
-| 2 | Overseer mail, both directions | A weekend | Once, for a config line |
-| 3 | Extra rewards with a budget | A weekend | No |
-| 4 | Character throughlines | A weekend | No |
+| 0 | One-bounty rule made explicit; typed proposals; offline tests | An evening | Built |
+| 4a | Arcs: written at first notice, approved, carried into every bounty | Pulled forward | Built |
+| 1 | Richer bounties: six kinds, chains, spell rewards | Two weekends | Next |
+| 2 | Overseer mail, both directions | A weekend | |
+| 3 | Extra rewards with a budget | A weekend | |
+| 4b | Arc revision, grounding the adversary, signature rewards | An evening or two | |
+
+## Decisions
+
+1. **A bounty nobody accepts** still expires after `DM_STALE_HOURS` (24).
+2. **Letters send without approval.**
+3. **Reward budgets** start as rough numbers and get tuned in play.
+4. **The goal is a fully automatic DM.** Approval is a setting per proposal type, `DM_AUTO_APPROVE`, so turning automation on later is a configuration change, not a rewrite. It defaults to `letter`.
+5. **Arc setup was pulled forward** and is built.
 
 ## Ground rules (unchanged)
 
@@ -18,7 +27,7 @@ Order follows the owner's ranking. Estimates are rough guesses for one person wo
 - Every model choice is checked against lists the script built from the live database.
 - Console commands go through the allow-list in `console.py`.
 
-## Phase 0: one active bounty, and shared plumbing
+## Phase 0: one active bounty, and shared plumbing (built)
 
 ### 0.1 The one-bounty rule
 
@@ -164,6 +173,8 @@ Triggers: level milestones, helping another player's bounty, returning after a l
 
 ## Phase 4: character throughlines
 
+Built so far (4a): 4.1, 4.2 and 4.3. Remaining (4b): 4.4, 4.5, and delivering the signature reward through the Phase 3 catalogue.
+
 ### 4.1 The arc
 
 New table `arcs`, one active arc per character:
@@ -172,7 +183,7 @@ New table `arcs`, one active arc per character:
 - **Lure:** what the Overseer wants this character to become ("lead this priest down a dark path").
 - **Adversary:** the enemy group the story turns toward ("the Naga").
 - **Beats:** three to five planned steps, each with a level band and an intent.
-- **Signature reward:** the capstone family the arc builds toward.
+- **Signature reward:** one capstone book the arc builds toward, chosen from the books that character's class can use. Warriors, rogues and hunters cannot use the books, so their arcs have none.
 
 The arc is never shown to players.
 
@@ -204,7 +215,7 @@ When the player's actions contradict the arc (refusing the dark path, out-levell
 - 1.1 is the base for most of Phase 1 and for 4.5.
 - Phase 3's gift delivery needs Phase 2.
 - Phase 4's signature rewards need Phase 3's catalogue.
-- Throughlines are ranked last but cheap to lay down. If the arc table and its approval flow (4.1, 4.2) were pulled forward, every bounty written in Phases 1 to 3 would already have a direction.
+- Arc setup (4.1 to 4.3) was pulled forward, so every bounty written in Phases 1 to 3 already has a direction.
 
 ## Spikes before building
 
@@ -215,11 +226,3 @@ When the player's actions contradict the arc (refusing the dark path, out-levell
 | `send mail` with quotes and a line-break code; how the letter looks in game | 2.1 |
 | Mail a letter to the DM character and read it back | 2.3 |
 | Add an item to a creature's loot, reload, kill it | 1.7, 3.3 |
-
-## Open decisions
-
-1. **A bounty nobody accepts.** Keep the 24-hour expiry, lengthen it, or never expire and wait.
-2. **Letters without approval.** Whether gift-free letters may send unattended.
-3. **Generosity.** The actual budget numbers in 3.1, especially how often a capstone appears.
-4. **Arc visibility to the owner.** Arcs are spoilers. Whether the owner who also plays wants to approve them, or have them hidden and auto-approved.
-5. **Pulling 4.1 and 4.2 forward.** See Dependencies.

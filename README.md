@@ -8,10 +8,13 @@ It runs beside a [cmangos-deploy](https://github.com/mserajnik/cmangos-deploy) s
 
 1. **Observe.** A tick forces a save and reads the game databases: who is online, where, what they finished, who they are grouped with.
 2. **Remember.** Anything new goes into the DM's own memory file, `state.db`: a chronicle per character, every bounty and how it ended, and a running story summary.
-3. **Propose.** When a character has no bounty out, the model is given the story so far plus real nearby creatures and rewards, and writes the next bounty. The proposal is stored, not applied.
-4. **Approve.** You review and approve. Only then is the quest written to the game, reloaded through the server's remote console, and announced.
+3. **Plan.** The first time a character is noticed, the model writes a private arc for them: what the Overseer wants them to become, the enemy the story turns toward, and three to five beats. Every bounty after that serves the arc.
+4. **Propose.** When a character has no bounty out, the model is given the arc, the story so far, and real nearby creatures and rewards, and writes the next bounty. The proposal is stored, not applied.
+5. **Approve.** You review and approve. Only then is the quest written to the game, reloaded through the server's remote console, and announced.
 
-Nothing reaches the game without `approve`.
+One bounty at a time: a character with a bounty offered or accepted gets no new proposal. An accepted bounty never expires; one nobody accepts is dropped after a day.
+
+By default nothing reaches the game without `approve`. `DM_AUTO_APPROVE` can switch review off per proposal type.
 
 ## Requirements
 
@@ -24,7 +27,7 @@ Nothing reaches the game without `approve`.
 
 | Path | What it is |
 |---|---|
-| `dm.py` | The loop and its commands: `tick`, `run`, `pending`, `approve`, `reject`, `story`, `context` |
+| `dm.py` | The loop and its commands: `tick`, `run`, `pending`, `approve`, `reject`, `story`, `arc`, `context` |
 | `dm_state.py` | The memory file (`state.db`): schema, upgrades, helpers |
 | `world_query.py` | Read-only questions to the game databases |
 | `write_quest.py` | One-off: have the model write a bounty for a character, without the story loop |
@@ -34,8 +37,10 @@ Nothing reaches the game without `approve`.
 | `console.py` | Client for the server's remote console, with the command allow-list |
 | `env.example` | Template for `.env` |
 | `test_quest.json` and the two `test_quest_*.sql` | A fixed quest for smoke-testing the pipeline without a model |
+| `tests/test_offline.py` | Checks that need no server: `python3 -m unittest discover tests` |
 | `server/` | Copies of the two custom-sql files the DM depends on (see step 1) |
 | `docs/ai_dm_spec.md` | Design spec |
+| `docs/dev_plan.md` | What is built and what is next |
 
 Not in git: `.env` (secrets), `state.db` (the story), `issued/` (records from `write_quest.py`).
 
@@ -100,6 +105,7 @@ Edit `.env` and set at least `DM_SOAP_PASS` and `ANTHROPIC_API_KEY`. If the serv
 Run these in order. Each one tests one more link in the chain.
 
 ```
+python3 -m unittest discover tests               # the rules, with no server involved
 python3 console.py "server info"                 # the remote console answers
 python3 world_query.py <Character>               # the database is readable
 python3 apply_quest.py test_quest.json           # a fixed quest goes live
@@ -114,9 +120,11 @@ python3 write_quest.py <Character> --dry-run     # the model writes a quest; not
 With a character online:
 
 ```
-python3 dm.py tick
+python3 dm.py tick        # notices the character and writes an arc
 python3 dm.py pending
-python3 dm.py approve 1
+python3 dm.py approve 1   # the arc
+python3 dm.py tick        # now writes the first bounty
+python3 dm.py approve 2
 ```
 
 To keep it watching:
@@ -133,10 +141,12 @@ python3 dm.py run --every 300
 |---|---|
 | `dm.py tick` | One pass: observe, record, maybe propose |
 | `dm.py run --every 300` | Tick every 300 seconds until stopped |
-| `dm.py pending` | Show proposals waiting for a decision |
-| `dm.py approve <n>` | Put proposal `n` live and advance the story |
+| `dm.py pending` | Show proposals waiting for a decision: arcs and bounties |
+| `dm.py approve <n>` | Put proposal `n` into effect |
 | `dm.py reject <n> "reason"` | Discard it. The reason is passed to the model next time |
 | `dm.py story <Character>` | The chronicle: story so far, bounties and how each ended, events |
+| `dm.py arc <Character>` | The Overseer's private plan. A spoiler if you play that character |
+| `dm.py arc <Character> --seed "..."` | Have a new arc written around your direction |
 | `dm.py context <Character>` | Exactly what the model would be told next. No model call |
 
 A tick does three things without asking: it forces a save, it stops offering a bounty once its character has turned it in, and it calls the model when a character has no bounty out.
@@ -169,6 +179,7 @@ All settings are read from the environment, or from `.env` in this folder.
 | `DM_COOLDOWN_MINUTES` | `20` | Wait after a bounty ends before proposing the next |
 | `DM_STALE_HOURS` | `24` | An offered bounty nobody accepts is dropped after this |
 | `DM_MAX_PROPOSALS_HOUR` | `6` | Ceiling on model calls per hour |
+| `DM_AUTO_APPROVE` | `letter` | Proposal types that skip review: `bounty`, `arc`, `letter` |
 | `DM_IGNORE_CHARACTERS` | empty | Names the DM should not track |
 | `DM_MAIL_CHARACTER` | empty | A character the DM owns; mail to it is read as letters to the Overseer |
 | `DM_STATE` | `state.db` in this folder | Path to the memory file |
@@ -187,7 +198,7 @@ For testing against something other than the live server: `DM_DB_COMMAND`, `DM_D
 - **The model never writes SQL.** It fills in a small form. The script sets the quest id, giver, zone, levels and XP, and rejects any choice that is not on the lists it was given.
 - **Preflight.** Nothing is written if the giver, target or reward is missing.
 - **Reserved ids.** DM quests use ids 30000 to 39999, so they are easy to find and remove.
-- **Approval.** A quest reaches the game only through `approve` or an explicit `apply_quest.py` run.
+- **Approval.** By default a quest reaches the game only through `approve` or an explicit `apply_quest.py` run. With `bounty` in `DM_AUTO_APPROVE`, the checks above are the only gate.
 
 Known gap: the scripts reach the database as its root user through the container. A dedicated user with narrow permissions is still to do.
 
