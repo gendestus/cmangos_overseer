@@ -65,6 +65,9 @@ ADDED_COLUMNS = (
     ("arcs", "outcome", "TEXT"),                               # how it ended, written when the next arc is planned
     ("arcs", "ended_at", "INTEGER"),
     ("arcs", "end_reason", "TEXT"),                            # resolved, outgrown, replaced
+    ("quests", "kind", "TEXT"),                                # hunt, mark, journey, party, trophy;
+                                                               # a bounty's kind, not a proposal's type
+    ("quests", "objectives", "TEXT"),                          # JSON: every objective, with names and labels
 )
 
 

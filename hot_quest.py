@@ -22,6 +22,8 @@ Spec fields
     objectives_text  the one-line summary under "Quest Objectives"
     progress_text    what the ender says while the quest is incomplete
     completion_text  what the ender says at turn-in
+    objective_labels one short label per kill objective, for the quest log
+    suggested_players the "Suggested players: N" line; 0 leaves it off
     kill             up to 4 of {creature, count}
     collect          up to 4 of {item, count}; kill + collect <= 4 each
     reward.money_copper   coins given (100 = 1 silver)
@@ -65,6 +67,24 @@ def as_int(value, name, low, high):
     return value
 
 
+def labels(entries, name, limit, longest=120):
+    """Validate a list of short display strings, e.g. quest-log objective labels."""
+    entries = entries or []
+    if not isinstance(entries, list):
+        raise SpecError(f"{name} must be a list")
+    if len(entries) > limit:
+        raise SpecError(f"{name}: at most {limit} entries, got {len(entries)}")
+    out = []
+    for i, entry in enumerate(entries, start=1):
+        if not isinstance(entry, str) or not entry.strip():
+            raise SpecError(f"{name}[{i}] must be a non-empty string")
+        text = " ".join(entry.split())
+        if len(text) > longest:
+            raise SpecError(f"{name}[{i}] is {len(text)} characters; the limit here is {longest}")
+        out.append(text)
+    return out
+
+
 def pairs(entries, id_key, name, limit):
     """Validate a list of {id_key, count} objects."""
     entries = entries or []
@@ -96,7 +116,11 @@ def validate(spec):
             raise SpecError(f"{field} is {len(text)} characters; the limit here is {limit}")
         q[field] = text
 
+    q["suggested"] = as_int(spec.get("suggested_players", 0), "suggested_players", 0, 40)
     q["kill"] = pairs(spec.get("kill"), "creature", "kill", 4)
+    q["labels"] = labels(spec.get("objective_labels"), "objective_labels", 4)
+    if len(q["labels"]) > len(q["kill"]):
+        raise SpecError(f"objective_labels has {len(q['labels'])} entries for {len(q['kill'])} kill objectives")
     q["collect"] = pairs(spec.get("collect"), "item", "collect", 4)
     if not q["kill"] and not q["collect"]:
         raise SpecError("the quest needs at least one kill or collect objective")
@@ -163,6 +187,7 @@ def render_apply(q):
         "Objectives": sql_text(q["objectives_text"]),
         "RequestItemsText": sql_text(q["progress_text"]),
         "OfferRewardText": sql_text(q["completion_text"]),
+        "SuggestedPlayers": q["suggested"],
         "RewOrReqMoney": q["money"],
         "RewMoneyMaxLevel": q["xp_weight"],
         "RewSpell": q["rew_spell"],
@@ -171,6 +196,10 @@ def render_apply(q):
     for i, (ident, count) in enumerate(padded(q["kill"], 4), start=1):
         columns[f"ReqCreatureOrGOId{i}"] = ident
         columns[f"ReqCreatureOrGOCount{i}"] = count
+    # One label per kill objective, so a bounty with two of them does not show
+    # two unnamed counters. An item objective is labelled by the item itself.
+    for i, text in enumerate(q["labels"] + [""] * (4 - len(q["labels"])), start=1):
+        columns[f"ObjectiveText{i}"] = sql_text(text)
     for i, (ident, count) in enumerate(padded(q["collect"], 4), start=1):
         columns[f"ReqItemId{i}"] = ident
         columns[f"ReqItemCount{i}"] = count

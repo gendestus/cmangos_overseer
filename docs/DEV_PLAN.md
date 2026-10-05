@@ -10,7 +10,9 @@ Order follows the owner's ranking. Estimates are rough guesses for one person wo
 | G | Dynamic heralds: the model picks a nearby friendly quest NPC; no configured list | An evening | Built |
 | 0.4 | Narrow database users, a kill switch, and one command that undoes everything | An evening | Built |
 | 1.1 | Target search v2: ranks, two distance tiers, bearings, party awareness | An evening | Built |
-| 1 | The rest of richer bounties: six kinds, chains, spell rewards | Two weekends | Next |
+| 1.2a | Bounty kinds: hunt, mark, journey, party; objectives as a list; per-kind caps | An evening | Built |
+| 1.2b | The trophy kind, on DM props (`proposal_prop_trophies.md`) | A weekend | Next, after the spike and one restart |
+| 1 | The rest of richer bounties: chains, spell rewards, trial | A weekend | |
 | 2 | Overseer mail, both directions | A weekend | |
 | 3 | Extra rewards with a budget | A weekend | |
 | 4b | Arc revision, grounding the adversary, signature rewards | An evening or two | |
@@ -101,20 +103,34 @@ Accepted: `world_query.py Gendestus` lists ranked, far and named targets with be
 
 ### 1.2 Bounty kinds
 
-The model picks a `kind`; each kind has its own checks.
+Built, except `trophy` (1.2b, waiting on props) and `trial` (1.6, waiting on the benilla timer spike).
 
-| Kind | Objective | Check |
+The model picks a `kind` and is held to that kind's own rules. `KINDS` in `write_quest.py` is the single source: the prompt text, the tool's enum and every check are read from it, so what the model is told and what it is held to cannot drift apart.
+
+| Kind | Objective | Checked |
 |---|---|---|
-| hunt | Kill N of a normal creature (today's bounty) | N within alive count and cap |
-| mark | Kill one named, rare or elite creature | Target alive; elite only with a party or a level margin |
-| trophy | Collect N of an item nearby creatures drop | Expected kills within alive count and cap |
-| trial | A hunt against a timer | Time limit within set bounds |
-| journey | A hunt or mark in the far tier | Distance stated in the text |
-| party | Two objectives, written for the group | Character is in a party |
+| hunt | Kill N of a normal creature | Rank is normal; one objective; N within the alive count and a cap of 12 |
+| mark | Kill one named, rare or elite creature | Rank is not normal; exactly one kill |
+| journey | A hunt or mark in the far tier | At least one target has `tier == "far"` |
+| party | Two objectives, written for the group | The character has online company; exactly two objectives |
+| trophy | Collect N of a DM prop the target drops | 1.2b; see `proposal_prop_trophies.md` |
+| trial | A hunt against a timer | 1.6; `LimitTime` is seconds and needs no extra flag, so the renderer change is one line once the spike passes |
 
-Up to two objectives per quest to start; the quest format allows four.
+The model's answer now carries a list of one or two objectives instead of a flat `target_creature` and `kill_count`. `hot_quest` already took up to four of each, so the spec format did not change; what changed is the form, the validator, and the three displays that indexed the first objective.
+
+Other pieces that came with it:
+
+- **Per-kind caps.** The kill cap comes from the kind; the money cap is the level's cap times the kind's multiplier, so a named enemy pays twice an ordinary hunt and a journey half again.
+- **Quest-log labels.** Every objective carries a two-to-five-word label, written to `ObjectiveText1..4`. Without them a two-objective bounty shows two unnamed counters.
+- **Suggested players.** A `party` bounty sets `SuggestedPlayers`, so the quest log says who it is for.
+- **The party re-check at approval.** 1.1 flagged targets that are only fair with company, and this is where that is honoured: `approve` re-reads the party and refuses if it has gone, rather than putting an unfair bounty live. The proposal stays pending and the next tick writes another.
+- **State.** `quests` gained `kind` and `objectives` (JSON, with each objective's name, count and label). `quests.target` still holds the primary objective's creature name, so older chronicle text still reads.
+
+Accepted: 73 offline tests, and two real bounties written by the model against the live world — a `hunt` for ten Defias Thugs, and a `journey` sent 622 yards south after Stonetusk Boars with the direction named in the quest text.
 
 ### 1.3 Trophy objectives from stock loot
+
+Superseded by `proposal_prop_trophies.md` (accepted 2026-10-04), which replaces this section and 1.7: trophies collect DM-owned props added to a creature's loot live, not stock items. The 30% rule below does not hold up against the live loot tables — Kobold Worker's best ordinary drop is 29.55% and Defias Thug's is 13%. What remains useful here is the stock fallback, kept as a second source in the proposal's 4.7.
 
 - New query: items dropped by eligible nearby creatures, with drop chance.
 - Offer only items with a drop chance of 30% or more, or quest-only drops. Quest-only drops appear for any quest that needs the item, including a DM quest (verified in the loot code).
@@ -138,9 +154,9 @@ Up to two objectives per quest to start; the quest format allows four.
 - New spec field `time_limit_minutes`, written to `LimitTime`. The server treats a quest with a time limit as timed when it loads (seen in the loader).
 - Spike first: confirm the timer shows in benilla and that failing it behaves sensibly.
 
-### 1.7 DM-owned trophy items (optional, needs one restart)
+### 1.7 DM-owned trophy items (no longer optional)
 
-A pool of about 30 generic items ("Marked Insignia", "Strange Idol") created once by custom-sql. The DM then adds one to a creature's loot live (`creature_loot_template` is hot-reloadable) as a guaranteed quest-only drop that every party member can loot. This removes the drop-chance problem in 1.3.
+Superseded by `proposal_prop_trophies.md`, which takes this up as the main design rather than an optional extra: a pool of about 80 generic story props in the item range 200000 to 200199, created once by custom-sql, added to a target creature's loot live as a quest-only drop when a trophy bounty is posted and deleted when it ends. Still needs one restart, because new item templates load only at startup.
 
 ### 1.8 Prompt, form, display
 
@@ -262,4 +278,4 @@ When the player's actions contradict the arc (refusing the dark path, out-levell
 | Timed quest in benilla | 1.6 |
 | `send mail` with quotes and a line-break code; how the letter looks in game | 2.1 |
 | Mail a letter to the DM character and read it back | 2.3 |
-| Add an item to a creature's loot, reload, kill it | 1.7, 3.3 |
+| Add a prop to a creature's loot, reload, kill it with and without the quest, then in a party | 1.3, 1.7, 3.3 (the full steps are in `proposal_prop_trophies.md` section 6) |

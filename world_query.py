@@ -369,7 +369,7 @@ def dm_quest_progress():
     """
     low, high = hot_quest.QUEST_ID_RANGE
     return rows(f"""
-        SELECT JSON_OBJECT('guid', s.guid, 'name', c.name, 'quest', s.quest, 'kills', s.mobcount1,
+        SELECT JSON_OBJECT('guid', s.guid, 'name', c.name, 'quest', s.quest,
                            'state', IF(s.rewarded = 1, 'done', IF(s.status = 1, 'ready', 'accepted')))
         FROM {hot_quest.CHAR_DB}.character_queststatus s
         JOIN {hot_quest.CHAR_DB}.characters c ON c.guid = s.guid

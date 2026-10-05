@@ -47,16 +47,22 @@ CONTEXT = {
                  "unique": False, "needs_party": False},
                 {"creature": 471, "name": "Narg the Taskmaster", "rank": "rare", "min_level": 4, "max_level": 4,
                  "spawned": 1, "alive": 1, "distance": 900, "direction": "south-west", "tier": "far",
-                 "unique": True, "needs_party": False}],
+                 "unique": True, "needs_party": False},
+                {"creature": 448, "name": "Hogger", "rank": "elite", "min_level": 4, "max_level": 4,
+                 "spawned": 6, "alive": 6, "distance": 350, "direction": "west", "tier": "near",
+                 "unique": False, "needs_party": True}],
     "reward_items": [{"item": 111520, "name": "Grimoire of Summon Voidwalker", "required_level": 10}],
     "money_cap": 650, "xp_weight": 100,
 }
 
 ANSWER = {
-    "title": "Teeth in the Dark", "briefing": "Go, $N.", "objectives_text": "Slay 8 Kobold Workers.",
-    "progress_text": "Not yet.", "completion_text": "Done.", "giver": 197, "target_creature": 257, "kill_count": 8,
+    "title": "Teeth in the Dark", "kind": "hunt", "briefing": "Go, $N.",
+    "objectives_text": "Slay 8 Kobold Workers.", "progress_text": "Not yet.", "completion_text": "Done.",
+    "giver": 197, "objectives": [{"target_creature": 257, "count": 8, "label": "Kobold Workers slain"}],
     "reward_money_copper": 400, "reward_item": None, "announcement": "A bounty is posted.", "dm_note": "fits",
 }
+
+PARTY = [{"name": "Bo", "level": 4, "online": 1}]
 
 ARC = {
     "premise": "A paladin reaching past the Light.", "lure": "Make a knight who wields death.",
@@ -96,10 +102,13 @@ class ModelAnswerRules(unittest.TestCase):
     def test_good_answer_becomes_a_spec(self):
         spec, target, announcement = self.build()
         self.assertEqual(spec["kill"], [{"creature": 257, "count": 8}])
+        self.assertEqual(spec["objective_labels"], ["Kobold Workers slain"])
         self.assertEqual(spec["giver"], 197)                     # the herald the model picked
         self.assertEqual(spec["ender"], 197)
         self.assertEqual(target["name"], "Kobold Worker")
+        self.assertEqual(target["kind"], "hunt")
         self.assertEqual(target["giver"]["name"], "Marshal McBride")
+        self.assertEqual([o["label"] for o in target["objectives"]], ["Kobold Workers slain"])
 
     def test_herald_must_be_on_the_list(self):
         with self.assertRaises(write_quest.Rejected):
@@ -107,11 +116,16 @@ class ModelAnswerRules(unittest.TestCase):
 
     def test_target_must_be_on_the_list(self):
         with self.assertRaises(write_quest.Rejected):
-            self.build(target_creature=1642)
+            self.build(objectives=[{"target_creature": 1642, "count": 2, "label": "x"}])
 
     def test_kills_cannot_exceed_what_is_alive(self):
-        with self.assertRaises(write_quest.Rejected):
-            self.build(kill_count=10)
+        with self.assertRaises(write_quest.Rejected):           # 9 Kobold Workers are alive
+            self.build(objectives=[{"target_creature": 257, "count": 10, "label": "x"}])
+
+    def test_every_objective_needs_a_quest_log_label(self):
+        for label in ("", "   ", "x" * 61):
+            with self.assertRaises(write_quest.Rejected):
+                self.build(objectives=[{"target_creature": 257, "count": 2, "label": label}])
 
     def test_money_cannot_exceed_the_cap(self):
         with self.assertRaises(write_quest.Rejected):
@@ -122,6 +136,139 @@ class ModelAnswerRules(unittest.TestCase):
             self.build(reward_item=19019)
         spec, _, _ = self.build(reward_item=111520)
         self.assertEqual(spec["reward"]["items"], [{"item": 111520, "count": 1}])
+
+
+class BountyKinds(unittest.TestCase):
+    """Each kind may ask for different things, and the validator holds it to them."""
+
+    def build(self, context=None, **changes):
+        return write_quest.build_spec(dict(ANSWER, **changes), context or CONTEXT, 30000)
+
+    def objectives(self, *entries):
+        return [{"target_creature": c, "count": n, "label": f"label {c}"} for c, n in entries]
+
+    def test_the_kind_must_be_one_we_know(self):
+        for kind in (None, "", "quest", "TROPHY"):
+            with self.assertRaises(write_quest.Rejected):
+                self.build(kind=kind)
+
+    def test_every_kind_is_described_to_the_model(self):
+        rules = write_quest.kind_rules()
+        for name in write_quest.KINDS:
+            self.assertIn(name, rules)
+        self.assertEqual(sorted(write_quest.TOOL["input_schema"]["properties"]["kind"]["enum"]),
+                         sorted(write_quest.KINDS))
+
+    # hunt
+    def test_a_hunt_takes_only_an_ordinary_creature(self):
+        spec, target, _ = self.build(kind="hunt", objectives=self.objectives((257, 8)))
+        self.assertEqual(target["kind"], "hunt")
+        with self.assertRaises(write_quest.Rejected):            # Narg is a rare
+            self.build(kind="hunt", objectives=self.objectives((471, 1)))
+
+    def test_a_hunt_takes_one_objective(self):
+        with self.assertRaises(write_quest.Rejected):
+            self.build(kind="hunt", objectives=self.objectives((257, 2), (471, 1)))
+
+    # mark
+    def test_a_mark_takes_only_a_named_creature_once(self):
+        spec, _, _ = self.build(kind="mark", objectives=self.objectives((471, 1)))
+        self.assertEqual(spec["kill"], [{"creature": 471, "count": 1}])
+        with self.assertRaises(write_quest.Rejected):            # a normal creature is not a mark
+            self.build(kind="mark", objectives=self.objectives((257, 1)))
+        with self.assertRaises(write_quest.Rejected):            # and it is one kill, not two
+            self.build(kind="mark", objectives=self.objectives((471, 2)))
+
+    # journey
+    def test_a_journey_must_actually_go_somewhere(self):
+        spec, _, _ = self.build(kind="journey", objectives=self.objectives((471, 1)))
+        self.assertEqual(spec["kill"], [{"creature": 471, "count": 1}])
+        with self.assertRaises(write_quest.Rejected):            # Kobold Workers are in the near tier
+            self.build(kind="journey", objectives=self.objectives((257, 4)))
+
+    # party
+    def test_a_party_bounty_needs_company_and_two_objectives(self):
+        alone = dict(CONTEXT, party=[])
+        with self.assertRaises(write_quest.Rejected):
+            self.build(alone, kind="party", objectives=self.objectives((257, 4), (471, 1)))
+        together = dict(CONTEXT, party=PARTY)
+        spec, _, _ = self.build(together, kind="party", objectives=self.objectives((257, 4), (471, 1)))
+        self.assertEqual(len(spec["kill"]), 2)
+        self.assertEqual(spec["suggested_players"], 2)           # the character plus one companion
+        with self.assertRaises(write_quest.Rejected):            # two means two
+            self.build(together, kind="party", objectives=self.objectives((257, 4)))
+
+    def test_only_a_party_bounty_suggests_players(self):
+        spec, _, _ = self.build(dict(CONTEXT, party=PARTY), kind="hunt")
+        self.assertEqual(spec["suggested_players"], 0)
+
+    # shared rules
+    def test_an_objective_cannot_repeat_a_target(self):
+        with self.assertRaises(write_quest.Rejected):
+            self.build(dict(CONTEXT, party=PARTY), kind="party",
+                       objectives=self.objectives((257, 4), (257, 2)))
+
+    def test_a_creature_that_needs_the_party_is_refused_when_alone(self):
+        # mark allows an elite, so this isolates the party rule from the rank rule.
+        with self.assertRaises(write_quest.Rejected):            # Hogger needs the party
+            self.build(dict(CONTEXT, party=[]), kind="mark", objectives=self.objectives((448, 1)))
+        spec, target, _ = self.build(dict(CONTEXT, party=PARTY), kind="mark",
+                                     objectives=self.objectives((448, 1)))
+        self.assertTrue(target["needs_party"])                   # flagged, so approval can check again
+
+    def test_money_scales_with_the_kind(self):
+        caps = {name: write_quest.money_cap(CONTEXT, name) for name in write_quest.KINDS}
+        self.assertEqual(caps["hunt"], CONTEXT["money_cap"])
+        self.assertGreater(caps["mark"], caps["hunt"])           # a named enemy is worth more
+        self.assertGreater(caps["journey"], caps["hunt"])
+        # the cap is enforced per kind, not globally
+        self.build(kind="mark", objectives=self.objectives((471, 1)),
+                   reward_money_copper=caps["hunt"] + 1)
+        with self.assertRaises(write_quest.Rejected):
+            self.build(kind="hunt", reward_money_copper=caps["hunt"] + 1)
+
+    def test_the_quest_level_follows_the_hardest_target(self):
+        spec, _, _ = self.build(kind="mark", objectives=self.objectives((471, 1)))
+        self.assertEqual(spec["quest_level"], 4)                 # Narg is level 4, the character is 3
+
+
+class ObjectiveDisplay(unittest.TestCase):
+    def record(self):
+        return write_quest.build_spec(
+            dict(ANSWER, kind="party",
+                 objectives=[{"target_creature": 257, "count": 4, "label": "Workers slain"},
+                             {"target_creature": 471, "count": 1, "label": "Narg dealt with"}]),
+            dict(CONTEXT, party=PARTY), 30000)
+
+    def test_a_summary_names_every_objective(self):
+        spec, record, _ = self.record()
+        self.assertEqual(write_quest.objective_summary(spec, record["objectives"]),
+                         "4 x Kobold Worker, 1 x Narg the Taskmaster")
+
+    def test_a_summary_survives_a_trip_through_the_database(self):
+        spec, record, _ = self.record()
+        stored = json.loads(json.dumps(record["objectives"]))    # JSON makes integer keys strings
+        self.assertEqual(write_quest.objective_summary(spec, stored),
+                         "4 x Kobold Worker, 1 x Narg the Taskmaster")
+
+    def test_a_summary_falls_back_when_no_names_are_known(self):
+        self.assertIn("creature 257", write_quest.objective_summary({"kill": [{"creature": 257, "count": 4}]}))
+        self.assertEqual(write_quest.objective_summary({"kill": []}), "no objective")
+
+    def test_detailed_lines_carry_rank_distance_and_label(self):
+        _, record, _ = self.record()
+        lines = write_quest.objective_lines(record)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("[normal]", lines[0])
+        self.assertIn("Workers slain", lines[0])
+        self.assertIn("a journey", lines[1])                     # Narg is in the far tier
+        self.assertIn("[rare]", lines[1])
+
+    def test_an_older_record_without_objectives_still_renders(self):
+        old = {"name": "Kobold Vermin", "alive": 12, "creature": 6}
+        self.assertEqual(write_quest.objective_lines(old), ["Kobold Vermin (12 alive)"])
+        self.assertEqual(write_quest.objective_summary({"kill": [{"creature": 6, "count": 4}]}, old),
+                         "4 x Kobold Vermin")
 
 
 class ArcRules(unittest.TestCase):
@@ -299,10 +446,11 @@ class WhatTheModelIsTold(unittest.TestCase):
         self.assertIn("party of 2", self.message(with_party))
 
     def test_a_named_target_caps_the_kill_count_at_one(self):
-        answer = dict(ANSWER, target_creature=471, kill_count=3)
+        objectives = [{"target_creature": 471, "count": 3, "label": "Narg dealt with"}]
         with self.assertRaises(write_quest.Rejected):     # only one is alive
-            write_quest.build_spec(answer, CONTEXT, 30000)
-        spec, _, _ = write_quest.build_spec(dict(answer, kill_count=1), CONTEXT, 30000)
+            write_quest.build_spec(dict(ANSWER, kind="mark", objectives=objectives), CONTEXT, 30000)
+        objectives[0]["count"] = 1
+        spec, _, _ = write_quest.build_spec(dict(ANSWER, kind="mark", objectives=objectives), CONTEXT, 30000)
         self.assertEqual(spec["kill"], [{"creature": 471, "count": 1}])
 
 

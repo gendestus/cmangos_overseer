@@ -9,7 +9,7 @@ It runs beside a [cmangos-deploy](https://github.com/mserajnik/cmangos-deploy) s
 1. **Observe.** A tick forces a save and reads the game databases: who is online, where, what they finished, who they are grouped with.
 2. **Remember.** Anything new goes into the DM's own memory file, `state.db`: a chronicle per character, every bounty and how it ended, and a running story summary.
 3. **Plan.** The first time a character is noticed, the model writes a private mini-arc for them: what the Overseer wants them to become over the next few levels, the enemy the story turns toward, and two to four beats. When an arc ends, the next is planned from how it actually went, so the story can turn.
-4. **Propose.** When a character has no bounty out, the model is given the arc, the story so far, and real NPCs, creatures and rewards. Creatures come with their rank, how many are alive, and the distance and compass bearing of the nearest one, in two tiers: nearby, and far enough to be worth a journey. A named elite is offered only to a character with company or a wide level margin, and the last two bounties' targets are left out. It picks which NPC the Overseer speaks through, writes the bounty, and the proposal is stored, not applied.
+4. **Propose.** When a character has no bounty out, the model is given the arc, the story so far, and real NPCs, creatures and rewards. Creatures come with their rank, how many are alive, and the distance and compass bearing of the nearest one, in two tiers: nearby, and far enough to be worth a journey. A named elite is offered only to a character with company or a wide level margin, and the last two bounties' targets are left out. It picks a **kind** of bounty, which NPC the Overseer speaks through, and one or two objectives; the proposal is stored, not applied.
 5. **Approve.** You review and approve. Only then is the quest written to the game, reloaded through the server's remote console, and announced.
 
 One bounty at a time: a character with a bounty offered or accepted gets no new proposal. An accepted bounty never expires; one nobody accepts is dropped after a day.
@@ -180,6 +180,25 @@ A tick does three things without asking: it forces a save, it stops offering a b
 | `apply_quest.py <spec.json> --dry-run` | Print the SQL and console commands; change nothing |
 | `console.py "<command>"` | Send one allowed GM command |
 | `world_query.py <Character>` | Print what the DM can see for a character |
+
+## Kinds of bounty
+
+The model picks a kind, and each one is held to its own rules. They are defined in one table, `KINDS` in `write_quest.py`, which is also what the prompt and the validator read, so the rules the model is told and the rules it is held to cannot drift apart.
+
+| Kind | What it asks for | Held to |
+|---|---|---|
+| `hunt` | Kill several of one ordinary creature | An ordinary creature only, one objective, up to 12 |
+| `mark` | One named creature, killed once | A rare, elite or rare elite, exactly one kill |
+| `journey` | A hunt or mark far enough away to be worth the walk | At least one target in the far tier |
+| `party` | Two objectives, written for a group | The character has online company; exactly two objectives |
+
+Money scales with the kind: a `mark` or a `party` bounty may pay twice a `hunt`, a `journey` half again. Kill counts are capped by the kind and by how many of that creature are actually alive.
+
+Each objective also carries a short label for the quest log, so a two-objective bounty does not show two unnamed counters, and a `party` bounty sets the quest's "Suggested players" line.
+
+An elite offered on the strength of a party, and any `party` bounty, is **checked again at approval**: if the company has gone, `approve` refuses and the next tick writes a different bounty.
+
+`trophy` (collect a DM-owned prop from a creature's loot) is designed in `docs/proposal_prop_trophies.md` and needs a server restart to install its item pool; `trial` (a hunt against a timer) is still to come.
 
 ## Settings
 

@@ -375,7 +375,10 @@ def story_section(db, who):
         lines.append("Earlier bounties, oldest first:")
         for quest in history:
             spec = json.loads(quest["spec"])
-            hunt = f"{spec['kill'][0]['count']} x {quest['target']}" if spec["kill"] else "no hunt"
+            names = json.loads(quest["objectives"] or "null")
+            hunt = write_quest.objective_summary(spec, names)
+            if quest["kind"]:
+                hunt = f"{quest['kind']}: {hunt}"
             outcome = {
                 "completed": f"turned in after {dm_state.ago(quest['issued_at'], quest['completed_at'])}",
                 "accepted": "accepted, not finished yet",
@@ -588,7 +591,7 @@ def propose(db, who, say):
     if progress not in ("advance", "hold", "detour", "conclude"):
         progress = "hold"
     arc = dm_state.active_arc(db, who["guid"])
-    payload = {"beat_progress": progress}
+    payload = {"beat_progress": progress, "kind": target["kind"], "needs_party": target["needs_party"]}
     if progress == "conclude":
         if arc and arc["current_beat"] >= len(json.loads(arc["beats"])) - 1:
             payload["concludes_arc"] = arc["id"]
@@ -624,6 +627,16 @@ def approve_proposal(db, row, say):
         say(f"arc for {row['name']} is now in force.")
         return
 
+    payload = json.loads(row["payload"] or "{}")
+    target = json.loads(row["target"])
+    if payload.get("needs_party") or payload.get("kind") == "party":
+        # 1.1 offers an elite, and 1.2 offers a party bounty, on the strength of
+        # who was grouped and online when the bounty was written. A party can
+        # disband in between, so the company is checked again here.
+        company = [other for other in world_query.parties().get(row["guid"], []) if other.get("online")]
+        if not company:
+            raise ApproveFailed(f"this bounty was written for a party and {row['name']} is now alone; "
+                                "reject it and the next tick will write another")
     spec = json.loads(row["spec"])
     spec["id"] = world_query.next_quest_id()        # the id is fixed only now, so it cannot collide
     try:
@@ -633,11 +646,12 @@ def approve_proposal(db, row, say):
     except console.ConsoleError as error:
         say(f"warning: the quest is in the database but the console step failed: {error}\n"
             f"  Run `.reload all_quest` in game to load it.")
-    target = json.loads(row["target"])
-    payload = json.loads(row["payload"] or "{}")
-    db.execute("INSERT INTO quests (quest, guid, title, target, giver, concludes_arc, spec, announcement, dm_note, "
-               "story_beat, model, issued_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-               (spec["id"], row["guid"], spec["title"], target["name"], (target.get("giver") or {}).get("name"),
+    db.execute("INSERT INTO quests (quest, guid, title, kind, objectives, target, giver, concludes_arc, spec, "
+               "announcement, dm_note, story_beat, model, issued_at) "
+               "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               (spec["id"], row["guid"], spec["title"], payload.get("kind"),
+                json.dumps(target.get("objectives") or []), target["name"],
+                (target.get("giver") or {}).get("name"),
                 payload.get("concludes_arc"), json.dumps(spec), row["announcement"], row["dm_note"],
                 row["story_beat"], row["model"], stamp))
     db.execute("UPDATE characters SET story_so_far = ? WHERE guid = ?", (row["story_so_far"], row["guid"]))
@@ -739,14 +753,20 @@ def show_proposal(row):
         return
     spec, target = json.loads(row["spec"]), json.loads(row["target"])
     reward = [f"{spec['reward']['money_copper']} copper"] + [f"item {i['item']}" for i in spec["reward"]["items"]]
-    progress = json.loads(row["payload"] or "{}").get("beat_progress", "hold")
+    payload = json.loads(row["payload"] or "{}")
+    progress = payload.get("beat_progress", "hold")
+    kind = payload.get("kind") or target.get("kind") or "hunt"
+    if payload.get("needs_party"):
+        kind += " (needs the party; checked again at approval)"
+    objectives = "\n          ".join(write_quest.objective_lines(target))
     giver = target.get("giver")
     herald = f"{giver['name']}, {giver['distance']} yards {giver['direction']}" if giver else "unknown"
     print(f"""
 === Proposal {row['id']}: BOUNTY for {row['name']}  ({dm_state.ago(row['ts'])} ago, {row['status']}) ===
 Title:    {spec['title']}
+Kind:     {kind}
 Herald:   {herald}
-Hunt:     {spec['kill'][0]['count']} x {target['name']} ({target['alive']} alive when written)
+Hunt:     {objectives}
 Reward:   {', '.join(reward)}
 Briefing:
   {spec['briefing']}
