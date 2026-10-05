@@ -47,10 +47,18 @@ SET @target_index := 42;   -- 1 hour
 
 -- -----------------------------------------------------------------------------
 -- 1. The buffs. Names match every rank. The comment is the stock duration.
+--
+--    To drop a buff, put -- at the very start of its line. The last line of
+--    the list ends with a semicolon: if you drop that one, change the comma on
+--    the new last line to a semicolon.
+--
+--    The collation is named on purpose. Newer MariaDB versions give a new text
+--    column a different default collation from the one the game tables use,
+--    and comparing the two without naming one is an error.
 -- -----------------------------------------------------------------------------
 DROP TEMPORARY TABLE IF EXISTS hlb_buff;
 CREATE TEMPORARY TABLE hlb_buff (
-  name VARCHAR(64) NOT NULL PRIMARY KEY
+  name VARCHAR(64) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci NOT NULL PRIMARY KEY
 );
 
 INSERT INTO hlb_buff (name) VALUES
@@ -90,7 +98,6 @@ INSERT INTO hlb_buff (name) VALUES
   ('Fear Ward'),                       -- 10 min
   ('Shadowguard'),                     -- 10 min
   ('Touch of Weakness'),               -- 10 min
-  --('Levitate'),                        -- 2 min
   -- Shaman
   ('Lightning Shield'),                -- 10 min
   ('Water Breathing'),                 -- 10 min
@@ -101,9 +108,9 @@ INSERT INTO hlb_buff (name) VALUES
   ('Detect Lesser Invisibility'),      -- 10 min
   ('Detect Invisibility'),             -- 10 min
   ('Detect Greater Invisibility'),     -- 10 min
-  ('Unending Breath'),                 -- 10 min
+  ('Unending Breath');                 -- 10 min
   -- Warrior
-  --('Battle Shout');                    -- 2 min
+--  ('Battle Shout');                    -- 2 min
 
 -- -----------------------------------------------------------------------------
 -- 2. Remember each spell's stock duration the first time it qualifies.
@@ -119,7 +126,7 @@ CREATE TABLE IF NOT EXISTS custom_buff_duration_stock (
 INSERT IGNORE INTO custom_buff_duration_stock (Id, DurationIndex)
 SELECT s.Id, s.DurationIndex
 FROM spell_template s
-JOIN hlb_buff b ON b.name = s.SpellName
+JOIN hlb_buff b ON s.SpellName = b.name COLLATE utf8mb3_general_ci
 WHERE s.DurationIndex IN (4, 5, 6, 347, 40, 30)                        -- 2 to 30 minutes
   AND (s.Attributes & 64) = 0                                          -- not passive
   AND (s.Effect1 IN (6, 35) OR s.Effect2 IN (6, 35) OR s.Effect3 IN (6, 35))   -- applies an aura
@@ -140,7 +147,7 @@ SET s.DurationIndex = k.DurationIndex;
 -- -----------------------------------------------------------------------------
 UPDATE spell_template s
 JOIN custom_buff_duration_stock k ON k.Id = s.Id
-JOIN hlb_buff b ON b.name = s.SpellName
+JOIN hlb_buff b ON s.SpellName = b.name COLLATE utf8mb3_general_ci
 SET s.DurationIndex = @target_index
 WHERE @target_index <> 0;
 
