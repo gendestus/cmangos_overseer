@@ -636,6 +636,60 @@ class MemoryFile(unittest.TestCase):
         self.assertIn("something new", text)
         db.close()
 
+    def test_only_named_characters_are_noticed_when_an_allow_list_is_set(self):
+        os.environ.pop("DM_CHARACTERS", None)
+        os.environ.pop("DM_IGNORE_CHARACTERS", None)
+        self.assertIsNone(dm.watched())                          # unset: everyone, as before
+
+        os.environ["DM_CHARACTERS"] = "Gendestus, Zachadin"
+        allow, skip = dm.watched(), dm.ignored()
+        self.assertEqual(allow, {"gendestus", "zachadin"})
+        self.assertTrue(dm.noticed({"name": "Gendestus"}, allow, skip))
+        self.assertTrue(dm.noticed({"name": "GENDESTUS"}, allow, skip))   # names are not case sensitive
+        self.assertFalse(dm.noticed({"name": "Rento"}, allow, skip))      # a playerbot
+        self.assertFalse(dm.noticed({"name": ""}, allow, skip))
+        self.assertFalse(dm.noticed({}, allow, skip))
+        os.environ.pop("DM_CHARACTERS")
+
+    def test_the_block_list_still_wins_over_the_allow_list(self):
+        os.environ["DM_CHARACTERS"] = "Gendestus"
+        os.environ["DM_IGNORE_CHARACTERS"] = "Gendestus"
+        self.assertFalse(dm.noticed({"name": "Gendestus"}, dm.watched(), dm.ignored()))
+        os.environ.pop("DM_CHARACTERS")
+        os.environ.pop("DM_IGNORE_CHARACTERS")
+
+    def test_everyone_is_noticed_when_no_allow_list_is_set(self):
+        os.environ.pop("DM_CHARACTERS", None)
+        os.environ.pop("DM_IGNORE_CHARACTERS", None)
+        allow, skip = dm.watched(), dm.ignored()
+        self.assertTrue(dm.noticed({"name": "Rento"}, allow, skip))
+
+    def test_a_remade_character_does_not_show_the_dead_ones_story(self):
+        """Same name, new guid: the chronicle must follow the character in the game."""
+        os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
+        db = dm_state.connect()
+        db.execute("INSERT INTO characters (guid, name, first_seen, last_seen, story_so_far) "
+                   "VALUES (1806, 'Gendestus', 1, 100, 'the first one')")
+        db.execute("INSERT INTO characters (guid, name, first_seen, last_seen, story_so_far) "
+                   "VALUES (1807, 'Gendestus', 2, 200, 'the second one')")
+
+        row, held = dm.whose_story(db, "Gendestus", live_guid=1806)
+        self.assertEqual(row["story_so_far"], "the first one")   # whoever holds the name now
+        self.assertEqual(held, 2)
+        row, _ = dm.whose_story(db, "Gendestus", live_guid=1807)
+        self.assertEqual(row["story_so_far"], "the second one")
+
+        # Nobody holds it in the game any more: the most recently seen one.
+        row, _ = dm.whose_story(db, "Gendestus", live_guid=None)
+        self.assertEqual(row["story_so_far"], "the second one")
+        # A live guid state has never seen falls back the same way.
+        row, _ = dm.whose_story(db, "Gendestus", live_guid=9999)
+        self.assertEqual(row["story_so_far"], "the second one")
+
+        self.assertEqual(dm.whose_story(db, "Nobody"), (None, 0))
+        self.assertEqual(dm.whose_story(db, "gendestus", 1806)[0]["guid"], 1806)   # and not case sensitive
+        db.close()
+
     def test_elapsed_time_reads_naturally(self):
         self.assertEqual(dm_state.ago(1000, 1030), "a minute")
         self.assertEqual(dm_state.ago(1000, 1000 + 25 * 60), "25 minutes")

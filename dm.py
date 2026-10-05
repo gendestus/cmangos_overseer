@@ -37,6 +37,9 @@ Settings, on top of the ones the other scripts use:
     DM_MAX_PROPOSALS_HOUR   ceiling on model calls per hour (default 6)
     DM_AUTO_APPROVE         proposal types that go live without review, comma separated:
                             bounty, arc, letter (default: letter)
+    DM_CHARACTERS           if set, the only characters the DM notices, comma separated.
+                            Set this on a playerbot realm, where a thousand characters
+                            exist and only a few of them are people
     DM_IGNORE_CHARACTERS    names the DM should not track, comma separated
     DM_MAIL_CHARACTER       name of a character the DM owns; mail sent to it is read as
                             letters to the Overseer (optional)
@@ -157,6 +160,29 @@ def setting(name, default):
 def ignored():
     names = os.environ.get("DM_IGNORE_CHARACTERS", "") + "," + os.environ.get("DM_MAIL_CHARACTER", "")
     return {part.strip().lower() for part in names.split(",") if part.strip()}
+
+
+def watched():
+    """Names the DM may notice, or None for everyone who is not ignored.
+
+    A realm running playerbots holds a thousand characters or more, far too
+    many to list in DM_IGNORE_CHARACTERS. DM_CHARACTERS turns the rule around:
+    name the few real players and the DM notices nobody else, so no model call
+    is ever spent writing an arc for a bot.
+
+    Names, not guids, on purpose: a character deleted and made again keeps its
+    name but takes a new guid, and the owner should not have to notice.
+    """
+    names = {part.strip().lower() for part in os.environ.get("DM_CHARACTERS", "").split(",") if part.strip()}
+    return names or None
+
+
+def noticed(who, allow, skip):
+    """Whether the DM should pay this character any attention at all."""
+    name = (who.get("name") or "").lower()
+    if name in skip:
+        return False
+    return allow is None or name in allow
 
 
 # ---- observe ---------------------------------------------------------------
@@ -692,13 +718,18 @@ def tick(db, say=print):
     except console.ConsoleError as error:
         say(f"note: could not refresh positions ({error}); using the last save")
 
-    skip = ignored()
-    players = [who for who in world_query.online_characters() if who["name"].lower() not in skip]
-    say(f"tick: {len(players)} character(s) online")
+    skip, allow = ignored(), watched()
+    online = world_query.online_characters()
+    players = [who for who in online if noticed(who, allow, skip)]
+    if allow is not None and len(online) != len(players):
+        say(f"tick: {len(players)} of {len(online)} character(s) online are tracked (DM_CHARACTERS)")
+    else:
+        say(f"tick: {len(players)} character(s) online")
     parties = world_query.parties()
     progress = world_query.dm_quest_progress()
     for who in players:
-        observe_character(db, who, [m for m in parties.get(who["guid"], []) if m["name"].lower() not in skip], say)
+        company = [m for m in parties.get(who["guid"], []) if noticed(m, allow, skip)]
+        observe_character(db, who, company, say)
     observe_company(db, players, parties, progress)
     observe_bounties(db, players, progress, say)
     observe_letters(db, say)
@@ -933,10 +964,34 @@ def cmd_purge(db, args):
         sys.exit(1)
 
 
+def whose_story(db, name, live_guid=None):
+    """The state row for a name, and how many characters have ever held it.
+
+    A character deleted and made again keeps its name but takes a new guid, so
+    state can hold more than one row under one name. Prefer whoever holds the
+    name in the game now; otherwise the most recently seen, because a
+    chronicle outlives the character it is about.
+    """
+    held = db.execute("SELECT * FROM characters WHERE name = ? COLLATE NOCASE ORDER BY last_seen DESC",
+                      (name,)).fetchall()
+    if live_guid is not None:
+        for row in held:
+            if row["guid"] == live_guid:
+                return row, len(held)
+    return (held[0] if held else None), len(held)
+
+
 def cmd_story(db, args):
-    row = db.execute("SELECT * FROM characters WHERE name = ? COLLATE NOCASE", (args.character,)).fetchone()
+    try:
+        live = world_query.character(args.character)
+    except world_query.QueryError:
+        live = None
+    row, held = whose_story(db, args.character, live["guid"] if live else None)
     if not row:
         sys.exit(f"dm: the Overseer has not noticed anyone called {args.character}")
+    if held > 1:
+        print(f"note: {held} characters have been called {row['name']}; "
+              f"showing the one with guid {row['guid']}.\n")
     print(f"=== {row['name']}: first noticed {dm_state.ago(row['first_seen'])} ago ===\n")
     print("Story so far:\n  " + (row["story_so_far"] or "(nothing written yet)"))
     print("\nBounties:")

@@ -217,7 +217,8 @@ All settings are read from the environment, or from `.env` in this folder.
 | `DM_STALE_HOURS` | `24` | An offered bounty nobody accepts is dropped after this |
 | `DM_MAX_PROPOSALS_HOUR` | `6` | Ceiling on model calls per hour |
 | `DM_AUTO_APPROVE` | `letter` | Proposal types that skip review: `bounty`, `arc`, `letter` |
-| `DM_IGNORE_CHARACTERS` | empty | Names the DM should not track |
+| `DM_CHARACTERS` | empty | If set, the only characters the DM notices. Needed on a playerbot realm |
+| `DM_IGNORE_CHARACTERS` | empty | Names the DM should not track. Applied after `DM_CHARACTERS` |
 | `DM_MAIL_CHARACTER` | empty | A character the DM owns; mail to it is read as letters to the Overseer |
 | `DM_STATE` | `state.db` in this folder | Path to the memory file |
 
@@ -249,6 +250,8 @@ For testing against something other than the live server: `DM_DB_COMMAND`, `DM_D
 - **A tick is a sample.** Company during a hunt is whoever was grouped or nearby when a tick ran. The server does not record who landed a kill.
 - **Friend or foe comes from the game's own faction files.** If they cannot be read, the DM falls back to rough rules: only "friendly to all" NPCs as heralds, and city factions excluded as targets.
 - **Zone names** come from a built-in table of about 45 zones. Others show as "zone 123".
+- **Playerbots must be excluded by hand.** A realm with `AiPlayerbot.Enabled = 1` can hold a thousand characters. The DM cannot tell a bot from a player — the account names that would say so live in the `realmd` database, which its read-only user is deliberately denied — so set `DM_CHARACTERS` to the real players. Without it, the first tick after bots log in starts writing story arcs for them.
+- **A chronicle is keyed to a character's guid, not its name.** Delete a character and make another with the same name and the new one starts a fresh story, which is usually what you want. `dm.py story` then says how many have held the name and shows whoever holds it now.
 
 ## Troubleshooting
 

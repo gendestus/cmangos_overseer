@@ -30,6 +30,7 @@ ALLOWED = {
     "saveall": "write every online character to the database so positions are current",
     "reload all_quest": "pick up quests added or changed in the database",
     "reload npc_vendor": "pick up vendor stock changed in the database",
+    "reload creature_loot_template": "pick up loot changed in the database, for trophy props",
     "announce": "server-wide chat line",
     "notify": "server-wide on-screen message",
     "send mail": "letter to one character",
