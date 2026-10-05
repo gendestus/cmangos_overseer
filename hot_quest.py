@@ -26,6 +26,9 @@ Spec fields
     suggested_players the "Suggested players: N" line; 0 leaves it off
     kill             up to 4 of {creature, count}
     collect          up to 4 of {item, count}; kill + collect <= 4 each
+    props            up to 2 of {item, count, creature, chance}: a DM prop added to
+                     that creature's loot as a quest-only drop, and collected. Each
+                     also takes one of the four collect slots.
     reward.money_copper   coins given (100 = 1 silver)
     reward.xp_weight      the stock table's XP input (RewMoneyMaxLevel); copy
                           it from a stock quest of the same level
@@ -43,6 +46,10 @@ import os
 import sys
 
 QUEST_ID_RANGE = (30000, 39999)
+PROP_ID_RANGE = (200000, 200199)        # DM-owned story props, from server/dm_props.sql
+PROP_CHANCES = (100, 50, 34)            # drop rates a trophy bounty may ask for
+MAX_PROPS = 2
+MAX_PROP_COUNT = 20
 QUEST_FLAGS_SHARABLE = 8
 # Database names. cmangos-deploy uses these; override only for a test copy.
 WORLD_DB = os.environ.get("DM_WORLD_DB", "mangos")
@@ -65,6 +72,76 @@ def as_int(value, name, low, high):
     if not low <= value <= high:
         raise SpecError(f"{name} must be between {low} and {high}, got {value}")
     return value
+
+
+def props(entries):
+    """Validate the DM props a bounty seeds into a creature's loot."""
+    entries = entries or []
+    if not isinstance(entries, list):
+        raise SpecError("props must be a list")
+    if len(entries) > MAX_PROPS:
+        raise SpecError(f"props: at most {MAX_PROPS} entries, got {len(entries)}")
+    out, seen = [], set()
+    for i, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict):
+            raise SpecError(f"props[{i}] is not an object")
+        item = as_int(entry.get("item"), f"props[{i}].item", *PROP_ID_RANGE)
+        count = as_int(entry.get("count"), f"props[{i}].count", 1, MAX_PROP_COUNT)
+        creature = as_int(entry.get("creature"), f"props[{i}].creature", 1, 16777215)
+        chance = entry.get("chance")
+        if chance not in PROP_CHANCES:
+            raise SpecError(f"props[{i}].chance must be one of {PROP_CHANCES}, got {chance!r}")
+        if item in seen:
+            raise SpecError(f"props[{i}]: prop {item} is already used by this bounty")
+        seen.add(item)
+        out.append({"item": item, "count": count, "creature": creature, "chance": chance})
+    return out
+
+
+def loot_tag(quest_id):
+    """How a loot row says which bounty owns it. Never matches a stock row,
+    whose `comments` holds the item's name."""
+    return f"dm:{as_int(quest_id, 'id', *QUEST_ID_RANGE)} "
+
+
+def render_props_apply(q):
+    """Add each prop to its creature's loot as a quest-only drop.
+
+    A negative chance is the server's "quest only" flag with the magnitude as
+    the rate, so the prop drops for a character who needs it and for nobody
+    else. The row is resolved through the creature's LootId, which is not
+    always its entry. The ON DUPLICATE guard means a stock row is never
+    touched: only a row this DM already tagged can be rewritten.
+    """
+    if not q["props"]:
+        return ""
+    tag = loot_tag(q["id"])
+    statements = [f"-- Props for DM quest {q['id']}. Reload loot before the quest goes on offer.",
+                  f"\nUSE {WORLD_DB};\n"]
+    for prop in q["props"]:
+        statements.append(f"""INSERT INTO creature_loot_template
+  (entry, item, ChanceOrQuestChance, groupid, mincountOrRef, maxcount, condition_id, comments)
+SELECT t.LootId, {prop['item']}, {-prop['chance']}, 0, 1, 1, 0, {sql_text(tag + str(prop['item']))}
+FROM creature_template t
+WHERE t.Entry = {prop['creature']} AND t.LootId <> 0
+ON DUPLICATE KEY UPDATE
+  ChanceOrQuestChance = IF(comments LIKE 'dm:%', VALUES(ChanceOrQuestChance), ChanceOrQuestChance),
+  comments            = IF(comments LIKE 'dm:%', VALUES(comments), comments);""")
+    return "\n".join(statements) + "\n"
+
+
+def render_props_remove(quest_id):
+    """Take this bounty's props back out of every loot table. By tag, so only
+    rows this DM wrote are touched."""
+    return (f"-- Remove the props of DM quest {quest_id}\n\nUSE {WORLD_DB};\n\n"
+            f"DELETE FROM creature_loot_template WHERE comments LIKE "
+            f"{sql_text(loot_tag(quest_id) + '%')};\n")
+
+
+def render_props_purge():
+    """Every loot row any DM bounty ever added."""
+    return (f"-- Remove every DM-added loot row\n\nUSE {WORLD_DB};\n\n"
+            "DELETE FROM creature_loot_template WHERE comments LIKE 'dm:%';\n")
 
 
 def labels(entries, name, limit, longest=120):
@@ -122,8 +199,12 @@ def validate(spec):
     if len(q["labels"]) > len(q["kill"]):
         raise SpecError(f"objective_labels has {len(q['labels'])} entries for {len(q['kill'])} kill objectives")
     q["collect"] = pairs(spec.get("collect"), "item", "collect", 4)
-    if not q["kill"] and not q["collect"]:
-        raise SpecError("the quest needs at least one kill or collect objective")
+    q["props"] = props(spec.get("props"))
+    if not q["kill"] and not q["collect"] and not q["props"]:
+        raise SpecError("the quest needs at least one kill, collect or prop objective")
+    if len(q["collect"]) + len(q["props"]) > 4:
+        raise SpecError(f"{len(q['collect'])} collect objectives plus {len(q['props'])} props "
+                        "is more than the four item slots a quest has")
 
     reward = spec.get("reward") or {}
     q["money"] = as_int(reward.get("money_copper", 0), "reward.money_copper", 0, 10_000_000)
@@ -157,6 +238,17 @@ def preflight(q):
     for item, _ in q["collect"] + q["items"] + q["choice"]:
         checks.append((f"item {item} exists",
                        f"EXISTS(SELECT 1 FROM item_template WHERE entry = {item})"))
+    for prop in q["props"]:
+        checks.append((f"prop {prop['item']} exists",
+                       f"EXISTS(SELECT 1 FROM item_template WHERE entry = {prop['item']})"))
+        checks.append((f"creature {prop['creature']} has a loot table to add it to",
+                       f"EXISTS(SELECT 1 FROM creature_template WHERE Entry = {prop['creature']} AND LootId <> 0)"))
+        # Refuse to touch a loot row the DM does not own.
+        checks.append((f"no stock loot row for prop {prop['item']} on creature {prop['creature']}",
+                       f"NOT EXISTS(SELECT 1 FROM creature_loot_template l "
+                       f"JOIN creature_template t ON t.LootId = l.entry "
+                       f"WHERE t.Entry = {prop['creature']} AND l.item = {prop['item']} "
+                       f"AND l.comments NOT LIKE 'dm:%')"))
     for spell in filter(None, (q["rew_spell"], q["rew_spell_cast"])):
         checks.append((f"spell {spell} exists",
                        f"EXISTS(SELECT 1 FROM spell_template WHERE Id = {spell})"))
@@ -200,7 +292,8 @@ def render_apply(q):
     # two unnamed counters. An item objective is labelled by the item itself.
     for i, text in enumerate(q["labels"] + [""] * (4 - len(q["labels"])), start=1):
         columns[f"ObjectiveText{i}"] = sql_text(text)
-    for i, (ident, count) in enumerate(padded(q["collect"], 4), start=1):
+    items = q["collect"] + [(prop["item"], prop["count"]) for prop in q["props"]]
+    for i, (ident, count) in enumerate(padded(items, 4), start=1):
         columns[f"ReqItemId{i}"] = ident
         columns[f"ReqItemCount{i}"] = count
     for i, (ident, count) in enumerate(padded(q["items"], 4), start=1):

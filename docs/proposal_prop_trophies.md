@@ -1,7 +1,22 @@
 # Proposal: story props for trophy bounties
 
-Status: accepted 2026-10-04. Replaces sections 1.3 and 1.7 of `DEV_PLAN.md`.
+Status: accepted and built 2026-10-04. Replaces sections 1.3 and 1.7 of `DEV_PLAN.md`.
 Audience: whoever implements Phase 1 (currently Claude Code).
+
+Every fact in section 3 was confirmed against the live server before building, by the
+spike in section 6. Two results worth carrying forward:
+
+- **A quest-only drop stops once the objective is met.** Better than assumed: a trophy
+  bounty cannot flood a character with spares, so the expected-kills arithmetic in 4.6 is
+  a worst case rather than an average.
+- **Flag 2048 behaves as read.** One Kobold Vermin, two party members, each looted their
+  own copy from the same corpse.
+
+One limit the spike exposed that is not in this document: **purge cannot take a prop out of
+a player's bag.** A loot table is restored exactly, but whatever was already looted stays
+looted. The check in 4.6 that refuses a prop the character is already carrying is what
+keeps that from corrupting the next bounty, and it earned its place the first time a test
+bounty was purged mid-flight.
 
 ## 1. Problem
 
@@ -54,39 +69,16 @@ A new file `server/dm_props.sql`, installed in the game server's `custom-sql` fo
 - **Icons:** `displayid` is borrowed from a stock item. Verified donors are listed below; find others by name on the live database.
 - **Discovery at run time:** the DM reads the pool with `SELECT entry, name FROM item_template WHERE entry BETWEEN 200000 AND 200199`. No list is hard-coded in Python.
 
-Starter set, to be extended to about 80. Donor display ids are from the live-schema database.
+Written: `server/dm_props.sql` creates 98 props in six blocks, each with room to grow. Every icon was checked against the live-schema database.
 
-| Prop name | Icon from (stock item, display id) |
-|---|---|
-| Stolen Book | An Old History Book, 1143 |
-| Stolen Scroll | Simple Scroll, 1301 |
-| Coded Orders | Defias Script, 13125 |
-| Stolen Silver | Stolen Silver, 7260 |
-| Pilfered Gold Dust | Gold Dust, 7137 |
-| Stolen Supplies | Supply Crate, 7925 |
-| Marked Bandana | Red Burlap Bandana, 1272 |
-| Bolt of Stolen Cloth | Linen Cloth, 7383 |
-| Stolen Ingot | Iron Bar, 7376 |
-| Stolen Candle | Large Candle, 7066 |
-| Guttered Candle | Melted Candle, 6677 |
-| Burnt-out Torch | Unlit Poor Torch, 12311 |
-| Severed Paw | Gnoll Paw, 6671 |
-| Bloodied Fang | Large Fang, 2460 |
-| Broken Fang | Broken Fang, 6002 |
-| Hooked Claw | Sharp Claw, 1496 |
-| Blackened Claw | Wicked Claw, 3146 |
-| Staring Eye | Murloc Eye, 7394 |
-| Finger Bone | Skeleton Finger, 7251 |
-| Bone Shards | Bone Fragments, 13806 |
-| Torn Pelt | Ruined Pelt, 7086 |
-| Tainted Meat | Chunk of Boar Meat, 6348 |
-| Strange Egg | Small Egg, 18046 |
-| Omen Feather | Light Feather, 28877 |
-| Blood-dark Shard | Blood Shard, 7045 |
-| Glowing Shard | Glowing Shard, 19223 |
-| Carved Stone | Rough Stone, 4714 |
-
-Still needed, with donors to find: letters, keys, idols, insignia, heads, ears, vials, maps, rings, tools, relics.
+| Ids | Block | Count | Examples |
+|---|---|---|---|
+| 200000 to 200012 | Papers and records | 13 | Stolen Book, Coded Orders, Sealed Letter, Crude Map |
+| 200020 to 200033 | Valuables | 14 | Stolen Silver, Looted Lockbox, Marked Insignia |
+| 200040 to 200059 | Supplies and tools | 20 | Stolen Supplies, Miner's Pick, Stolen Candle, Crude Key |
+| 200060 to 200087 | Taken from the body | 28 | Severed Paw, Bloodied Fang, Staring Eye, Torn Pelt |
+| 200100 to 200118 | Relics and the uncanny | 19 | Carved Idol, Pinned Doll, Dark Rune, Vial of Poison |
+| 200130 to 200133 | Growing things | 4 | Pale Mushroom, Gnarled Root |
 
 ### 4.2 Quest spec
 
@@ -195,7 +187,7 @@ With the stub model: a trophy bounty proposed, approved, turned in and retired, 
 
 ## 8. Done when
 
-- `server/dm_props.sql` creates the pool and is safe to run on every start.
+- `server/dm_props.sql` is installed and the props exist in game (the file is written; it needs one restart).
 - A trophy bounty with a prop can be proposed, approved, completed and retired on the live server.
 - After retirement the creature's loot table is exactly as it was.
 - Every check in 4.6 has a test.

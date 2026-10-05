@@ -601,9 +601,28 @@ def recent_targets(db, guid, count=2):
     return found
 
 
+def props_in_use(db):
+    """Props a bounty still out has already seeded into a creature's loot.
+
+    A quest-only drop fires for anyone whose quest needs that item, so two
+    live bounties sharing a prop would let each character loot the other's.
+    """
+    found = set()
+    for row in db.execute("SELECT spec FROM quests WHERE status IN ('offered', 'accepted')"):
+        try:
+            spec = json.loads(row["spec"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        for prop in spec.get("props") or []:
+            if prop.get("item"):
+                found.add(int(prop["item"]))
+    return found
+
+
 def propose(db, who, say):
     """Ask the model for the next bounty and store it as a proposal. Returns the proposal number."""
-    context = write_quest.gather(who["name"], skip=recent_targets(db, who["guid"]))
+    context = write_quest.gather(who["name"], skip=recent_targets(db, who["guid"]),
+                                 props_in_use=props_in_use(db))
     message = write_quest.user_message(context, None, story=story_section(db, context["character"]))
     answer, usage = llm.ask_for_tool_call(SYSTEM, message, TOOL, max_tokens=4096)
     spec, target, announcement = write_quest.build_spec(answer, context, hot_quest.QUEST_ID_RANGE[0])
@@ -922,17 +941,33 @@ def live_dm_quests():
         f"FROM {hot_quest.WORLD_DB}.quest_template WHERE entry BETWEEN {low} AND {high} ORDER BY entry;")
 
 
+def seeded_loot_rows():
+    """Every loot row any DM bounty has added, by its tag. Read from the game,
+    so a row left behind by a run whose record was lost is still found."""
+    return world_query.rows(
+        f"SELECT JSON_OBJECT('creature', entry, 'item', item, 'tag', comments) "
+        f"FROM {hot_quest.WORLD_DB}.creature_loot_template "
+        f"WHERE comments LIKE 'dm:%' ORDER BY comments;")
+
+
 def cmd_purge(db, args):
-    """Take every DM quest out of the game. The DM's own memory is kept."""
+    """Take every DM quest and every seeded prop out of the game. Memory is kept."""
     live = live_dm_quests()
+    seeded = seeded_loot_rows()
     low, high = hot_quest.QUEST_ID_RANGE
-    if not live:
-        print(f"nothing to purge: no quest in {low} to {high} is in the world database.")
+    if not live and not seeded:
+        print(f"nothing to purge: no quest in {low} to {high} is in the world database, "
+              "and no creature is carrying a DM prop.")
         return
     print(f"{len(live)} DM quest(s) in the world database:")
     for quest in live:
         print(f"  {quest['id']}  {quest['title']}")
-    print("\nPurging deletes each one, its giver links, and every character's record of it.\n"
+    if seeded:
+        print(f"\n{len(seeded)} seeded prop(s) in creature loot:")
+        for row in seeded:
+            print(f"  creature loot {row['creature']}: item {row['item']}  [{row['tag']}]")
+    print("\nPurging deletes each quest, its giver links, and every character's record of it,\n"
+          "and takes every seeded prop back out of creature loot.\n"
           "The DM's memory (state.db) is kept, so the chronicle still reads correctly.")
     if not args.yes:
         if input("\ntype the word purge to go ahead: ").strip() != "purge":
@@ -954,11 +989,25 @@ def cmd_purge(db, args):
         print(f"\nremoved {len(gone)} quest(s): {', '.join(str(i) for i in gone)}")
     for quest_id, error in failed:
         print(f"could not remove {quest_id}: {error}")
-    try:
-        print(f"console: reload all_quest -> {console.run('reload all_quest') or 'ok'}")
-    except console.ConsoleError as error:
-        print(f"the database is clean but the server was not told to re-read quests ({error}).\n"
-              "Run `.reload all_quest` in game.")
+
+    # The quests stop asking first, then the props they seeded come out.
+    reloads = ["reload all_quest"]
+    if seeded:
+        try:
+            apply_quest.run_sql(hot_quest.render_props_purge())
+            dm_state.add_event(db, 0, "purged", f"removed {len(seeded)} seeded loot row(s)")
+            db.commit()
+            print(f"removed {len(seeded)} seeded prop(s) from creature loot")
+            reloads.append("reload creature_loot_template")
+        except apply_quest.StepFailed as error:
+            print(f"could not remove the seeded props: {error}")
+            failed.append(("seeded props", error))
+    for command in reloads:
+        try:
+            print(f"console: {command} -> {console.run(command) or 'ok'}")
+        except console.ConsoleError as error:
+            print(f"the database is clean but the server was not told ({error}).\n"
+                  f"  Run `.{command}` in game.")
     print("Anyone holding one of these should relog.")
     if failed:
         sys.exit(1)
@@ -1016,7 +1065,8 @@ def cmd_context(db, args):
     if not dm_state.get_character(db, who["guid"]):
         sys.exit("dm: the Overseer has not noticed this character yet; run a tick while they are online")
     try:
-        context = write_quest.gather(args.character, skip=recent_targets(db, who["guid"]))
+        context = write_quest.gather(args.character, skip=recent_targets(db, who["guid"]),
+                                     props_in_use=props_in_use(db))
     except write_quest.NoContext as error:
         sys.exit(f"dm: {error}")
     print(write_quest.user_message(context, None, story=story_section(db, context["character"])))

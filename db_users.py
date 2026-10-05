@@ -60,6 +60,10 @@ WRITE_GRANTS = (
     # Only when a quest is removed outright. SELECT comes with it because
     # MariaDB needs read access to the columns a DELETE's WHERE clause names.
     ("SELECT, DELETE", f"{hot_quest.CHAR_DB}.character_queststatus"),
+    # Trophy props: a row added to a creature's loot while the bounty is out
+    # and deleted afterwards. UPDATE is for the ON DUPLICATE KEY clause that
+    # refuses to overwrite a row the DM does not own.
+    ("SELECT, INSERT, UPDATE, DELETE", f"{hot_quest.WORLD_DB}.creature_loot_template"),
 )
 
 ENV_KEYS = ("DM_DB_QUERY_COMMAND", "DM_DB_COMMAND")
@@ -166,6 +170,7 @@ def probes():
             ("writes a quest row", f"DELETE FROM {world}.quest_template WHERE entry = 0;", True),
             ("writes a giver link", f"DELETE FROM {world}.creature_questrelation WHERE quest = 0;", True),
             ("forgets a player's quest", f"DELETE FROM {chars}.character_queststatus WHERE quest = 0;", True),
+            ("seeds a prop into loot", f"DELETE FROM {world}.creature_loot_template WHERE entry = 0 AND item = 0;", True),
             ("cannot change a creature", f"DELETE FROM {world}.creature WHERE guid = 0;", False),
             ("cannot change an item", f"DELETE FROM {world}.item_template WHERE entry = 0;", False),
             ("cannot read a player's mail", f"SELECT 1 FROM {chars}.mail LIMIT 1;", False),
@@ -242,12 +247,37 @@ def write_env(passwords):
     return path
 
 
+def env_commands():
+    """The two database commands, read from the .env file itself.
+
+    Deliberately not through os.environ: console.load_env uses setdefault, so
+    once a value has been read in this process a rewritten .env would be
+    ignored, and `--create --write-env` would then verify the passwords it had
+    just replaced. The real environment still wins if the file says nothing,
+    for anyone who exports these in their shell instead.
+    """
+    found = {}
+    try:
+        with open(env_path(), encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    key, value = line.split("=", 1)
+                    if key.strip() in ENV_KEYS:
+                        found[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    for key in ENV_KEYS:
+        found.setdefault(key, os.environ.get(key, ""))
+    return found
+
+
 def passwords_from_env():
     """Dig the two passwords back out of the commands in .env."""
-    console.load_env()
+    commands = env_commands()
     found = {}
     for user, key in ((READER, "DM_DB_QUERY_COMMAND"), (WRITER, "DM_DB_COMMAND")):
-        command = os.environ.get(key, "")
+        command = commands.get(key, "")
         match = re.search(r"MYSQL_PWD=(\S+)", command)
         if match and f"-u {user}" in command:
             found[user] = shlex.split(f"x={match.group(1)}")[0][2:]

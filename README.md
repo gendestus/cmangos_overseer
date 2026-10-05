@@ -40,7 +40,7 @@ By default nothing reaches the game without `approve`. `DM_AUTO_APPROVE` can swi
 | `env.example` | Template for `.env` |
 | `tests/test_quest.json` and the two `tests/test_quest_*.sql` | A fixed quest for smoke-testing the pipeline without a model |
 | `tests/test_offline.py` | Checks that need no server: `python3 -m unittest discover tests` |
-| `server/` | Copies of custom-sql files from the game server (see step 1) |
+| `server/` | custom-sql files for the game server: the spell books (step 1) and the DM's story props (step 6) |
 | `docs/ai_dm_spec.md` | Design spec |
 | `docs/DEV_PLAN.md` | What is built and what is next |
 
@@ -113,13 +113,31 @@ This creates `dm_read`, which can only read, and `dm_write`, which can only inse
 
 A later phase that writes to a new table needs a line added to `WRITE_GRANTS` in `db_users.py` and a re-run of `--create`. An offline test fails if the renderer writes to a table the writer has no grant for.
 
-### 6. Smoke tests
+### 6. Story props, for trophy bounties (needs one restart)
+
+Trophy bounties need the DM's pool of story props. New item types load only at server start, so this is the one step that needs a restart.
+
+```
+cp server/dm_props.sql ~/cmangos-deploy/storage/classic/database/custom-sql/
+docker compose restart mangosd      # from the server folder
+```
+
+The file is idempotent, so leaving it in `custom-sql` is correct: it is re-applied on every start and rewrites only the ids it owns. Check it took:
+
+```
+python3 -c "import world_query; print(len(world_query.props()), 'props')"
+```
+
+Then confirm one in game with `.additem 200000` — a Stolen Book, with a book icon. Without this step the DM simply never offers a `trophy` bounty; every other kind works.
+
+### 7. Smoke tests
 
 Run these in order. Each one tests one more link in the chain.
 
 ```
 python3 -m unittest discover tests               # the rules, with no server involved
 python3 db_users.py --check                      # each database user can do its job and no more
+python3 -c "import world_query as w; print(len(w.props()))"   # the story props are installed
 python3 factions.py                              # the faction files are readable and make sense
 python3 console.py "server info"                 # the remote console answers
 python3 world_query.py <Character>               # the database is readable
@@ -130,7 +148,7 @@ python3 write_quest.py <Character> --dry-run     # the model writes a quest; not
 
 `factions.py` prints how seven well-known factions treat a Human and an Orc, with the answers to expect. `world_query.py` lists the nearby NPCs the DM could speak through. The fixed test quest is offered by Marshal McBride in Northshire, so it needs an Alliance character to take it.
 
-### 7. Run it
+### 8. Run it
 
 With a character online:
 
@@ -191,14 +209,29 @@ The model picks a kind, and each one is held to its own rules. They are defined 
 | `mark` | One named creature, killed once | A rare, elite or rare elite, exactly one kill |
 | `journey` | A hunt or mark far enough away to be worth the walk | At least one target in the far tier |
 | `party` | Two objectives, written for a group | The character has online company; exactly two objectives |
+| `trophy` | Collect something the creature is carrying | The prop is one the DM owns, is not in use, and the character does not already hold; the kills it implies are within what is alive and under 24 |
 
-Money scales with the kind: a `mark` or a `party` bounty may pay twice a `hunt`, a `journey` half again. Kill counts are capped by the kind and by how many of that creature are actually alive.
+Money scales with the kind: a `mark` or a `party` bounty may pay twice a `hunt`, a `journey` or a `trophy` half again. Kill counts are capped by the kind and by how many of that creature are actually alive.
 
 Each objective also carries a short label for the quest log, so a two-objective bounty does not show two unnamed counters, and a `party` bounty sets the quest's "Suggested players" line.
 
 An elite offered on the strength of a party, and any `party` bounty, is **checked again at approval**: if the company has gone, `approve` refuses and the next tick writes a different bounty.
 
-`trophy` (collect a DM-owned prop from a creature's loot) is designed in `docs/proposal_prop_trophies.md` and needs a server restart to install its item pool; `trial` (a hunt against a timer) is still to come.
+`trial` (a hunt against a timer) is still to come; it needs a spike in the game client first.
+
+### Trophies
+
+A trophy bounty does not look for something a creature already drops. The DM owns a pool of about a hundred generic story props — `Stolen Book`, `Guttered Candle`, `Severed Paw` — and when a bounty needs one it is **added to that creature's loot live**, as a quest-only drop, then deleted when the bounty ends. That is what lets the Overseer say *the kobolds have been carrying off my books* and have it be true.
+
+The design and the evidence behind it are in `docs/proposal_prop_trophies.md`. What matters in use:
+
+- A quest-only drop appears **only** for a character whose bounty needs it, and stops once they have enough. Nobody else's loot is touched.
+- Props are flagged as party loot, so each member of a group takes their own copy from one corpse rather than competing.
+- The loot row is tagged `dm:<quest id>`, and nothing untagged is ever written or deleted. Retiring or removing a bounty takes its props out; `dm.py purge` takes out every DM prop anywhere.
+- The prop pool itself survives a purge. It is permanent; only the loot rows come and go.
+- **A purge cannot empty a player's bags.** Loot tables are restored exactly, but anything already looted stays looted. The DM therefore never offers a prop the character is already carrying.
+
+Installing the pool needs one restart, because new item types load only at server start. See setup step 6.
 
 ## Settings
 

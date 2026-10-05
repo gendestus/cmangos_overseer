@@ -11,8 +11,9 @@ Order follows the owner's ranking. Estimates are rough guesses for one person wo
 | 0.4 | Narrow database users, a kill switch, and one command that undoes everything | An evening | Built |
 | 1.1 | Target search v2: ranks, two distance tiers, bearings, party awareness | An evening | Built |
 | 1.2a | Bounty kinds: hunt, mark, journey, party; objectives as a list; per-kind caps | An evening | Built |
-| 1.2b | The trophy kind, on DM props (`proposal_prop_trophies.md`) | A weekend | Next, after the spike and one restart |
-| 1 | The rest of richer bounties: chains, spell rewards, trial | A weekend | |
+| 1.2b | The trophy kind, on DM props (`proposal_prop_trophies.md`) | A weekend | Built |
+| G2 | Only notice the characters you name, for a playerbot realm | An evening | Built |
+| 1 | The rest of richer bounties: chains, spell rewards, trial | A weekend | Next |
 | 2 | Overseer mail, both directions | A weekend | |
 | 3 | Extra rewards with a budget | A weekend | |
 | 4b | Arc revision, grounding the adversary, signature rewards | An evening or two | |
@@ -113,7 +114,7 @@ The model picks a `kind` and is held to that kind's own rules. `KINDS` in `write
 | mark | Kill one named, rare or elite creature | Rank is not normal; exactly one kill |
 | journey | A hunt or mark in the far tier | At least one target has `tier == "far"` |
 | party | Two objectives, written for the group | The character has online company; exactly two objectives |
-| trophy | Collect N of a DM prop the target drops | 1.2b; see `proposal_prop_trophies.md` |
+| trophy | Collect N of a DM prop the target is made to carry | Built. Prop is in the pool, not in use, not already carried; implied kills within what is alive and under 24 |
 | trial | A hunt against a timer | 1.6; `LimitTime` is seconds and needs no extra flag, so the renderer change is one line once the spike passes |
 
 The model's answer now carries a list of one or two objectives instead of a flat `target_creature` and `kill_count`. `hot_quest` already took up to four of each, so the spec format did not change; what changed is the form, the validator, and the three displays that indexed the first objective.
@@ -130,7 +131,9 @@ Accepted: 73 offline tests, and two real bounties written by the model against t
 
 ### 1.3 Trophy objectives from stock loot
 
-Superseded by `proposal_prop_trophies.md` (accepted 2026-10-04), which replaces this section and 1.7: trophies collect DM-owned props added to a creature's loot live, not stock items. The 30% rule below does not hold up against the live loot tables — Kobold Worker's best ordinary drop is 29.55% and Defias Thug's is 13%. What remains useful here is the stock fallback, kept as a second source in the proposal's 4.7.
+Built as `proposal_prop_trophies.md` describes, which replaces this section and 1.7: trophies collect DM-owned props added to a creature's loot live, not stock items. The 30% rule below does not hold up against the live loot tables — Kobold Worker's best ordinary drop is 29.55% and Defias Thug's is 13%.
+
+What shipped: `world_query.props` and `carrying`; `props` in the quest spec with the loot-row renderers in `hot_quest`; the ordering in `apply_quest` (props and their reload before the quest is offered, after it stops asking on the way out); the `trophy` kind and its expected-kills arithmetic; the `creature_loot_template` grant for `dm_write`; and loot cleanup folded into `dm.py purge`. The stock-loot fallback in the proposal's 4.7 was **not** built — props cover the need, and a second source is complexity without a reason yet.
 
 - New query: items dropped by eligible nearby creatures, with drop chance.
 - Offer only items with a drop chance of 30% or more, or quest-only drops. Quest-only drops appear for any quest that needs the item, including a DM quest (verified in the loot code).
@@ -156,7 +159,7 @@ Superseded by `proposal_prop_trophies.md` (accepted 2026-10-04), which replaces 
 
 ### 1.7 DM-owned trophy items (no longer optional)
 
-Superseded by `proposal_prop_trophies.md`, which takes this up as the main design rather than an optional extra: a pool of about 80 generic story props in the item range 200000 to 200199, created once by custom-sql, added to a target creature's loot live as a quest-only drop when a trophy bounty is posted and deleted when it ends. Still needs one restart, because new item templates load only at startup.
+Built. `server/dm_props.sql` creates 98 story props in the item range 200000 to 200199, cloned from a stock quest item so the insert survives an upstream schema change, and re-applied idempotently on every start. One restart was needed, because new item templates load only at startup. The pool is permanent: a purge removes the loot rows a bounty seeded, never the props themselves.
 
 ### 1.8 Prompt, form, display
 
@@ -278,4 +281,4 @@ When the player's actions contradict the arc (refusing the dark path, out-levell
 | Timed quest in benilla | 1.6 |
 | `send mail` with quotes and a line-break code; how the letter looks in game | 2.1 |
 | Mail a letter to the DM character and read it back | 2.3 |
-| Add a prop to a creature's loot, reload, kill it with and without the quest, then in a party | 1.3, 1.7, 3.3 (the full steps are in `proposal_prop_trophies.md` section 6) |
+| ~~Add a prop to a creature's loot, reload, kill it with and without the quest, then in a party~~ | Done 2026-10-04, all five steps. A quest-only drop fires for a DM quest and stops once the objective is met; flag 2048 lets every party member loot one from the same corpse. 1.3, 1.7 and 3.3's plumbing rest on this. |

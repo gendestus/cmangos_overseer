@@ -16,6 +16,7 @@ Needs ANTHROPIC_API_KEY in the environment or the .env beside this file.
 """
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -28,6 +29,7 @@ import world_query
 ISSUED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "issued")
 
 MAX_OBJECTIVES = 2          # the quest format allows four; two is enough to start
+MAX_EXPECTED_KILLS = 24     # the most kills a trophy objective may imply
 
 
 class Kind:
@@ -37,12 +39,18 @@ class Kind:
     ranks        creature ranks it may target, from world_query.RANK_NAMES
     max_count    ceiling on one objective's count, before the alive count is applied
     money        multiplier on the level's money cap, so harder work pays better
+    collects     True if its objectives collect a prop rather than count kills
     rule         the sentence the model is told about this kind
     """
+    collects = False
 
     def __init__(self, objectives, ranks, max_count, money, rule):
         self.objectives, self.ranks = objectives, ranks
         self.max_count, self.money, self.rule = max_count, money, rule
+
+    def objective(self, entry, target, context):
+        """Check one objective of this kind. Returns what the spec needs from it."""
+        return {}
 
     def check(self, chosen, context):
         """Rules that need the whole answer, not one objective. Raises Rejected."""
@@ -50,7 +58,7 @@ class Kind:
 
 class Journey(Kind):
     def check(self, chosen, context):
-        if not any(target["tier"] == "far" for _, target, _ in chosen):
+        if not any(o["target"]["tier"] == "far" for o in chosen):
             raise Rejected("a journey must send the character to a far target; all of these are nearby")
 
 
@@ -58,6 +66,36 @@ class Party(Kind):
     def check(self, chosen, context):
         if not online_company(context):
             raise Rejected("a party bounty needs company; this character is alone")
+
+
+class Trophy(Kind):
+    """Collect a DM prop that the target has been made to carry.
+
+    The prop is added to that creature's loot as a quest-only drop while the
+    bounty is out, so it drops for whoever needs it and for nobody else, and
+    it is deleted again when the bounty ends.
+    """
+    collects = True
+
+    def objective(self, entry, target, context):
+        allowed = {prop["item"]: prop for prop in context.get("props", [])}
+        prop = allowed.get(entry.get("prop"))
+        if not prop:
+            raise Rejected(f"prop {entry.get('prop')} is not in the list of props this bounty may use")
+        chance = entry.get("chance")
+        if chance not in hot_quest.PROP_CHANCES:
+            raise Rejected(f"drop chance {chance!r} must be one of {hot_quest.PROP_CHANCES}")
+        count = entry.get("count")
+        # The area has to be able to supply the hunt. The drop stops once the
+        # objective is met, so this is the worst case, not an average.
+        expected = math.ceil(count * 100 / chance) if isinstance(count, int) and count > 0 else 0
+        if expected > target["alive"]:
+            raise Rejected(f"{count} x {prop['name']} at {chance}% needs about {expected} kills, "
+                           f"but only {target['alive']} {target['name']} are alive")
+        if expected > MAX_EXPECTED_KILLS:
+            raise Rejected(f"{count} x {prop['name']} at {chance}% needs about {expected} kills, "
+                           f"more than the {MAX_EXPECTED_KILLS} a bounty may ask for")
+        return {"prop": prop["item"], "prop_name": prop["name"], "chance": chance, "expected_kills": expected}
 
 
 # The one place a kind is defined. The prompt text, the tool's enum and every
@@ -79,6 +117,12 @@ KINDS = {
         objectives=(2, 2), ranks=("normal", "elite", "rare", "rare elite"), max_count=10, money=2.0,
         rule="party: two objectives, written for the whole group rather than one person. Only for a "
              "character who has company."),
+    "trophy": Trophy(
+        objectives=(1, 1), ranks=("normal", "elite", "rare", "rare elite"), max_count=hot_quest.MAX_PROP_COUNT,
+        money=1.5,
+        rule="trophy: collect something a creature is carrying, chosen from the list of props. Pick a prop "
+             "that makes sense as a thing that creature would own or have taken, and say in the quest text "
+             "why the Overseer wants it. Every party member can loot their own copy."),
 }
 
 
@@ -139,8 +183,13 @@ TOOL = {
                     "type": "object",
                     "properties": {
                         "target_creature": {"type": "integer", "description": "Creature id, from the list of creatures."},
-                        "count": {"type": "integer", "description": "How many to kill."},
+                        "count": {"type": "integer", "description": "How many to kill, or for a trophy how many to collect."},
                         "label": {"type": "string", "description": "Two to five words for the quest log, e.g. \"Kobold Workers slain\"."},
+                        "prop": {"type": ["integer", "null"],
+                                 "description": "Trophy only: item id from the props list, which that creature will be made to carry."},
+                        "chance": {"type": ["integer", "null"], "enum": list(hot_quest.PROP_CHANCES) + [None],
+                                   "description": "Trophy only: how often the prop drops, as a percentage. "
+                                                  "Higher means fewer kills."},
                     },
                     "required": ["target_creature", "count", "label"],
                 },
@@ -164,8 +213,30 @@ class NoContext(Exception):
     """There is nothing sensible to offer this character right now."""
 
 
-def gather(name, skip=()):
-    """Everything the model is shown. `skip` is creature ids a bounty should not reuse."""
+def offerable_props(who, in_use=()):
+    """Props a trophy bounty may use for this character.
+
+    Two of the proposal's checks are enforced by leaving a prop off the list
+    rather than refusing it afterwards, which is the same discipline as every
+    other choice the model makes:
+
+    - a prop another live bounty is already using would be looted by the wrong
+      character, since the drop fires for anyone whose quest needs it;
+    - a prop the character already carries would leave the objective part
+      finished the moment it was offered.
+    """
+    pool = world_query.props()
+    held = world_query.carrying(who["guid"], [prop["item"] for prop in pool])
+    busy = {int(item) for item in in_use}
+    return [prop for prop in pool if prop["item"] not in busy and not held.get(prop["item"])]
+
+
+def gather(name, skip=(), props_in_use=()):
+    """Everything the model is shown.
+
+    skip          creature ids a bounty should not reuse
+    props_in_use  props another live bounty has already seeded
+    """
     who = world_query.character(name)
     if not who:
         raise NoContext(f"no character named {name}")
@@ -175,6 +246,7 @@ def gather(name, skip=()):
         "party": party,
         "givers": world_query.givers(who),
         "targets": world_query.targets(who, party=party, skip=skip),
+        "props": offerable_props(who, props_in_use),
         "reward_items": world_query.reward_items(who),
         "money_cap": world_query.money_cap(who["level"]),
         "xp_weight": world_query.xp_weight(who["level"]),
@@ -214,6 +286,11 @@ def user_message(context, hint, story=None):
         lines.append(f"- {name}: {count} objective(s), up to {kind.max_count} per objective, "
                      f"money up to {money_cap(context, name)} copper")
     lines.append("")
+    if context.get("props"):
+        lines.append(f"Props a trophy bounty may ask for, at {', '.join(str(c) + '%' for c in hot_quest.PROP_CHANCES)} "
+                     f"drop chance (at most {MAX_EXPECTED_KILLS} kills' worth):")
+        lines.append("  " + "; ".join(f"{p['item']} {p['name']}" for p in context["props"]))
+        lines.append("")
     if context["reward_items"]:
         lines.append("Reward list (id, name, level needed to use it):")
         for r in context["reward_items"]:
@@ -228,18 +305,22 @@ def user_message(context, hint, story=None):
 
 
 def resolve_objectives(answer, context, kind):
-    """Check every objective against the lists this script built. Returns a list of
-    (spec objective, the target it points at, quest-log label)."""
+    """Check every objective against the lists this script built.
+
+    Returns one dict per objective: the target it points at, the count, the
+    quest-log label, and for a trophy the prop and its drop chance.
+    """
     entries = answer.get("objectives")
     if not isinstance(entries, list):
         raise Rejected("objectives must be a list")
-    fewest, most = KINDS[kind].objectives
+    rules = KINDS[kind]
+    fewest, most = rules.objectives
     if not fewest <= len(entries) <= most:
         word = f"{fewest}" if fewest == most else f"{fewest} to {most}"
         raise Rejected(f"a {kind} bounty needs {word} objective(s), got {len(entries)}")
 
     by_id = {t["creature"]: t for t in context["targets"]}
-    allowed, cap = KINDS[kind].ranks, KINDS[kind].max_count
+    allowed, cap = rules.ranks, rules.max_count
     company = online_company(context)
     chosen, used = [], set()
     for i, entry in enumerate(entries, start=1):
@@ -255,8 +336,10 @@ def resolve_objectives(answer, context, kind):
                            f"({target['name']}); it allows {', '.join(allowed)}")
         if target.get("needs_party") and not company:
             raise Rejected(f"objective {i}: {target['name']} needs a party and this character is alone")
-        ceiling = min(cap, target["alive"])
         count = entry.get("count")
+        # A collected prop is not capped by the alive count directly: what
+        # matters is how many kills it would take, which the kind checks.
+        ceiling = cap if rules.collects else min(cap, target["alive"])
         if not isinstance(count, int) or not 1 <= count <= ceiling:
             raise Rejected(f"objective {i}: count {count} is outside 1 to {ceiling} for {target['name']}")
         label = " ".join(str(entry.get("label", "")).split())
@@ -265,8 +348,10 @@ def resolve_objectives(answer, context, kind):
         if len(label) > 60:
             raise Rejected(f"objective {i}: the label is {len(label)} characters; keep it under 60")
         used.add(target["creature"])
-        chosen.append(({"creature": target["creature"], "count": count}, target, label))
-    KINDS[kind].check(chosen, context)
+        objective = {"target": target, "count": count, "label": label}
+        objective.update(rules.objective(entry, target, context))   # a trophy adds its prop here
+        chosen.append(objective)
+    rules.check(chosen, context)
     return chosen
 
 
@@ -294,12 +379,17 @@ def build_spec(answer, context, quest_id):
         raise Rejected("announcement is too long or contains a line break")
 
     company = online_company(context)
+    # A trophy's objectives become props, which the renderer turns into both a
+    # collect objective and a loot row. Every other kind counts kills.
+    kills = [{"creature": o["target"]["creature"], "count": o["count"]} for o in chosen if not o.get("prop")]
+    props = [{"item": o["prop"], "count": o["count"], "creature": o["target"]["creature"], "chance": o["chance"]}
+             for o in chosen if o.get("prop")]
     spec = {
         "id": quest_id,
         "title": answer.get("title"),
         "zone": who["zone"],
         "min_level": max(1, who["level"] - 2),
-        "quest_level": max([who["level"]] + [t["max_level"] for _, t, _ in chosen]),
+        "quest_level": max([who["level"]] + [o["target"]["max_level"] for o in chosen]),
         "suggested_players": len(company) + 1 if kind == "party" else 0,
         "giver": giver["creature"],
         "ender": giver["creature"],
@@ -307,9 +397,10 @@ def build_spec(answer, context, quest_id):
         "objectives_text": answer.get("objectives_text"),
         "progress_text": answer.get("progress_text"),
         "completion_text": answer.get("completion_text"),
-        "kill": [objective for objective, _, _ in chosen],
-        "objective_labels": [label for _, _, label in chosen],
+        "kill": kills,
+        "objective_labels": [o["label"] for o in chosen if not o.get("prop")],
         "collect": [],
+        "props": props,
         "reward": {
             "money_copper": money,
             "xp_weight": context["xp_weight"],
@@ -322,12 +413,16 @@ def build_spec(answer, context, quest_id):
 
     # What the DM keeps for its records and its displays: the first objective's
     # target as before, plus every objective in full and the herald.
-    primary = chosen[0][1]
-    record = dict(primary, giver=giver, kind=kind, needs_party=any(t.get("needs_party") for _, t, _ in chosen),
-                  objectives=[dict(creature=t["creature"], name=t["name"], count=o["count"], label=label,
-                                   rank=t["rank"], alive=t["alive"], distance=t["distance"],
-                                   direction=t["direction"], tier=t["tier"])
-                              for o, t, label in chosen])
+    record = dict(chosen[0]["target"], giver=giver, kind=kind,
+                  needs_party=any(o["target"].get("needs_party") for o in chosen),
+                  objectives=[dict(creature=o["target"]["creature"], name=o["target"]["name"],
+                                   count=o["count"], label=o["label"], rank=o["target"]["rank"],
+                                   alive=o["target"]["alive"], distance=o["target"]["distance"],
+                                   direction=o["target"]["direction"], tier=o["target"]["tier"],
+                                   **({"prop": o["prop"], "prop_name": o["prop_name"],
+                                       "chance": o["chance"], "expected_kills": o["expected_kills"]}
+                                      if o.get("prop") else {}))
+                              for o in chosen])
     return spec, record, announcement
 
 
@@ -350,11 +445,17 @@ def creature_names(names):
 
 
 def objective_summary(spec, names=None):
-    """One line: '8 x Kobold Worker, 1 x Hogger'."""
+    """One line: '8 x Kobold Worker, 1 x Hogger', or '4 x Stolen Book from Kobold Vermin'."""
     found = creature_names(names)
+    props = {int(o["prop"]): o for o in (names if isinstance(names, list) else []) if isinstance(o, dict) and o.get("prop")}
     parts = []
     for o in spec.get("kill") or []:
         parts.append(f"{o['count']} x " + (found.get(o["creature"]) or f"creature {o['creature']}"))
+    for o in spec.get("props") or []:
+        prop = props.get(int(o["item"]), {})
+        what = prop.get("prop_name") or f"item {o['item']}"
+        whose = found.get(o.get("creature")) or f"creature {o.get('creature')}"
+        parts.append(f"{o['count']} x {what} from {whose}")
     return ", ".join(parts) or "no objective"
 
 
@@ -368,7 +469,12 @@ def objective_lines(record):
         where = f"{o['distance']} yards {o['direction']}"
         if o.get("tier") == "far":
             where += ", a journey"
-        lines.append(f"{o['count']} x {o['name']} [{o['rank']}] ({o['alive']} alive, {where})  \"{o['label']}\"")
+        if o.get("prop"):
+            lines.append(f"{o['count']} x {o['prop_name']} from {o['name']} [{o['rank']}] "
+                         f"at {o['chance']}%, about {o['expected_kills']} kills "
+                         f"({o['alive']} alive, {where})  \"{o['label']}\"")
+        else:
+            lines.append(f"{o['count']} x {o['name']} [{o['rank']}] ({o['alive']} alive, {where})  \"{o['label']}\"")
     return lines
 
 

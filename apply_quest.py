@@ -70,7 +70,9 @@ def apply_spec(spec, announce=None, remove=False, retire=False, say=print):
     commands = ["reload all_quest"]
     if announce and not remove and not retire:
         commands.append(f"announce {announce}")
-    for command in commands:                          # refuse early, before any write
+    # Refuse early, before any write. The loot reload is checked too but kept
+    # out of `commands`, because it has to run at its own point in the order.
+    for command in commands + (["reload creature_loot_template"] if quest["props"] else []):
         console.check_allowed(console.normalise(command))
 
     label = f"quest {quest['id']} ({quest['title']})"
@@ -79,6 +81,18 @@ def apply_spec(spec, announce=None, remove=False, retire=False, say=print):
         say(report.strip())
         if "PROBLEM" in report:
             raise StepFailed("preflight found a problem; nothing was written")
+
+    def reload_loot():
+        reply = console.run("reload creature_loot_template")
+        say(f"console: reload creature_loot_template -> {reply or 'ok'}")
+
+    # Props first on the way in, so the drop exists before the quest is on
+    # offer; last on the way out, so the quest stops asking before the drop
+    # disappears. Either order reversed leaves a character unable to finish.
+    if not remove and not retire and quest["props"]:
+        run_sql(hot_quest.render_props_apply(quest))
+        say(f"database: seeded {len(quest['props'])} prop(s) into creature loot")
+        reload_loot()
 
     if remove:
         run_sql(hot_quest.render_remove(quest))
@@ -91,6 +105,11 @@ def apply_spec(spec, announce=None, remove=False, retire=False, say=print):
     for command in commands:
         reply = console.run(command)
         say(f"console: {command} -> {reply or 'ok'}")
+
+    if (remove or retire) and quest["props"]:
+        run_sql(hot_quest.render_props_remove(quest["id"]))
+        say(f"database: took this bounty's prop(s) back out of creature loot")
+        reload_loot()
     return quest
 
 
@@ -113,11 +132,19 @@ def main():
         sys.exit(f"apply_quest: spec rejected: {error}")
 
     if args.dry_run:
+        taking_down = args.remove or args.retire
+        if quest["props"] and not taking_down:          # props go in before the quest is offered
+            print(hot_quest.render_props_apply(quest))
+            print("-- console: reload creature_loot_template\n")
         print(hot_quest.render_remove(quest) if args.remove else
               hot_quest.render_retire(quest) if args.retire else hot_quest.render_apply(quest))
         print("-- console: reload all_quest")
         if args.announce and not args.remove:
             print(f"-- console: announce {args.announce}")
+        if quest["props"] and taking_down:              # and come out after it stops asking
+            print()
+            print(hot_quest.render_props_remove(quest["id"]))
+            print("-- console: reload creature_loot_template")
         return
 
     try:

@@ -7,6 +7,7 @@ They cover the rules the DM enforces on a model's answer, the SQL renderer,
 the console allow-list and the memory file's schema upgrade. Anything that
 talks to the game is tested by hand with the smoke tests in the README.
 """
+import inspect
 import json
 import os
 import re
@@ -230,6 +231,144 @@ class BountyKinds(unittest.TestCase):
     def test_the_quest_level_follows_the_hardest_target(self):
         spec, _, _ = self.build(kind="mark", objectives=self.objectives((471, 1)))
         self.assertEqual(spec["quest_level"], 4)                 # Narg is level 4, the character is 3
+
+
+class TrophyBounties(unittest.TestCase):
+    """Collecting a DM prop the target has been made to carry."""
+
+    CONTEXT = dict(CONTEXT, props=[{"item": 200000, "name": "Stolen Book"},
+                                   {"item": 200060, "name": "Severed Paw"}])
+
+    def build(self, context=None, **objective):
+        entry = {"target_creature": 257, "count": 4, "label": "Books recovered",
+                 "prop": 200000, "chance": 50}
+        entry.update(objective)
+        return write_quest.build_spec(dict(ANSWER, kind="trophy", objectives=[entry]),
+                                      context or self.CONTEXT, 30000)
+
+    def test_a_trophy_becomes_a_prop_not_a_kill(self):
+        spec, record, _ = self.build()
+        self.assertEqual(spec["props"], [{"item": 200000, "count": 4, "creature": 257, "chance": 50}])
+        self.assertEqual(spec["kill"], [])
+        # The item slot is labelled by the item itself, so there is no ObjectiveText.
+        self.assertEqual(spec["objective_labels"], [])
+        self.assertEqual(record["objectives"][0]["prop_name"], "Stolen Book")
+        self.assertEqual(record["objectives"][0]["expected_kills"], 8)
+
+    def test_the_prop_must_be_one_this_bounty_may_use(self):
+        with self.assertRaises(write_quest.Rejected):
+            self.build(prop=200199)                     # in the range, but not offered
+        with self.assertRaises(write_quest.Rejected):
+            self.build(prop=None)
+
+    def test_the_drop_chance_is_one_of_three(self):
+        for chance in write_quest.hot_quest.PROP_CHANCES:
+            self.build(count=1, chance=chance)          # 1 at 34% is 3 kills, within what is alive
+        for chance in (75, 10, 0, -50, None, "50"):
+            with self.assertRaises(write_quest.Rejected):
+                self.build(count=1, chance=chance)
+
+    def test_the_area_must_be_able_to_supply_it(self):
+        # 9 Kobold Workers are alive; 9 books at 50% needs about 18 kills.
+        with self.assertRaises(write_quest.Rejected):
+            self.build(count=9, chance=50)
+        self.build(count=4, chance=100)                 # 4 kills, fine
+
+    def test_no_bounty_may_ask_for_more_kills_than_the_cap(self):
+        crowded = dict(self.CONTEXT,
+                       targets=[dict(self.CONTEXT["targets"][0], alive=500)])
+        self.build(crowded, count=8, chance=100)        # 8 kills
+        with self.assertRaises(write_quest.Rejected) as caught:
+            self.build(crowded, count=20, chance=34)    # about 59 kills
+        self.assertIn(str(write_quest.MAX_EXPECTED_KILLS), str(caught.exception))
+
+    def test_a_prop_in_use_or_already_carried_is_never_offered(self):
+        pool = [{"item": 200000, "name": "Stolen Book"}, {"item": 200060, "name": "Severed Paw"}]
+        who = {"guid": 1}
+        real_props, real_carrying = world_query.props, world_query.carrying
+        try:
+            world_query.props = lambda: pool
+            world_query.carrying = lambda guid, items: {200060: 3}   # a leftover stack
+            offered = write_quest.offerable_props(who, in_use=[200000])
+            self.assertEqual(offered, [])               # one busy, one already held
+            world_query.carrying = lambda guid, items: {}
+            self.assertEqual([p["item"] for p in write_quest.offerable_props(who)], [200000, 200060])
+            self.assertEqual([p["item"] for p in write_quest.offerable_props(who, in_use=["200000"])], [200060])
+        finally:
+            world_query.props, world_query.carrying = real_props, real_carrying
+
+    def test_the_spec_renders_a_loot_row_and_an_item_objective(self):
+        spec, _, _ = self.build()
+        quest = hot_quest.validate(spec)
+        loot = hot_quest.render_props_apply(quest)
+        self.assertIn("INSERT INTO creature_loot_template", loot)
+        self.assertIn("-50", loot)                      # negative chance: quest-only
+        self.assertIn("t.LootId", loot)                 # resolved, never assumed to be the entry
+        self.assertIn("'dm:30000 200000'", loot)
+        self.assertIn("comments LIKE 'dm:%'", loot)     # a stock row is never overwritten
+        applied = hot_quest.render_apply(quest)
+        self.assertIn("ReqItemId1", applied)
+        removed = hot_quest.render_props_remove(30000)
+        self.assertIn("WHERE comments LIKE 'dm:30000 %'", removed)
+        self.assertIn("WHERE comments LIKE 'dm:%'", hot_quest.render_props_purge())
+
+
+class PropSpecRules(unittest.TestCase):
+    def spec(self, **props):
+        entry = {"item": 200000, "count": 4, "creature": 6, "chance": 50}
+        entry.update(props)
+        return dict(SPEC, kill=[], collect=[], props=[entry])
+
+    def test_a_prop_only_quest_still_has_an_objective(self):
+        quest = hot_quest.validate(self.spec())
+        self.assertEqual(quest["kill"], [])
+        self.assertEqual(len(quest["props"]), 1)
+
+    def test_a_quest_with_no_objective_at_all_is_refused(self):
+        with self.assertRaises(hot_quest.SpecError):
+            hot_quest.validate(dict(SPEC, kill=[], collect=[], props=[]))
+
+    def test_the_prop_id_must_be_in_the_reserved_range(self):
+        for item in (199999, 200200, 1, 752):
+            with self.assertRaises(hot_quest.SpecError):
+                hot_quest.validate(self.spec(item=item))
+
+    def test_counts_and_chances_are_bounded(self):
+        for count in (0, -1, hot_quest.MAX_PROP_COUNT + 1, "4", None):
+            with self.assertRaises(hot_quest.SpecError):
+                hot_quest.validate(self.spec(count=count))
+        for chance in (75, 0, -50, None):
+            with self.assertRaises(hot_quest.SpecError):
+                hot_quest.validate(self.spec(chance=chance))
+
+    def test_at_most_two_props_and_no_repeats(self):
+        two = [{"item": 200000, "count": 1, "creature": 6, "chance": 100},
+               {"item": 200060, "count": 1, "creature": 257, "chance": 100}]
+        hot_quest.validate(dict(SPEC, kill=[], collect=[], props=two))
+        with self.assertRaises(hot_quest.SpecError):          # the same prop twice
+            hot_quest.validate(dict(SPEC, kill=[], collect=[],
+                                    props=[two[0], dict(two[0], creature=257)]))
+        with self.assertRaises(hot_quest.SpecError):          # three
+            hot_quest.validate(dict(SPEC, kill=[], collect=[],
+                                    props=two + [{"item": 200061, "count": 1, "creature": 6, "chance": 100}]))
+
+    def test_props_and_collect_share_the_four_item_slots(self):
+        collect = [{"item": 4536, "count": 1}] * 3
+        props = [{"item": 200000, "count": 1, "creature": 6, "chance": 100},
+                 {"item": 200060, "count": 1, "creature": 257, "chance": 100}]
+        with self.assertRaises(hot_quest.SpecError):
+            hot_quest.validate(dict(SPEC, kill=[], collect=collect, props=props))
+
+    def test_a_loot_tag_cannot_be_forged_from_outside_the_quest_range(self):
+        for quest_id in (1, 29999, 40000):
+            with self.assertRaises(hot_quest.SpecError):
+                hot_quest.render_props_remove(quest_id)
+
+    def test_the_preflight_refuses_to_overwrite_a_stock_loot_row(self):
+        sql = hot_quest.render_preflight(hot_quest.validate(self.spec()))
+        self.assertIn("no stock loot row for prop 200000", sql)
+        self.assertIn("comments NOT LIKE 'dm:%'", sql)
+        self.assertIn("has a loot table to add it to", sql)
 
 
 class ObjectiveDisplay(unittest.TestCase):
@@ -535,12 +674,21 @@ class NarrowDatabaseUsers(unittest.TestCase):
         return {target.split(".", 1)[-1] for _, target in grants}
 
     def written_tables(self):
-        quest = hot_quest.validate(SPEC)
-        sql = hot_quest.render_apply(quest) + hot_quest.render_remove(quest) + hot_quest.render_retire(quest)
+        """Every table hot_quest can write, read from its source.
+
+        Scanning the source rather than calling the renderers on purpose: a
+        renderer added later is covered without anyone remembering to list it
+        here, which is how creature_loot_template first slipped past.
+        """
+        source = inspect.getsource(hot_quest)
         found = set()
-        for statement in ("REPLACE INTO", "INSERT INTO", "DELETE FROM", "UPDATE"):
-            for match in re.finditer(statement + r" ([a-zA-Z_][\w.]*)", sql):
-                found.add(match.group(1).split(".", 1)[-1])
+        # "(?<!KEY )UPDATE" so the column list of an ON DUPLICATE KEY UPDATE
+        # clause is not mistaken for a table name.
+        for statement in ("REPLACE INTO", "INSERT INTO", "DELETE FROM", r"(?<!KEY )UPDATE"):
+            for match in re.finditer(statement + r"\s+([{}\w.]+)", source):
+                table = match.group(1).split(".")[-1]        # drop a {WORLD_DB}. prefix
+                if table.isidentifier():
+                    found.add(table)
         return found
 
     def test_every_table_written_is_granted(self):
@@ -558,6 +706,40 @@ class NarrowDatabaseUsers(unittest.TestCase):
     def test_the_reader_is_granted_nothing_but_select(self):
         for privilege, _ in db_users.READ_GRANTS:
             self.assertEqual(privilege, "SELECT")
+
+    def test_rotated_passwords_are_read_from_the_file_not_the_environment(self):
+        """`--create --write-env` twice must verify the new passwords, not the old.
+
+        console.load_env uses setdefault, so a value already read in this
+        process would otherwise shadow a rewritten .env and the second run
+        would check passwords it had just replaced.
+        """
+        folder = tempfile.mkdtemp()
+        path = os.path.join(folder, ".env")
+        os.environ["DM_DB_QUERY_COMMAND"] = "docker compose exec -e MYSQL_PWD=stale -T database mariadb -u dm_read"
+        os.environ["DM_DB_COMMAND"] = "docker compose exec -e MYSQL_PWD=stale -T database mariadb -u dm_write"
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("ANTHROPIC_API_KEY=keep-me\n"
+                             "DM_DB_QUERY_COMMAND=docker compose exec -e MYSQL_PWD=fresh-r -T database mariadb -u dm_read\n"
+                             "DM_DB_COMMAND=docker compose exec -e MYSQL_PWD=fresh-w -T database mariadb -u dm_write\n")
+            original, db_users.env_path = db_users.env_path, lambda: path
+            try:
+                self.assertEqual(db_users.passwords_from_env(),
+                                 {db_users.READER: "fresh-r", db_users.WRITER: "fresh-w"})
+            finally:
+                db_users.env_path = original
+
+            # With no file, the real environment is still honoured.
+            original, db_users.env_path = db_users.env_path, lambda: os.path.join(folder, "absent")
+            try:
+                self.assertEqual(db_users.passwords_from_env(),
+                                 {db_users.READER: "stale", db_users.WRITER: "stale"})
+            finally:
+                db_users.env_path = original
+        finally:
+            os.environ.pop("DM_DB_QUERY_COMMAND", None)
+            os.environ.pop("DM_DB_COMMAND", None)
 
 
 class MemoryFile(unittest.TestCase):

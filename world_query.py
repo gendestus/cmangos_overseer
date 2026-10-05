@@ -242,6 +242,42 @@ def givers(who, limit=8):
     return []
 
 
+PROP_ID_RANGE = (200000, 200199)        # ai_dm_spec.md reserves this for DM items
+
+
+def props():
+    """The DM's own story props, read from the game rather than listed here.
+
+    Created once by `server/dm_props.sql`, which needs a server restart. The
+    DM adds one to a creature's loot as a quest-only drop while a trophy
+    bounty is out, and deletes the row afterwards.
+    """
+    low, high = PROP_ID_RANGE
+    return rows(f"""
+        SELECT JSON_OBJECT('item', entry, 'name', name)
+        FROM {hot_quest.WORLD_DB}.item_template
+        WHERE entry BETWEEN {low} AND {high}
+        ORDER BY entry;""")
+
+
+def carrying(guid, items):
+    """How many of each of these items the character already holds.
+
+    A trophy objective would be part-finished the moment it was offered if a
+    stack were left over from an earlier bounty, so the validator checks this.
+    """
+    if not items:
+        return {}
+    wanted = ", ".join(str(int(item)) for item in items)
+    found = rows(f"""
+        SELECT JSON_OBJECT('item', ci.item_template, 'count', SUM(ii.count))
+        FROM {hot_quest.CHAR_DB}.character_inventory ci
+        JOIN {hot_quest.CHAR_DB}.item_instance ii ON ii.guid = ci.item
+        WHERE ci.guid = {int(guid)} AND ci.item_template IN ({wanted})
+        GROUP BY ci.item_template;""")
+    return {int(row["item"]): int(row["count"]) for row in found}
+
+
 def reward_items(who, reach=10, limit=6):
     """Capstone spell books this character can use and does not already know.
 
