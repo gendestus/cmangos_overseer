@@ -156,6 +156,7 @@ Rules:
 - Keep it short: title up to 40 characters, briefing 2 to 4 sentences, progress and completion 1 to 3 sentences each.
 - The objectives line states plainly what to do, how many, and whom to return to, by the herald's name.
 - Each objective also gets a short label of its own, two to five words, for the character's quest log.
+- Be creative with the name. Don't just describe the quest. Instead of "Maps of Fargodeep" choose "Underground Cartography"
 - The announcement is one line the whole server sees. Name the herald in it, so players know where to go. Do not name the character in it.""".format(kinds=kind_rules())
 
 CLOSING = "\n\nRespond by calling the submit_quest tool exactly once. Do not reply with prose."
