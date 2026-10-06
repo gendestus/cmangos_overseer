@@ -1,8 +1,9 @@
 # Proposal: herald voice and continuity
 
-Status: proposed 2026-10-06. Polish; no new game mechanics.
+Status: implemented 2026-10-06. Polish; no new game mechanics.
+Implementation notes: the line-picking lives in `world_query` (`herald_lines`, `pick_lines`, `herald_voice`). The back-fill in 5 reads `giver_id` and `ender_id` from each bounty's stored spec, which always held them, so it is exact rather than by name. `pinned` is recorded and shown but changes nothing yet: no note, pinned or not, is ever replaced by the model.
 Audience: whoever implements it (currently Claude Code).
-Reference: `herald_voice_prototype.py` beside this file is the query in 4.1, as run against the test database.
+Reference: the query in 4.1 began as `herald_voice_prototype.py`, now folded into `world_query.py`.
 
 ## 1. Problem
 

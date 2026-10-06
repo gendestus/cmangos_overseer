@@ -59,6 +59,12 @@ CREATE TABLE IF NOT EXISTS rewards (
     level INTEGER,                               -- the character's level when it was posted
     status TEXT NOT NULL DEFAULT 'posted'        -- posted, collected, lapsed
 );
+CREATE TABLE IF NOT EXISTS herald_voices (
+    creature INTEGER PRIMARY KEY, name TEXT,
+    note TEXT,                                   -- two sentences on how this NPC speaks
+    pinned INTEGER NOT NULL DEFAULT 0,           -- 1 when the owner wrote or confirmed it
+    set_at INTEGER, set_by_quest INTEGER, uses INTEGER NOT NULL DEFAULT 0
+);
 """
 
 # Columns added after the first release; applied to an existing state.db on open.
@@ -76,6 +82,10 @@ ADDED_COLUMNS = (
     ("quests", "kind", "TEXT"),                                # hunt, mark, journey, party, trophy;
                                                                # a bounty's kind, not a proposal's type
     ("quests", "objectives", "TEXT"),                          # JSON: every objective, with names and labels
+    ("quests", "giver_id", "INTEGER"),                         # creature id of the herald who offered it
+    ("quests", "ender_id", "INTEGER"),                         # creature id of the NPC who receives the turn-in
+    ("quests", "ender", "TEXT"),                               # and their name
+    ("quests", "handed_over", "TEXT"),                         # what the character gives at turn-in, e.g. "12 Stolen Book"
 )
 
 
@@ -91,8 +101,30 @@ def connect():
     for table, column, declaration in ADDED_COLUMNS:
         if column not in [row["name"] for row in db.execute(f"PRAGMA table_info({table})")]:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+    backfill_parties(db)
     db.commit()
     return db
+
+
+def backfill_parties(db):
+    """Fill who was party to each older bounty from what its record already holds.
+
+    The spec has always carried the giver and ender as creature ids, and the
+    objectives what a trophy asked for, so this is exact rather than a guess.
+    """
+    db.execute("UPDATE quests SET giver_id = json_extract(spec, '$.giver') "
+               "WHERE giver_id IS NULL AND json_valid(spec)")
+    db.execute("UPDATE quests SET ender_id = json_extract(spec, '$.ender'), "
+               "ender = CASE WHEN json_extract(spec, '$.ender') = giver_id THEN giver END "
+               "WHERE ender_id IS NULL AND json_valid(spec)")
+    for row in db.execute("SELECT quest, objectives FROM quests WHERE handed_over IS NULL").fetchall():
+        db.execute("UPDATE quests SET handed_over = ? WHERE quest = ?",
+                   (handed_over(json.loads(row["objectives"] or "[]")), row["quest"]))
+
+
+def handed_over(objectives):
+    """What the character gives the NPC at turn-in: the props of a trophy bounty. Empty for kills."""
+    return ", ".join(f"{o['count']} {o['prop_name']}" for o in objectives if o.get("prop_name"))
 
 
 def ago(ts, reference=None):
@@ -225,6 +257,50 @@ def gear_budget(db, guid, level, every, span):
     if last_prize is not None and level - last_prize < span:
         return ("standard",)
     return ("standard", "prize")
+
+
+def herald_history(db, guid, creature, limit=2):
+    """This character's latest bounties in which this NPC was the giver or received the turn-in, newest first."""
+    return db.execute("SELECT * FROM quests WHERE guid = ? AND (giver_id = ? OR ender_id = ?) "
+                      "ORDER BY issued_at DESC, quest DESC LIMIT ?", (guid, creature, creature, limit)).fetchall()
+
+
+def voice_note(db, creature):
+    return db.execute("SELECT * FROM herald_voices WHERE creature = ?", (creature,)).fetchone()
+
+
+def all_voices(db):
+    return db.execute("SELECT * FROM herald_voices ORDER BY name").fetchall()
+
+
+def settle_voice(db, creature, name, note, quest=None):
+    """Record a bounty through this NPC. The first note given is kept; later ones only count a use.
+
+    Returns 'settled' when this note became theirs, 'kept' when one was already
+    there, or None when there was nothing to record.
+    """
+    if voice_note(db, creature):
+        db.execute("UPDATE herald_voices SET uses = uses + 1 WHERE creature = ?", (creature,))
+        return "kept"
+    note = " ".join(str(note or "").split())
+    if not note:
+        return None
+    db.execute("INSERT INTO herald_voices (creature, name, note, set_at, set_by_quest, uses) VALUES (?, ?, ?, ?, ?, 1)",
+               (creature, name, note, now(), quest))
+    return "settled"
+
+
+def set_voice(db, creature, name, note):
+    """The owner writes or replaces a note; it is pinned."""
+    db.execute("INSERT INTO herald_voices (creature, name, note, pinned, set_at) VALUES (?, ?, ?, 1, ?) "
+               "ON CONFLICT (creature) DO UPDATE SET name = excluded.name, note = excluded.note, pinned = 1, "
+               "set_at = excluded.set_at, set_by_quest = NULL",
+               (creature, name, " ".join(str(note).split()), now()))
+
+
+def forget_voice(db, creature):
+    """Clear a note, so the next bounty through this NPC settles a new one."""
+    return db.execute("DELETE FROM herald_voices WHERE creature = ?", (creature,)).rowcount
 
 
 def proposals_in_last_hour(db):

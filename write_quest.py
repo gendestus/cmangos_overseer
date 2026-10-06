@@ -31,6 +31,8 @@ ISSUED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "issued")
 MAX_OBJECTIVES = 2          # the quest format allows four; two is enough to start
 MAX_EXPECTED_KILLS = 24     # the most kills a trophy objective may imply
 MAX_GEAR = 3                # gear ids one bounty may offer; more than one is a choice
+VOICED_HERALDS = 5          # the nearest heralds are shown their own lines; the rest only their facts
+MAX_VOICE_WORDS = 80        # a voice note is asked for in 40 words; far past that is refused
 GEAR_TIERS = ("standard", "prize")
 
 
@@ -154,10 +156,15 @@ def significant(kind, ranks):
 
 RULES = """You are the Overseer, an unseen dungeon master for a small private World of Warcraft (1.12) server with one to three players. You write short bounty quests that fit where a character is and what they can handle.
 
-Voice: an old, amused, slightly unsettling intelligence that has just started paying attention to this world. It has no body: it speaks through ordinary people of the world, who become its heralds for a moment. Dry, never jokey, never modern, no mention of games, servers or AI.
+Voice: an old, amused, slightly unsettling intelligence that has just started paying attention to this world. It has no body: it speaks through ordinary people of the world, who become its heralds for a moment. Its own tone, in the announcement, is dry and never jokey; the heralds keep theirs. Nothing anyone says is modern, and nothing mentions games, servers or AI.
 
 Rules:
-- Pick the herald only from the list of nearby NPCs. Choose one who suits the errand, and prefer a nearer one unless the story gains from the walk. Write their lines as that person would speak, with something else behind the words; a guard captain, an innkeeper and a priestess should not sound alike.
+- Pick the herald only from the list of nearby NPCs. Choose one who suits the errand, and prefer a nearer one unless the story gains from the walk.
+- Prefer the herald who gave the last bounty when they are on the list. Change herald when the story has moved somewhere else or the errand plainly belongs to someone else.
+- Write the herald's lines the way that person talks. Follow their settled voice note if one is shown; otherwise match their own lines for vocabulary, sentence length and formality. Use the same voice in the briefing, the progress text and the turn-in.
+- The Overseer shows in what the herald asks for and what they know, never in how they talk. A deputy still sounds like a deputy.
+- A herald knows what they were part of. They may say "you brought me" or "as I asked" only of something on their own "With this character" line.
+- To mention something another herald handled, attribute it ("I hear you carried Marshal McBride his books"), or let the herald be uneasy at knowing it without being told. Never have them claim it.
 - Choose one kind of bounty, and write it as that kind:
 {kinds}
 - Pick every target only from the list of creatures. A count must not exceed that creature's alive count or the kind's stated maximum.
@@ -193,6 +200,10 @@ TOOL = {
             "progress_text": {"type": "string", "description": "What the herald says if the character returns before finishing."},
             "completion_text": {"type": "string", "description": "What the herald says at turn-in."},
             "giver": {"type": "integer", "description": "Creature id of the herald, from the nearby NPCs list."},
+            "herald_voice": {"type": "string",
+                             "description": "Two sentences, at most 40 words, on how the herald you chose speaks: "
+                                            "register, sentence length, habits, attitude to adventurers. If a settled "
+                                            "note was shown for them, repeat it unchanged."},
             "objectives": {
                 "type": "array", "minItems": 1, "maxItems": MAX_OBJECTIVES,
                 "description": "What the character must do. How many are allowed depends on the kind.",
@@ -220,6 +231,7 @@ TOOL = {
             "dm_note": {"type": "string", "description": "One sentence for the log: why this quest suits this character."},
         },
         "required": ["title", "kind", "briefing", "objectives_text", "progress_text", "completion_text", "giver",
+                     "herald_voice",
                      "objectives", "reward_money_copper", "reward_item", "announcement", "dm_note"],
     },
 }
@@ -275,6 +287,11 @@ def gather(name, skip=(), props_in_use=(), gear_tiers=GEAR_TIERS):
     }
     if not context["givers"]:
         raise NoContext("no living, friendly quest giver was found anywhere on this character's map")
+    voiced = context["givers"][:VOICED_HERALDS]
+    lines = world_query.herald_lines([g["creature"] for g in voiced],
+                                     samples=2 if len(context["givers"]) > 4 else 3)
+    for g in voiced:
+        g["lines"] = lines.get(g["creature"], [])
     if not context["targets"]:
         raise NoContext("no suitable creatures alive near this character")
     return context
@@ -285,11 +302,10 @@ def user_message(context, hint, story=None):
     lines = [
         f"Character: {who['name']}, level {who['level']} {who['race_name']} {who['class_name']}.",
         "",
-        "Nearby NPCs the Overseer may speak through (id, name, role, yards away, direction):",
+        "Nearby NPCs the Overseer may speak through (id, name, who they are, yards away, direction):",
     ]
     for g in context["givers"]:
-        role = f", {g['title']}" if g["title"] else ""
-        lines.append(f"- {g['creature']}: {g['name']}{role}, {g['distance']} yards {g['direction']}")
+        lines += herald_block(g)
     lines += ["", world_query.party_note(who, context.get("party", []))]
     lines += ["", "Creatures the Overseer may send them against:"]
     for t in context["targets"]:
@@ -326,6 +342,27 @@ def user_message(context, hint, story=None):
     if hint:
         lines += ["", f"Direction from the server owner: {hint}"]
     return "\n".join(lines)
+
+
+POSSESSIVE = {"male": "his", "female": "her"}
+
+
+def herald_block(g):
+    """One candidate herald: facts, then their settled voice or else their own lines, then their history.
+
+    voice_note and history are added by dm.py, which holds the state; written
+    on its own, a bounty shows the lines alone.
+    """
+    facts = g.get("facts", g.get("title", ""))
+    block = [f"- {g['creature']}: {g['name']}{', ' + facts if facts else ''}. {g['distance']} yards {g['direction']}."]
+    if g.get("voice_note"):
+        block.append(f"  Voice (settled, follow it): {g['voice_note']}")
+    elif g.get("lines"):
+        own = POSSESSIVE.get(g.get("sex"), "their")
+        block.append(f"  In {own} own words: " + " / ".join(f'"{line["text"]}"' for line in g["lines"]))
+    if g.get("history") is not None:
+        block.append(f"  With this character: {g['history']}")
+    return block
 
 
 def gear_line(g):
@@ -435,6 +472,10 @@ def build_spec(answer, context, quest_id, finale=False):
     giver = {g["creature"]: g for g in context["givers"]}.get(answer.get("giver"))
     if not giver:
         raise Rejected(f"herald {answer.get('giver')} is not in the nearby NPCs list")
+    giver = {key: giver[key] for key in ("creature", "name", "title", "distance", "direction") if key in giver}
+    voice = " ".join(str(answer.get("herald_voice") or "").split())
+    if len(voice.split()) > MAX_VOICE_WORDS:
+        raise Rejected(f"the herald's voice note runs to {len(voice.split())} words; it should be about 40")
     kind = answer.get("kind")
     if kind not in KINDS:
         raise Rejected(f"kind {kind!r} is not one of {', '.join(sorted(KINDS))}")
@@ -490,7 +531,7 @@ def build_spec(answer, context, quest_id, finale=False):
 
     # What the DM keeps for its records and its displays: the first objective's
     # target as before, plus every objective in full and the herald.
-    record = dict(chosen[0]["target"], giver=giver, kind=kind,
+    record = dict(chosen[0]["target"], giver=giver, kind=kind, herald_voice=voice,
                   needs_party=any(o["target"].get("needs_party") for o in chosen),
                   objectives=[dict(creature=o["target"]["creature"], name=o["target"]["name"],
                                    count=o["count"], label=o["label"], rank=o["target"]["rank"],
@@ -583,6 +624,7 @@ Title:      {spec['title']}
 For:        {context['character']['name']} (level {context['character']['level']} {context['character']['class_name']})
 Kind:       {target.get('kind', 'hunt')}
 Herald:     {target['giver']['name']}, {target['giver']['distance']} yards {target['giver']['direction']}
+Voice:      {target.get('herald_voice') or '(none given)'}
 Objectives: {objectives}
 Reward:     {reward_text(spec, target)}
 Quest level {spec['quest_level']}, offered from level {spec['min_level']}

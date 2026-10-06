@@ -214,10 +214,12 @@ def givers(who, limit=8):
     for radius in (300, 800, 2000, 6000):
         found = rows(f"""
             SELECT JSON_OBJECT('creature', t.Entry, 'name', t.Name, 'title', IFNULL(t.SubName, ''), 'faction', t.Faction,
+                               'flags', t.NpcFlags, 'level', t.MaxLevel, 'gender', mi.gender,
                                'x', ROUND(c.position_x, 1), 'y', ROUND(c.position_y, 1),
                                'spawns', (SELECT COUNT(*) FROM {hot_quest.WORLD_DB}.creature c2 WHERE c2.id = t.Entry))
             FROM {hot_quest.WORLD_DB}.creature c
             JOIN {hot_quest.WORLD_DB}.creature_template t ON t.Entry = c.id
+            LEFT JOIN {hot_quest.WORLD_DB}.creature_model_info mi ON mi.modelid = t.DisplayId1
             LEFT JOIN {hot_quest.CHAR_DB}.creature_respawn r ON r.guid = c.guid AND r.respawntime > UNIX_TIMESTAMP()
             WHERE c.map = {who['map']} AND (t.NpcFlags & 2) <> 0 AND r.guid IS NULL
               AND POW(c.position_x - ({who['x']}), 2) + POW(c.position_y - ({who['y']}), 2) < {radius * radius}
@@ -235,13 +237,135 @@ def givers(who, limit=8):
             seen.add(row["creature"])
             row["distance"] = round(math.hypot(row["x"] - who["x"], row["y"] - who["y"]))
             row["direction"] = bearing(who, row["x"], row["y"])
-            chosen.append({key: row[key] for key in ("creature", "name", "title", "distance", "direction")})
+            chosen.append(dict({key: row[key] for key in ("creature", "name", "title", "level", "distance", "direction")},
+                               sex=SEXES.get(row["gender"], ""), facts=herald_facts(row)))
             if len(chosen) == limit:
                 break
         if chosen:
             return chosen
     return []
 
+
+
+# ---- how a herald talks ------------------------------------------------------
+# A herald's voice is taken from their own stock lines, which the world
+# database already holds: a greeting, the text of quests they give and take,
+# and their small talk. See docs/proposal_herald_voice.md.
+
+SEXES = {0: "male", 1: "female"}
+NPC_ROLES = ((4, "vendor"), (8, "flight master"), (16, "trainer"), (64, "stable master"), (128, "innkeeper"),
+             (256, "banker"), (4096, "repairer"))
+LINE_KINDS = ("greeting", "offering a quest", "at a turn-in", "small talk")     # in order of preference
+LINE_LIMITS = {"offering a quest": 2}           # every other kind gives at most one line
+LINE_CHARS = 260
+LINE_MIN_CHARS = 30
+STOCK_QUESTS_BELOW = hot_quest.QUEST_ID_RANGE[0]    # the DM's own quests are not the NPC's voice
+
+
+def herald_facts(row):
+    """'Stormwind guard, innkeeper, male, level 20': title, roles, sex and level, whichever are known."""
+    title = row.get("title") or ""
+    roles = " and ".join(name for bit, name in NPC_ROLES
+                         if int(row.get("flags") or 0) & bit and name not in title.lower())
+    level = f"level {row['level']}" if row.get("level") else ""
+    return ", ".join(part for part in (title, roles, SEXES.get(row.get("gender"), ""), level) if part)
+
+
+def clean_line(text, limit=LINE_CHARS):
+    """One line on one row, $B paragraph marks spaced out, cut at a sentence end near the limit.
+
+    $N, $C and $R stay: the model writes the same tokens and knows what they stand for.
+    """
+    text = " ".join(re.sub(r"\$[Bb]", " ", str(text or "")).split())
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+    if end > 0:
+        return cut[:end + 1]
+    return cut.rsplit(" ", 1)[0].rstrip(",;:-") + "..."
+
+
+def pick_lines(lines, samples=3):
+    """Choose up to `samples` of an NPC's lines: [{"src", "text"}] in, the same shape out.
+
+    Greetings first, then quest offers, turn-in text and small talk. At most two
+    quest offers and one of each other kind. Lines that open the same way are
+    near-duplicates (one NPC's four class letters), so only the longest is kept.
+    """
+    picked, seen = [], set()
+    order = {kind: i for i, kind in enumerate(LINE_KINDS)}
+    for line in sorted(lines, key=lambda l: (order.get(l["src"], len(order)), -len(str(l["text"] or "")))):
+        if len(picked) == samples:
+            break
+        text = clean_line(line["text"])
+        opening = re.sub(r"[^a-z]", "", text.lower())[:50]
+        if len(text) < LINE_MIN_CHARS or opening in seen:
+            continue
+        if sum(1 for p in picked if p["src"] == line["src"]) >= LINE_LIMITS.get(line["src"], 1):
+            continue
+        seen.add(opening)
+        picked.append({"src": line["src"], "text": text})
+    return picked
+
+
+def herald_lines(entries, samples=3):
+    """{creature id: chosen lines} for several NPCs, in one query. An NPC with no lines maps to []."""
+    ids = sorted({int(entry) for entry in entries})
+    if not ids:
+        return {}
+    listed = ", ".join(str(entry) for entry in ids)
+    db = hot_quest.WORLD_DB
+    found = rows(f"""
+        SELECT JSON_OBJECT('creature', g.Entry, 'src', 'greeting', 'text', g.Text) FROM {db}.questgiver_greeting g
+          WHERE g.Entry IN ({listed}) AND g.Type = 0
+        UNION ALL
+        SELECT JSON_OBJECT('creature', r.id, 'src', 'offering a quest', 'text', q.Details) FROM {db}.creature_questrelation r
+          JOIN {db}.quest_template q ON q.entry = r.quest
+          WHERE r.id IN ({listed}) AND r.quest < {STOCK_QUESTS_BELOW} AND CHAR_LENGTH(q.Details) >= {LINE_MIN_CHARS}
+        UNION ALL
+        SELECT JSON_OBJECT('creature', r.id, 'src', 'at a turn-in', 'text', q.OfferRewardText) FROM {db}.creature_involvedrelation r
+          JOIN {db}.quest_template q ON q.entry = r.quest
+          WHERE r.id IN ({listed}) AND r.quest < {STOCK_QUESTS_BELOW} AND CHAR_LENGTH(q.OfferRewardText) >= {LINE_MIN_CHARS}
+        UNION ALL
+        SELECT JSON_OBJECT('creature', t.Entry, 'src', 'small talk',
+                           'text', IF(CHAR_LENGTH(IFNULL(b.Text, '')) > 0, b.Text, b.Text1))
+          FROM {db}.creature_template t
+          JOIN {db}.gossip_menu m ON m.entry = t.GossipMenuId
+          JOIN {db}.npc_text_broadcast_text n ON n.Id = m.text_id
+          JOIN {db}.broadcast_text b ON b.Id = n.BroadcastTextId0
+          WHERE t.Entry IN ({listed}) AND t.GossipMenuId <> 0;""")
+    grouped = {entry: [] for entry in ids}
+    for row in found:
+        grouped.setdefault(int(row["creature"]), []).append(row)
+    return {entry: pick_lines(lines, samples) for entry, lines in grouped.items()}
+
+
+def herald_voice(entry):
+    """One NPC's facts and lines, for the owner's `dm.py voice`. None if there is no such creature."""
+    found = rows(f"""
+        SELECT JSON_OBJECT('creature', t.Entry, 'name', t.Name, 'title', IFNULL(t.SubName, ''), 'flags', t.NpcFlags,
+                           'level', t.MaxLevel, 'gender', mi.gender)
+        FROM {hot_quest.WORLD_DB}.creature_template t
+        LEFT JOIN {hot_quest.WORLD_DB}.creature_model_info mi ON mi.modelid = t.DisplayId1
+        WHERE t.Entry = {int(entry)};""")
+    if not found:
+        return None
+    who = found[0]
+    return {"creature": who["creature"], "name": who["name"], "facts": herald_facts(who),
+            "lines": herald_lines([who["creature"]]).get(who["creature"], [])}
+
+
+def heralds_named(name):
+    """Quest-givers with exactly one spawn whose name contains `name`, an exact match first."""
+    name = " ".join(str(name).split())
+    like = hot_quest.sql_text("%" + re.sub(r"([\\%_])", r"\\\1", name) + "%")
+    return rows(f"""
+        SELECT JSON_OBJECT('creature', t.Entry, 'name', t.Name, 'title', IFNULL(t.SubName, ''))
+        FROM {hot_quest.WORLD_DB}.creature_template t
+        WHERE (t.NpcFlags & 2) <> 0 AND t.Name LIKE {like}
+          AND (SELECT COUNT(*) FROM {hot_quest.WORLD_DB}.creature c WHERE c.id = t.Entry) = 1
+        ORDER BY t.Name = {hot_quest.sql_text(name)} DESC, t.Name LIMIT 10;""")
 
 PROP_ID_RANGE = (200000, 200199)        # ai_dm_spec.md reserves this for DM items
 

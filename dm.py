@@ -10,6 +10,10 @@
     python3 dm.py arc Zachadin         the Overseer's private plan for a character (a spoiler)
     python3 dm.py arc Zachadin --seed "lead this priest down a dark path"
     python3 dm.py context Zachadin     what the model would be told next; no model call
+    python3 dm.py voices               every herald's settled voice note
+    python3 dm.py voice McBride        one herald's facts, own lines and note
+    python3 dm.py voice 197 "text"     write or replace a note, and pin it
+    python3 dm.py voice 197 --forget   clear it; the next bounty through them settles a new one
     python3 dm.py pause "why"          the kill switch: nothing reaches the game
     python3 dm.py resume               undo it
     python3 dm.py purge                take every DM quest back out of the game
@@ -417,7 +421,7 @@ def story_section(db, who):
                 "ignored": "ignored; it expired unaccepted",
                 "purged": "withdrawn by the server owner",
             }.get(quest["status"], quest["status"])
-            through = f", offered through {quest['giver']}" if quest["giver"] else ""
+            through = parties_text(quest)
             lines.append(f"- \"{quest['title']}\" ({hunt}){through}, posted {dm_state.ago(quest['issued_at'])} ago: "
                          f"{outcome}.{paid_text(db, quest['quest'])} Beat: {quest['story_beat']}")
             if quest["circumstances"]:
@@ -641,10 +645,89 @@ def props_in_use(db):
     return found
 
 
+def parties_text(quest):
+    """', given by X, turned in to Y; handed over: 12 Stolen Book', for the list of earlier bounties."""
+    if not quest["giver"]:
+        return ""
+    text = f", given by {quest['giver']}"
+    if quest["status"] == "completed":
+        text += f", turned in to {quest['ender'] or quest['giver']}"
+        if quest["handed_over"]:
+            text += f"; handed over: {quest['handed_over']}"
+    return text
+
+
+HERALD_OUTCOME = {
+    "accepted": "not finished yet",
+    "offered": "not yet accepted",
+    "ignored": "ignored",
+    "purged": "withdrawn",
+}
+
+
+def herald_history(db, guid, creature, last=None):
+    """The "With this character" line for one candidate herald: what they gave and what they received."""
+    dealings = []
+    for quest in dm_state.herald_history(db, guid, creature):
+        when = dm_state.ago(quest["issued_at"])
+        gave = quest["giver_id"] == creature
+        received = quest["ender_id"] == creature and quest["status"] == "completed"
+        if gave:
+            text = f"gave \"{quest['title']}\" {when} ago"
+            if received:
+                text += " and received its turn-in"
+            elif quest["status"] != "completed":
+                text += f" ({HERALD_OUTCOME.get(quest['status'], quest['status'])})"
+        elif received:
+            text = f"received the turn-in of \"{quest['title']}\" {when} ago"
+        else:
+            continue                        # due to receive one that is not in yet: nothing has passed between them
+        if received and quest["handed_over"]:
+            text += f", with {quest['handed_over']} handed over"
+        dealings.append(text)
+    if not dealings:
+        return "nothing yet."
+    line = "; ".join(dealings) + "."
+    line = line[0].upper() + line[1:]
+    if last is not None and last["giver_id"] == creature:
+        line += " Gave the last bounty."
+    return line
+
+
+def enrich_heralds(db, guid, context):
+    """Add what state.db knows to each candidate herald: a settled voice note and their dealings with this character."""
+    last = dm_state.last_quest(db, guid)
+    for herald in context["givers"]:
+        note = dm_state.voice_note(db, herald["creature"])
+        if note:
+            herald["voice_note"] = note["note"]
+        herald["history"] = herald_history(db, guid, herald["creature"], last)
+    return context
+
+
+RECEIPT = re.compile(r"\b(brought me|gave me|given me|returned to me|as I asked|my last task)\b", re.IGNORECASE)
+
+
+def receipt_warning(db, guid, giver_id, texts):
+    """A herald with no dealings with this character who speaks of something received from them.
+
+    A warning, not a rejection: the wording may be innocent, but it is the
+    common way one herald takes credit for another's bounty.
+    """
+    if giver_id is None or dm_state.herald_history(db, guid, giver_id, limit=1):
+        return None
+    found = sorted({match.group(1).lower() for text in texts for match in RECEIPT.finditer(str(text or ""))})
+    if not found:
+        return None
+    return ("the herald has had no dealings with this character, yet says "
+            + ", ".join(f'"{phrase}"' for phrase in found) + "; check it is not another herald's bounty")
+
+
 def propose(db, who, say):
     """Ask the model for the next bounty and store it as a proposal. Returns the proposal number."""
     context = write_quest.gather(who["name"], skip=recent_targets(db, who["guid"]),
                                  props_in_use=props_in_use(db), gear_tiers=gear_tiers(db, who))
+    enrich_heralds(db, who["guid"], context)
     message = write_quest.user_message(context, None, story=story_section(db, context["character"]))
     answer, usage = llm.ask_for_tool_call(SYSTEM, message, TOOL, max_tokens=4096)
     progress = answer.get("beat_progress")
@@ -673,6 +756,10 @@ def propose(db, who, say):
                 usage.get("input_tokens"), usage.get("output_tokens")))
     number = db.execute("SELECT last_insert_rowid()").fetchone()[0]
     say(f"  {who['name']}: bounty proposal {number} written, \"{spec['title']}\"")
+    warning = receipt_warning(db, who["guid"], spec["giver"],
+                              (spec["briefing"], spec["progress_text"], spec["completion_text"]))
+    if warning:
+        say(f"    warning: {warning}")
     return number
 
 
@@ -715,14 +802,19 @@ def approve_proposal(db, row, say):
     except console.ConsoleError as error:
         say(f"warning: the quest is in the database but the console step failed: {error}\n"
             f"  Run `.reload all_quest` in game to load it.")
-    db.execute("INSERT INTO quests (quest, guid, title, kind, objectives, target, giver, concludes_arc, spec, "
-               "announcement, dm_note, story_beat, model, issued_at) "
-               "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    herald = target.get("giver") or {}
+    ender = herald.get("name") if spec["ender"] == spec["giver"] else None
+    db.execute("INSERT INTO quests (quest, guid, title, kind, objectives, target, giver, giver_id, ender, ender_id, "
+               "handed_over, concludes_arc, spec, announcement, dm_note, story_beat, model, issued_at) "
+               "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                (spec["id"], row["guid"], spec["title"], payload.get("kind"),
                 json.dumps(target.get("objectives") or []), target["name"],
-                (target.get("giver") or {}).get("name"),
+                herald.get("name"), spec["giver"], ender, spec["ender"],
+                dm_state.handed_over(target.get("objectives") or []),
                 payload.get("concludes_arc"), json.dumps(spec), row["announcement"], row["dm_note"],
                 row["story_beat"], row["model"], stamp))
+    if dm_state.settle_voice(db, spec["giver"], herald.get("name"), target.get("herald_voice"), spec["id"]) == "settled":
+        say(f"{herald.get('name')}'s voice is now settled: {target['herald_voice']}")
     record_reward(db, row, spec, target)
     db.execute("UPDATE characters SET story_so_far = ? WHERE guid = ?", (row["story_so_far"], row["guid"]))
     db.execute("UPDATE proposals SET status = 'approved', decided_at = ? WHERE id = ?", (stamp, row["id"]))
@@ -830,7 +922,19 @@ def tick(db, say=print):
 
 # ---- commands ---------------------------------------------------------------
 
-def show_proposal(row):
+def voice_text(db, creature, written):
+    """How the proposal's voice note stands against the one on record."""
+    stored = dm_state.voice_note(db, creature) if creature is not None else None
+    written = " ".join(str(written or "").split())
+    if not stored:
+        return f"new, kept on approval: {written}" if written else "none given"
+    pinned = ", pinned" if stored["pinned"] else ""
+    if written == stored["note"]:
+        return f"settled{pinned}: {stored['note']}"
+    return f"settled{pinned}, and kept: {stored['note']}\n          (the model wrote: {written or 'nothing'})"
+
+
+def show_proposal(db, row):
     if row["type"] == "arc":
         arc = json.loads(row["payload"])
         print(f"\n=== Proposal {row['id']}: ARC for {row['name']}  ({dm_state.ago(row['ts'])} ago, {row['status']}) ===")
@@ -853,6 +957,7 @@ def show_proposal(row):
 Title:    {spec['title']}
 Kind:     {kind}
 Herald:   {herald}
+Voice:    {voice_text(db, spec.get('giver'), target.get('herald_voice'))}
 Hunt:     {objectives}
 Reward:   {write_quest.reward_text(spec, target)}
 Briefing:
@@ -866,6 +971,10 @@ Story beat:   {row['story_beat']}
 Story so far: {row['story_so_far']}
 Arc:          {progress}
 Model's note: {row['dm_note']}   [{row['model']}, tokens {row['tokens_in']}/{row['tokens_out']}]""")
+    warning = receipt_warning(db, row["guid"], spec.get("giver"),
+                              (spec["briefing"], spec["progress_text"], spec["completion_text"]))
+    if warning:
+        print(f"** warning: {warning}")
 
 
 def cmd_pending(db, _args):
@@ -876,7 +985,7 @@ def cmd_pending(db, _args):
     if not found:
         print("no proposals waiting.")
     for row in found:
-        show_proposal(row)
+        show_proposal(db, row)
     if found:
         print("\napprove with: python3 dm.py approve <number>    reject with: python3 dm.py reject <number> \"why\"")
 
@@ -1108,7 +1217,75 @@ def cmd_context(db, args):
                                      props_in_use=props_in_use(db))
     except write_quest.NoContext as error:
         sys.exit(f"dm: {error}")
+    enrich_heralds(db, who["guid"], context)
     print(write_quest.user_message(context, None, story=story_section(db, context["character"])))
+
+
+def cmd_voices(db, _args):
+    found = dm_state.all_voices(db)
+    if not found:
+        print("no herald has a settled voice yet.")
+    for row in found:
+        pinned = ", pinned" if row["pinned"] else ""
+        print(f"{row['name']} ({row['creature']}), {row['uses']} bounties{pinned}:\n  {row['note']}")
+
+
+def find_herald(db, wanted):
+    """(creature id, name) for an id or a name, looking at notes already settled before the world database."""
+    wanted = " ".join(str(wanted).split())
+    if wanted.isdigit():
+        stored = dm_state.voice_note(db, int(wanted))
+        if stored:
+            return stored["creature"], stored["name"]
+        found = world_query.herald_voice(int(wanted))
+        if not found:
+            sys.exit(f"dm: no creature {wanted}")
+        return found["creature"], found["name"]
+    stored = db.execute("SELECT creature, name FROM herald_voices WHERE name = ? COLLATE NOCASE", (wanted,)).fetchall()
+    if len(stored) == 1:
+        return stored[0]["creature"], stored[0]["name"]
+    found = world_query.heralds_named(wanted)
+    exact = [row for row in found if row["name"].lower() == wanted.lower()]
+    if len(exact) == 1 or len(found) == 1:
+        row = (exact or found)[0]
+        return row["creature"], row["name"]
+    if not found:
+        sys.exit(f"dm: no quest-giver with one spawn is called anything like {wanted!r}")
+    listed = "\n".join(f"  {row['creature']}: {row['name']}" + (f", {row['title']}" if row["title"] else "")
+                       for row in found)
+    sys.exit(f"dm: {wanted!r} could be any of these; use the id:\n{listed}")
+
+
+def cmd_voice(db, args):
+    creature, name = find_herald(db, args.npc)
+    if args.forget:
+        if dm_state.forget_voice(db, creature):
+            db.commit()
+            print(f"{name}'s voice note is cleared; the next bounty through them settles a new one.")
+        else:
+            print(f"{name} has no voice note.")
+        return
+    if args.note is not None:
+        if not args.note.strip():
+            sys.exit("dm: the note is empty; to clear one, use --forget")
+        dm_state.set_voice(db, creature, name, args.note)
+        db.commit()
+        print(f"{name}'s voice note is set and pinned.")
+        return
+    found = world_query.herald_voice(creature) or {"facts": "", "lines": []}
+    print(f"{name} ({creature})" + (f": {found['facts']}" if found["facts"] else ""))
+    if found["lines"]:
+        for line in found["lines"]:
+            print(f"  [{line['src']}] \"{line['text']}\"")
+    else:
+        print("  (no lines of their own in the database)")
+    stored = dm_state.voice_note(db, creature)
+    if stored:
+        how = "pinned by you" if stored["pinned"] else (f"settled by bounty {stored['set_by_quest']}"
+                                                        if stored["set_by_quest"] else "settled")
+        print(f"Voice ({how}, {stored['uses']} bounties): {stored['note']}")
+    else:
+        print("Voice: not settled yet.")
 
 
 def cmd_tick(db, _args):
@@ -1162,6 +1339,12 @@ def main():
     context = commands.add_parser("context", help="show what the model would be told; no model call")
     context.add_argument("character")
     context.set_defaults(run=cmd_context)
+    commands.add_parser("voices", help="every herald's settled voice note").set_defaults(run=cmd_voices)
+    voice = commands.add_parser("voice", help="show one herald's voice, or set or clear its note")
+    voice.add_argument("npc", help="creature id or name")
+    voice.add_argument("note", nargs="?", help="a new note, which is pinned")
+    voice.add_argument("--forget", action="store_true", help="clear the note")
+    voice.set_defaults(run=cmd_voice)
     args = parser.parse_args()
 
     console.load_env()

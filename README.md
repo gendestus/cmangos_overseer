@@ -181,6 +181,10 @@ python3 dm.py run --every 300
 | `dm.py arc <Character>` | The arc in force and the ones that have ended. A spoiler if you play that character |
 | `dm.py arc <Character> --seed "..."` | Have a new arc written around your direction |
 | `dm.py context <Character>` | Exactly what the model would be told next. No model call |
+| `dm.py voices` | Every herald's settled voice note |
+| `dm.py voice <name or id>` | One herald's facts, their own lines from the game, and their note |
+| `dm.py voice <name or id> "text"` | Write or replace that herald's note, and pin it |
+| `dm.py voice <name or id> --forget` | Clear it, so the next bounty through them settles a new one |
 | `dm.py pause "why"` | Stop everything that reaches the game. Reading still works |
 | `dm.py resume` | Undo it |
 | `dm.py purge` | Take every DM quest back out of the game, after confirmation |
@@ -233,6 +237,12 @@ The design and the evidence behind it are in `docs/proposal_prop_trophies.md`. W
 
 Installing the pool needs one restart, because new item types load only at server start. See setup step 6.
 
+## Heralds
+
+Each candidate herald is shown to the model with their title, role, sex and level, and with how they actually talk: up to three of their own lines from the world database (a greeting, quest text, small talk). About four in five quest-givers have some. The first bounty through a herald also records a two-sentence **voice note**, and every later bounty through them is shown that note instead, so a herald sounds the same each time. `dm.py pending` shows whether a note is new or settled; it is stored on approval. A note you write with `dm.py voice` is pinned.
+
+Each herald is also listed with their own dealings with the character, the bounties they gave and received and what was handed over, and the model is told a herald may only speak of what they were part of. `dm.py pending` warns when a herald with no dealings says something like "you brought me". It is a warning, not a refusal. The design is in `docs/proposal_herald_voice.md`.
+
 ## Settings
 
 All settings are read from the environment, or from `.env` in this folder.
@@ -280,6 +290,7 @@ For testing against something other than the live server: `DM_DB_COMMAND`, `DM_D
 ## Known limits
 
 - **Heralds are existing quest NPCs.** A bounty is offered through a living NPC that already gives quests, has a single spawn, and is not hostile to the character. The search widens from 300 yards until it finds some. An NPC that is not a quest giver cannot be used without a server restart.
+- **A herald's voice is only steered, not checked.** The model is shown the note and told to follow it; nothing validates the prose. A wrong note can be fixed with `dm.py voice`. Heralds with no lines of their own get a note from the model's judgment on first use.
 - **Bounties are visible to everyone** at the giver, not only the character they were written for. The chronicle records who actually completed each one.
 - **A party can disband after a bounty is written.** An elite is offered on the strength of who was online and grouped at that moment. Nothing re-checks it at turn-in.
 - **Quest markers are not pushed.** A player already standing near the giver will not see the "!" for a new quest until the NPC comes back into view. Every bounty is announced for this reason.

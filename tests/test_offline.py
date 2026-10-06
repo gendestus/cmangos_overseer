@@ -1127,5 +1127,198 @@ class PrizeEndToEnd(unittest.TestCase):
             self.propose_hunt_with_prize("conclude", current_beat=0)
 
 
+class HeraldVoice(unittest.TestCase):
+    """docs/proposal_herald_voice.md: each herald keeps one voice and speaks only of their own dealings."""
+
+    def fresh(self):
+        os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
+        db = dm_state.connect()
+        self.addCleanup(db.close)
+        return db
+
+    def add_quest(self, db, quest, giver, status="completed", objectives=(), title="Teeth in the Dark", at=1):
+        objectives = list(objectives)
+        db.execute("INSERT INTO quests (quest, guid, title, spec, objectives, giver, giver_id, ender, ender_id, "
+                   "handed_over, issued_at, status) VALUES (?, 1, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?)",
+                   (quest, title, json.dumps(objectives), giver[1], giver[0], giver[1], giver[0],
+                    dm_state.handed_over(objectives), at, status))
+
+    MCBRIDE, WILLEM = (197, "Marshal McBride"), (823, "Deputy Willem")
+    BOOKS = [{"creature": 6, "name": "Kobold Vermin", "count": 12, "prop": 200000, "prop_name": "Stolen Book"}]
+
+    # -- the NPC's own lines ---------------------------------------------------
+
+    def line(self, src, text):
+        return {"src": src, "text": text}
+
+    def test_a_long_line_is_cut_at_a_sentence_end(self):
+        text = "Go to the mine. " * 30
+        cut = world_query.clean_line(text)
+        self.assertLessEqual(len(cut), world_query.LINE_CHARS)
+        self.assertTrue(cut.endswith("mine."))
+
+    def test_a_line_with_no_sentence_end_is_cut_at_a_word(self):
+        cut = world_query.clean_line("word " * 100)
+        self.assertTrue(cut.endswith("word..."))
+
+    def test_paragraph_marks_become_spaces_and_tokens_stay(self):
+        self.assertEqual(world_query.clean_line("Hello, $N.$B$BYou are a $C of $R."), "Hello, $N. You are a $C of $R.")
+
+    def test_lines_are_picked_by_kind_and_duplicate_openings_dropped(self):
+        letter = "$N, you are a $c with proven interest in the security of Northshire. "
+        picked = world_query.pick_lines([
+            self.line("small talk", "Welcome to my inn, weary traveller. Sit by the fire."),
+            self.line("offering a quest", letter + "Take this to the paladin trainer."),
+            self.line("offering a quest", letter + "Take this to the mage trainer, if you would."),
+            self.line("offering a quest", "My scouts tell me that the kobold infestation is larger than we thought."),
+            self.line("offering a quest", "A third quest offer, long enough to count as a line of its own."),
+            self.line("greeting", "Hello there. Normally I'd be out on the beat."),
+            self.line("greeting", "A second greeting that should never be shown at all."),
+            self.line("at a turn-in", "Too short."),
+        ], samples=5)
+        self.assertEqual([p["src"] for p in picked],
+                         ["greeting", "offering a quest", "offering a quest", "small talk"])
+        self.assertEqual(sum(1 for p in picked if p["text"].startswith("$N, you are")), 1)   # one class letter
+
+    def test_no_more_lines_than_asked(self):
+        lines = [self.line("offering a quest", f"Quest number {n} has a long enough text to be shown here.")
+                 for n in range(5)] + [self.line("greeting", "Greetings, traveller, and welcome to the abbey.")]
+        self.assertEqual(len(world_query.pick_lines(lines, samples=2)), 2)
+
+    def test_facts_name_the_title_once(self):
+        row = {"title": "Innkeeper", "flags": 2 | 4 | 128, "gender": 0, "level": 30}
+        self.assertEqual(world_query.herald_facts(row), "Innkeeper, vendor, male, level 30")
+
+    # -- the prompt ------------------------------------------------------------
+
+    def test_a_settled_note_replaces_the_lines(self):
+        herald = dict(CONTEXT["givers"][0], facts="male, level 20", sex="male",
+                      lines=[{"src": "greeting", "text": "Report."}], voice_note="Clipped and official.",
+                      history="nothing yet.")
+        block = "\n".join(write_quest.herald_block(herald))
+        self.assertIn("Marshal McBride, male, level 20. 32 yards east.", block)
+        self.assertIn("Voice (settled, follow it): Clipped and official.", block)
+        self.assertNotIn("Report.", block)
+        self.assertIn("With this character: nothing yet.", block)
+
+    def test_without_a_note_the_lines_are_shown_in_their_own_words(self):
+        herald = dict(CONTEXT["givers"][0], sex="female", lines=[{"src": "greeting", "text": "Hello there."}])
+        block = "\n".join(write_quest.herald_block(herald))
+        self.assertIn('In her own words: "Hello there."', block)
+        self.assertNotIn("With this character", block)          # write_quest alone has no history to give
+
+    # -- notes in state.db -------------------------------------------------------
+
+    def test_the_first_note_is_kept(self):
+        db = self.fresh()
+        self.assertEqual(dm_state.settle_voice(db, 197, "Marshal McBride", "Clipped.", 30000), "settled")
+        self.assertEqual(dm_state.settle_voice(db, 197, "Marshal McBride", "Florid and warm.", 30001), "kept")
+        note = dm_state.voice_note(db, 197)
+        self.assertEqual((note["note"], note["uses"], note["set_by_quest"]), ("Clipped.", 2, 30000))
+
+    def test_a_pinned_note_is_never_replaced_by_the_model(self):
+        db = self.fresh()
+        dm_state.set_voice(db, 197, "Marshal McBride", "Owner's words.")
+        dm_state.settle_voice(db, 197, "Marshal McBride", "The model's words.", 30000)
+        note = dm_state.voice_note(db, 197)
+        self.assertEqual((note["note"], note["pinned"]), ("Owner's words.", 1))
+
+    def test_forgetting_lets_the_next_bounty_settle_a_new_note(self):
+        db = self.fresh()
+        dm_state.settle_voice(db, 197, "Marshal McBride", "Clipped.")
+        self.assertEqual(dm_state.forget_voice(db, 197), 1)
+        dm_state.settle_voice(db, 197, "Marshal McBride", "Weary.")
+        self.assertEqual(dm_state.voice_note(db, 197)["note"], "Weary.")
+
+    def test_an_empty_note_settles_nothing(self):
+        db = self.fresh()
+        self.assertIsNone(dm_state.settle_voice(db, 197, "Marshal McBride", "  "))
+        self.assertIsNone(dm_state.voice_note(db, 197))
+
+    def test_an_overlong_note_is_refused(self):
+        with self.assertRaises(write_quest.Rejected):
+            write_quest.build_spec(dict(ANSWER, herald_voice="word " * 100), CONTEXT, 30000)
+
+    # -- who was party to what ---------------------------------------------------
+
+    def test_a_herald_with_history_says_what_passed_between_them(self):
+        db = self.fresh()
+        self.add_quest(db, 30000, self.MCBRIDE, objectives=self.BOOKS)
+        line = dm.herald_history(db, 1, 197, dm_state.last_quest(db, 1))
+        self.assertIn('Gave "Teeth in the Dark"', line)
+        self.assertIn("received its turn-in, with 12 Stolen Book handed over", line)
+        self.assertIn("Gave the last bounty.", line)
+        self.assertEqual(dm.herald_history(db, 1, 823, dm_state.last_quest(db, 1)), "nothing yet.")
+
+    def test_an_unfinished_bounty_is_given_but_not_received(self):
+        db = self.fresh()
+        self.add_quest(db, 30000, self.MCBRIDE, status="accepted")
+        line = dm.herald_history(db, 1, 197)
+        self.assertIn("(not finished yet)", line)
+        self.assertNotIn("received", line)
+
+    def test_earlier_bounties_name_giver_receiver_and_what_was_handed_over(self):
+        db = self.fresh()
+        self.add_quest(db, 30000, self.MCBRIDE, objectives=self.BOOKS)
+        text = dm.parties_text(db.execute("SELECT * FROM quests").fetchone())
+        self.assertEqual(text, ", given by Marshal McBride, turned in to Marshal McBride; handed over: 12 Stolen Book")
+
+    def test_older_bounties_are_back_filled_from_their_spec(self):
+        db = self.fresh()
+        db.execute("INSERT INTO quests (quest, guid, title, spec, objectives, giver, issued_at, status) "
+                   "VALUES (30000, 1, 'T', ?, ?, 'Marshal McBride', 1, 'completed')",
+                   (json.dumps(dict(SPEC, giver=197, ender=197)), json.dumps(self.BOOKS)))
+        db.commit()
+        db = dm_state.connect()
+        self.addCleanup(db.close)
+        row = db.execute("SELECT * FROM quests").fetchone()
+        self.assertEqual((row["giver_id"], row["ender_id"], row["ender"], row["handed_over"]),
+                         (197, 197, "Marshal McBride", "12 Stolen Book"))
+
+    # -- the soft check --------------------------------------------------------
+
+    def test_a_stranger_claiming_a_receipt_is_flagged(self):
+        db = self.fresh()
+        self.add_quest(db, 30000, self.MCBRIDE, objectives=self.BOOKS)
+        texts = ("The book you brought me was only the start.",)
+        self.assertIn('"brought me"', dm.receipt_warning(db, 1, 823, texts))
+        self.assertIsNone(dm.receipt_warning(db, 1, 197, texts))            # McBride did receive it
+        self.assertIsNone(dm.receipt_warning(db, 1, 823, ("I hear you carried the Marshal his books.",)))
+
+    # -- end to end, with the stub model -------------------------------------------
+
+    def test_a_second_bounty_is_shown_the_voice_the_first_settled(self):
+        db = self.fresh()
+        who = dict(CONTEXT["character"], map=0, x=0, y=0, online=1)
+        dm_state.save_character(db, who, [], [], [], first=True)
+        stub = os.path.join(tempfile.mkdtemp(), "answer.json")
+        with open(stub, "w") as handle:
+            json.dump(dict(ANSWER, herald_voice="Clipped and official. Counts things.", story_beat="b",
+                           story_so_far="s", beat_progress="hold"), handle)
+        messages = []
+        real = dm.llm.ask_for_tool_call
+
+        def ask(system, message, tool, **kwargs):
+            messages.append(message)
+            return real(system, message, tool, **kwargs)
+
+        with mock.patch.dict(os.environ, {"DM_LLM_PROVIDER": "stub", "DM_LLM_STUB": stub}), \
+                mock.patch.object(write_quest, "gather", lambda *a, **k: json.loads(json.dumps(CONTEXT))), \
+                mock.patch.object(dm.llm, "ask_for_tool_call", ask), \
+                mock.patch.object(world_query, "next_quest_id", side_effect=[30005, 30006]), \
+                mock.patch.object(apply_quest, "apply_spec"):
+            for _ in range(2):
+                number = dm.propose(db, who, lambda _line: None)
+                row = db.execute("SELECT * FROM proposals WHERE id = ?", (number,)).fetchone()
+                dm.approve_proposal(db, row, lambda _line: None)
+                db.execute("UPDATE quests SET status = 'completed'")
+        self.assertNotIn("Voice (settled", messages[0])
+        self.assertIn("Voice (settled, follow it): Clipped and official. Counts things.", messages[1])
+        self.assertIn('With this character: Gave "Teeth in the Dark"', messages[1])
+        self.assertEqual(dm_state.voice_note(db, 197)["uses"], 2)
+        quest = db.execute("SELECT * FROM quests WHERE quest = 30005").fetchone()
+        self.assertEqual((quest["giver_id"], quest["ender_id"], quest["ender"]), (197, 197, "Marshal McBride"))
+
+
 if __name__ == "__main__":
     unittest.main()
