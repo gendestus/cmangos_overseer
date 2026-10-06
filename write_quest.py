@@ -30,6 +30,8 @@ ISSUED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "issued")
 
 MAX_OBJECTIVES = 2          # the quest format allows four; two is enough to start
 MAX_EXPECTED_KILLS = 24     # the most kills a trophy objective may imply
+MAX_GEAR = 3                # gear ids one bounty may offer; more than one is a choice
+GEAR_TIERS = ("standard", "prize")
 
 
 class Kind:
@@ -135,9 +137,19 @@ def kind_rules():
     return "\n".join(f"  - {KINDS[name].rule}" for name in KINDS)
 
 
-def money_cap(context, kind):
-    """The level's cap, scaled by how much the kind asks of the character."""
-    return int(context["money_cap"] * KINDS[kind].money)
+def money_cap(context, kind, gear=False):
+    """The level's cap, scaled by how much the kind asks of the character. Gear replaces half the coin."""
+    cap = int(context["money_cap"] * KINDS[kind].money)
+    return cap // 2 if gear else cap
+
+
+def significant(kind, ranks):
+    """Whether a bounty may pay a prize: a mark, or a journey or party bounty against a named creature.
+
+    An arc's finale is significant too; dm.py knows that and passes it to build_spec.
+    ranks: the rank of each objective's target.
+    """
+    return kind == "mark" or (kind in ("journey", "party") and any(rank != "normal" for rank in ranks))
 
 
 RULES = """You are the Overseer, an unseen dungeon master for a small private World of Warcraft (1.12) server with one to three players. You write short bounty quests that fit where a character is and what they can handle.
@@ -150,8 +162,12 @@ Rules:
 {kinds}
 - Pick every target only from the list of creatures. A count must not exceed that creature's alive count or the kind's stated maximum.
 - A rare, elite or rare elite is one named creature, not a crowd. A creature marked "needs the party" may only be used while the character has company.
-- Pick the item reward only from the reward list, or give none. A capstone book is a rare prize: offer one only when the hunt is a real effort for this character.
-- Money must not exceed the stated cap.
+- Pick a capstone book (reward_item) only from the reward list, or give none. A capstone book is a rare prize: offer one only when the hunt is a real effort for this character.
+- Pick gear (reward_gear) only from the gear lists, or give none. One item is a fixed reward; two or three let the player pick one. Never give a capstone and gear together, and never mix the two gear lists.
+- Gear is a reward for effort, not for every errand. Most bounties still pay coin.
+- Offer a prize only when the list shows one, and only on a significant bounty: a mark, a journey or party bounty against a named creature, or an arc's finale. Make it belong to the story: the mark carried it, guarded it or stole it. Name it in the briefing. A level above the character's means something to grow into; say so.
+- When offering a choice of gear, offer different kinds of item, not three swords.
+- Money must not exceed the stated cap, and must be at most half of it when gear is given.
 - In quest text, write $N for the character's name and $C for their class. Use each at most twice.
 - Keep it short: title up to 40 characters, briefing 2 to 4 sentences, progress and completion 1 to 3 sentences each.
 - The objectives line states plainly what to do, how many, and whom to return to, by the herald's name.
@@ -197,6 +213,9 @@ TOOL = {
             },
             "reward_money_copper": {"type": "integer", "description": "Coins to pay, in copper. 100 copper is 1 silver."},
             "reward_item": {"type": ["integer", "null"], "description": "Item id from the reward list, or null for none."},
+            "reward_gear": {"type": "array", "items": {"type": "integer"}, "maxItems": MAX_GEAR,
+                            "description": "Item ids from one gear list, or empty for none. One is a fixed "
+                                           "reward; two or three let the player pick."},
             "announcement": {"type": "string", "description": "One server-wide line, up to 120 characters."},
             "dm_note": {"type": "string", "description": "One sentence for the log: why this quest suits this character."},
         },
@@ -232,11 +251,12 @@ def offerable_props(who, in_use=()):
     return [prop for prop in pool if prop["item"] not in busy and not held.get(prop["item"])]
 
 
-def gather(name, skip=(), props_in_use=()):
+def gather(name, skip=(), props_in_use=(), gear_tiers=GEAR_TIERS):
     """Everything the model is shown.
 
     skip          creature ids a bounty should not reuse
     props_in_use  props another live bounty has already seeded
+    gear_tiers    the gear tiers the budget allows; a tier left out is never shown
     """
     who = world_query.character(name)
     if not who:
@@ -249,6 +269,7 @@ def gather(name, skip=(), props_in_use=()):
         "targets": world_query.targets(who, party=party, skip=skip),
         "props": offerable_props(who, props_in_use),
         "reward_items": world_query.reward_items(who),
+        "gear": {tier: world_query.gear(who, tier) if tier in gear_tiers else [] for tier in GEAR_TIERS},
         "money_cap": world_query.money_cap(who["level"]),
         "xp_weight": world_query.xp_weight(who["level"]),
     }
@@ -285,7 +306,8 @@ def user_message(context, hint, story=None):
         fewest, most = kind.objectives
         count = f"{fewest}" if fewest == most else f"{fewest} to {most}"
         lines.append(f"- {name}: {count} objective(s), up to {kind.max_count} per objective, "
-                     f"money up to {money_cap(context, name)} copper")
+                     f"money up to {money_cap(context, name)} copper, "
+                     f"or {money_cap(context, name, gear=True)} with gear")
     lines.append("")
     if context.get("props"):
         lines.append(f"Props a trophy bounty may ask for, at {', '.join(str(c) + '%' for c in hot_quest.PROP_CHANCES)} "
@@ -297,12 +319,60 @@ def user_message(context, hint, story=None):
         for r in context["reward_items"]:
             lines.append(f"- {r['item']}: {r['name']}, level {r['required_level']}")
     else:
-        lines.append("Reward list: empty. Pay in money only.")
+        lines.append("Reward list: empty.")
+    lines += gear_lines(context)
     if story:
         lines += ["", story]
     if hint:
         lines += ["", f"Direction from the server owner: {hint}"]
     return "\n".join(lines)
+
+
+def gear_line(g):
+    return f"- {g['item']}: {g['name']}, {g['kind']}, level {g['level']}, {g['stats']}"
+
+
+def gear_lines(context):
+    """The gear section of the prompt. A tier with nothing in it, or none the budget allows, is not shown."""
+    gear = context.get("gear") or {}
+    if not any(gear.get(tier) for tier in GEAR_TIERS):
+        return ["Gear: none this time. Pay in coin, or a capstone if one fits."]
+    lines = ["", "Gear this character can use (id, name, kind, level to use it, stats):"]
+    if gear.get("standard"):
+        lines.append("Standard:")
+        lines += [gear_line(g) for g in gear["standard"]]
+    if gear.get("prize"):
+        lines.append("Prizes (a significant bounty only):")
+        lines += [gear_line(g) for g in gear["prize"]]
+    return lines
+
+
+def resolve_gear(answer, context, kind, chosen, finale=False):
+    """Check the gear the model chose. Returns {tier, items: [gear rows]}, or None for no gear."""
+    ids = answer.get("reward_gear") or []
+    if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
+        raise Rejected("reward_gear must be a list of item ids")
+    if not ids:
+        return None
+    if len(ids) > MAX_GEAR or len(set(ids)) != len(ids):
+        raise Rejected(f"reward_gear offers {len(ids)} items; give 1 to {MAX_GEAR} different ones")
+    if answer.get("reward_item") is not None:
+        raise Rejected("a bounty may pay a capstone or gear, not both")
+    shown = context.get("gear") or {}
+    tiers = set()
+    for item in ids:
+        tier = next((t for t in GEAR_TIERS if any(g["item"] == item for g in shown.get(t, []))), None)
+        if not tier:
+            raise Rejected(f"gear {item} is not on the gear list")
+        tiers.add(tier)
+    if len(tiers) > 1:
+        raise Rejected("reward_gear mixes standard gear and prizes; pick from one list")
+    tier = tiers.pop()
+    if tier == "prize" and not finale and not significant(kind, [o["target"]["rank"] for o in chosen]):
+        raise Rejected(f"a prize needs a significant bounty (a mark, a journey or party bounty against a "
+                       f"named creature, or an arc's finale); this is a {kind}")
+    rows = {g["item"]: g for g in shown[tier]}
+    return {"tier": tier, "items": [rows[item] for item in ids]}
 
 
 def resolve_objectives(answer, context, kind):
@@ -356,8 +426,11 @@ def resolve_objectives(answer, context, kind):
     return chosen
 
 
-def build_spec(answer, context, quest_id):
-    """Turn the model's answer into a full quest spec, enforcing every rule."""
+def build_spec(answer, context, quest_id, finale=False):
+    """Turn the model's answer into a full quest spec, enforcing every rule.
+
+    finale: the bounty concludes an arc, which makes it significant whatever its kind.
+    """
     who = context["character"]
     giver = {g["creature"]: g for g in context["givers"]}.get(answer.get("giver"))
     if not giver:
@@ -367,10 +440,12 @@ def build_spec(answer, context, quest_id):
         raise Rejected(f"kind {kind!r} is not one of {', '.join(sorted(KINDS))}")
     chosen = resolve_objectives(answer, context, kind)
 
-    cap = money_cap(context, kind)
+    gear = resolve_gear(answer, context, kind, chosen, finale)
+    cap = money_cap(context, kind, gear=bool(gear))
     money = answer.get("reward_money_copper")
     if not isinstance(money, int) or not 0 <= money <= cap:
-        raise Rejected(f"money {money} is outside 0 to {cap} copper for a {kind}")
+        raise Rejected(f"money {money} is outside 0 to {cap} copper for a {kind}"
+                       + (" with gear" if gear else ""))
     item = answer.get("reward_item")
     allowed_items = {r["item"] for r in context["reward_items"]}
     if item is not None and item not in allowed_items:
@@ -405,8 +480,9 @@ def build_spec(answer, context, quest_id):
         "reward": {
             "money_copper": money,
             "xp_weight": context["xp_weight"],
-            "items": [{"item": item, "count": 1}] if item is not None else [],
-            "choice_items": [],
+            "items": ([{"item": item, "count": 1}] if item is not None else [])
+                     + ([{"item": g["item"], "count": 1} for g in gear["items"]] if gear and len(gear["items"]) == 1 else []),
+            "choice_items": [{"item": g["item"], "count": 1} for g in gear["items"]] if gear and len(gear["items"]) > 1 else [],
             "teach_spell": None,
         },
     }
@@ -424,7 +500,27 @@ def build_spec(answer, context, quest_id):
                                        "chance": o["chance"], "expected_kills": o["expected_kills"]}
                                       if o.get("prop") else {}))
                               for o in chosen])
+    if item is not None:
+        record["capstone"] = {"item": item, "name": {r["item"]: r["name"] for r in context["reward_items"]}[item]}
+    if gear:
+        record["gear"] = {"tier": gear["tier"],
+                          "items": [{"item": g["item"], "name": g["name"], "kind": g["kind"]} for g in gear["items"]]}
     return spec, record, announcement
+
+
+def reward_text(spec, record):
+    """'300 copper, prize (pick one): Twisted Sabre or Deep Fathom Ring', for a person reviewing the bounty."""
+    parts = [f"{spec['reward']['money_copper']} copper"]
+    gear = (record or {}).get("gear")
+    if gear:
+        names = [g["name"] for g in gear["items"]]
+        pick = " (pick one)" if len(names) > 1 else ""
+        parts.append(f"{gear['tier']}{pick}: " + " or ".join(names))
+    elif (record or {}).get("capstone"):
+        parts.append(f"capstone: {record['capstone']['name']}")
+    else:
+        parts += [f"item {i['item']}" for i in spec["reward"]["items"]]
+    return ", ".join(parts)
 
 
 def creature_names(names):
@@ -480,9 +576,6 @@ def objective_lines(record):
 
 
 def show(spec, target, announcement, answer, context, usage):
-    item_names = {r["item"]: r["name"] for r in context["reward_items"]}
-    reward = [f"{spec['reward']['money_copper']} copper"]
-    reward += [item_names[i["item"]] for i in spec["reward"]["items"]]
     objectives = "\n            ".join(objective_lines(target))
     print(f"""
 --- Proposed quest {spec['id']} -------------------------------------------
@@ -491,7 +584,7 @@ For:        {context['character']['name']} (level {context['character']['level']
 Kind:       {target.get('kind', 'hunt')}
 Herald:     {target['giver']['name']}, {target['giver']['distance']} yards {target['giver']['direction']}
 Objectives: {objectives}
-Reward:     {', '.join(reward)}
+Reward:     {reward_text(spec, target)}
 Quest level {spec['quest_level']}, offered from level {spec['min_level']}
 
 Briefing:

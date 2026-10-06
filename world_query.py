@@ -11,6 +11,7 @@ Settings (environment or the .env beside this file):
     DM_DB_QUERY_COMMAND   command that reads SQL on stdin and prints raw rows;
                           default runs the mariadb client in the database container
     DM_DBC_DIR            folder of extracted .dbc files, for friend-or-foe checks (see factions.py)
+    DM_PRIZE_REACH        how many levels above the character a prize may be (default 5)
 """
 import json
 import math
@@ -298,6 +299,135 @@ def reward_items(who, reach=10, limit=6):
         LIMIT {limit};""")
 
 
+# ---- gear rewards (docs/proposal_gear_rewards.md) ---------------------------
+
+# The skill an item needs, by subclass, from Item::GetSkill.
+WEAPON_SKILL = {0: 44, 1: 172, 2: 45, 3: 46, 4: 54, 5: 160, 6: 229, 7: 43, 8: 55, 10: 136, 13: 162, 15: 173,
+                16: 176, 18: 226, 19: 228}
+ARMOR_SKILL = {1: 415, 2: 414, 3: 413, 4: 293, 6: 433}     # cloth, leather, mail, plate, shield
+BODY_ARMOR = (4, 3, 2, 1)                                   # plate, mail, leather, cloth: heaviest first
+CLOAK_SLOT = 16
+STAT = {3: "Agility", 4: "Strength", 5: "Intellect", 6: "Spirit", 7: "Stamina"}
+# Stats that count for each class. An item whose largest stat is not here is
+# no use to them. A heuristic, to tune in play.
+WANTED = {1: {4, 7, 3}, 2: {4, 7, 5, 6}, 3: {3, 7, 5}, 4: {3, 7, 4}, 5: {5, 6, 7}, 7: {5, 7, 4, 3, 6},
+          8: {5, 6, 7}, 9: {5, 7, 6}, 11: {5, 6, 7, 4, 3}}
+SLOT = {1: "head", 2: "neck", 3: "shoulder", 5: "chest", 6: "waist", 7: "legs", 8: "feet", 9: "wrist", 10: "hands",
+        11: "finger", 12: "trinket", 13: "one-hand", 14: "shield", 15: "ranged", 16: "back", 17: "two-hand",
+        20: "chest", 21: "main hand", 22: "off hand", 23: "held in off-hand", 25: "thrown", 26: "ranged"}
+WEAPON_NAME = {0: "axe", 1: "two-handed axe", 2: "bow", 3: "gun", 4: "mace", 5: "two-handed mace", 6: "polearm",
+               7: "sword", 8: "two-handed sword", 10: "staff", 13: "fist weapon", 15: "dagger", 16: "thrown",
+               18: "crossbow", 19: "wand"}
+# Not shirts, bags, tabards, ammo, quivers or relics.
+SKIP_SLOTS = (0, 4, 18, 19, 24, 27, 28)
+# tier: (quality, levels below the character, limit). A prize's reach above
+# the character is DM_PRIZE_REACH; standard gear is never above.
+GEAR_TIERS = {"standard": (2, 4, 8), "prize": (3, 2, 6)}
+
+
+def prize_reach():
+    console.load_env()
+    try:
+        return int(os.environ.get("DM_PRIZE_REACH", 5))
+    except ValueError:
+        return 5
+
+
+def gear_window(level, tier):
+    """The power levels a tier may offer at this character level, as (low, high)."""
+    _, below, _ = GEAR_TIERS[tier]
+    return max(1, level - below), level + (prize_reach() if tier == "prize" else 0)
+
+
+def gear(who, tier):
+    """Weapons and armor this character can use, for one reward tier.
+
+    standard: uncommon, up to 4 levels below the character and never above.
+    prize:    rare, from 2 below to DM_PRIZE_REACH above. No rare gear exists
+              below power level 15, so low characters get an empty list.
+
+    Only items something in the world drops, sells or rewards, with fixed stats,
+    and not already held by the character.
+    """
+    quality, _, limit = GEAR_TIERS[tier]
+    low, high = gear_window(who["level"], tier)
+    w, c = hot_quest.WORLD_DB, hot_quest.CHAR_DB
+    power = "IF(i.RequiredLevel > 0, i.RequiredLevel, GREATEST(1, CAST(i.ItemLevel AS SIGNED) - 5))"
+    stats = ", ".join(f"'t{n}', i.stat_type{n}, 'v{n}', i.stat_value{n}" for n in range(1, 11))
+    sources = " UNION ".join(
+        [f"SELECT item FROM {w}.{table}" for table in
+         ("creature_loot_template", "reference_loot_template", "gameobject_loot_template", "npc_vendor")]
+        + [f"SELECT {column} FROM {w}.quest_template" for column in
+           ("RewItemId1", "RewItemId2") + tuple(f"RewChoiceItemId{n}" for n in range(1, 7))])
+    found = rows(f"""
+        SELECT JSON_OBJECT('item', i.entry, 'name', i.name, 'class', i.class, 'subclass', i.subclass,
+                           'slot', i.InventoryType, 'required_level', i.RequiredLevel, 'level', {power}, {stats})
+        FROM {w}.item_template i
+        JOIN ({sources}) real_item ON real_item.item = i.entry
+        WHERE i.entry < 90000 AND i.class IN (2, 4) AND i.Quality = {quality} AND i.RandomProperty = 0
+          AND {power} BETWEEN {low} AND {high}
+          AND (i.AllowableClass = -1 OR (i.AllowableClass & {1 << (who['class'] - 1)}) <> 0)
+          AND (i.AllowableRace = -1 OR (i.AllowableRace & {1 << (who['race'] - 1)}) <> 0)
+          AND i.RequiredSkill = 0 AND i.requiredhonorrank = 0 AND i.RequiredReputationFaction = 0
+          AND i.InventoryType NOT IN {SKIP_SLOTS}
+          AND NOT EXISTS (SELECT 1 FROM {c}.character_inventory ci
+                          WHERE ci.guid = {int(who['guid'])} AND ci.item_template = i.entry);""")
+    return fit_gear(found, skills(who["guid"]), who["class"], limit)
+
+
+def skills(guid):
+    """The skill ids a character has, weapon and armor skills among them."""
+    return {int(row["skill"]) for row in rows(f"""
+        SELECT JSON_OBJECT('skill', skill) FROM {hot_quest.CHAR_DB}.character_skills WHERE guid = {int(guid)};""")}
+
+
+def fit_gear(found, known, char_class, limit):
+    """Keep what this character can use and would want, one item per kind.
+
+    found: item rows from the catalogue query. known: the character's skill ids.
+    Weapons come first, then the highest power level.
+    """
+    best_armor = next((sub for sub in BODY_ARMOR if ARMOR_SKILL[sub] in known), 1)
+    fit = []
+    for it in found:
+        sub = it["subclass"]
+        if it["class"] == 2:
+            need = WEAPON_SKILL.get(sub)
+            if not need or need not in known:
+                continue
+            kind = WEAPON_NAME[sub]
+        else:
+            body = sub in (1, 2, 3, 4) and it["slot"] != CLOAK_SLOT
+            if body:
+                if sub != best_armor:           # only the heaviest armor the character wears
+                    continue
+            elif sub == 6:
+                if ARMOR_SKILL[6] not in known:
+                    continue
+            elif sub not in (0, 1):             # librams, idols, totems are left to class limits
+                continue
+            kind = SLOT.get(it["slot"], "armor")
+            if body:
+                kind += " armor"
+        stats = sorted(((it[f"v{n}"], it[f"t{n}"]) for n in range(1, 11)
+                        if it.get(f"t{n}") in STAT and it.get(f"v{n}", 0) > 0), reverse=True)
+        if stats and stats[0][1] not in WANTED.get(char_class, set(STAT)):
+            continue                            # its main stat is no use to this class
+        fit.append({"item": it["item"], "name": it["name"], "kind": kind, "weapon": it["class"] == 2,
+                    "level": int(it["level"]), "required_level": it["required_level"],
+                    "stats": ", ".join(f"+{v} {STAT[t]}" for v, t in stats) or "no stats"})
+    fit.sort(key=lambda g: (not g["weapon"], -g["level"], g["name"]))
+    picked, seen = [], set()
+    for g in fit:                               # one per kind, so the list has variety
+        if g["kind"] in seen:
+            continue
+        seen.add(g["kind"])
+        picked.append(g)
+        if len(picked) == limit:
+            break
+    return picked
+
+
 def xp_weight(level):
     """The stock table's XP input for a quest of this level: the stock average."""
     found = rows(f"""
@@ -457,7 +587,9 @@ def main():
         report = {"character": who, "faction_files_found": factions.get() is not None,
                   "party": party,
                   "givers": givers(who), "targets": targets(who, party=party),
-                  "reward_items": reward_items(who), "xp_weight": xp_weight(who["level"]),
+                  "reward_items": reward_items(who),
+                  "gear_standard": gear(who, "standard"), "gear_prize": gear(who, "prize"),
+                  "xp_weight": xp_weight(who["level"]),
                   "money_cap_copper": money_cap(who["level"]), "next_quest_id": next_quest_id()}
     except QueryError as error:
         sys.exit(f"world_query: {error}")

@@ -43,6 +43,9 @@ Settings, on top of the ones the other scripts use:
     DM_IGNORE_CHARACTERS    names the DM should not track, comma separated
     DM_MAIL_CHARACTER       name of a character the DM owns; mail sent to it is read as
                             letters to the Overseer (optional)
+    DM_GEAR_EVERY           at most one gear reward in this many consecutive bounties (default 2)
+    DM_PRIZE_LEVEL_SPAN     levels a character must gain between prizes (default 4)
+    DM_PRIZE_REACH          how many levels above the character a prize may be (default 5)
     DM_PAUSE                set to 1 to pause without the flag file (`pause` writes the file)
     DM_PAUSE_FILE           where the flag file lives (default: `paused` beside this script)
 
@@ -326,6 +329,7 @@ def observe_bounties(db, players, progress, say):
                 db.execute("UPDATE quests SET status = 'completed', completed_at = ?, completed_by = ?, "
                            "circumstances = ? WHERE quest = ?",
                            (dm_state.now(), completer["name"], summary, quest["quest"]))
+                dm_state.set_reward_status(db, quest["quest"], "collected")
                 helpers = [c for c in dm_state.companions_of(db, quest["quest"]) if c["how"] in ("party", "shared")]
                 if helpers:
                     text += ", with " + " and ".join(sorted({c["name"] for c in helpers})) + " alongside"
@@ -359,6 +363,7 @@ def observe_bounties(db, players, progress, say):
     stale = dm_state.now() - int(setting("DM_STALE_HOURS", 24) * 3600)
     for quest in db.execute("SELECT * FROM quests WHERE status = 'offered' AND issued_at < ?", (stale,)).fetchall():
         db.execute("UPDATE quests SET status = 'ignored' WHERE quest = ?", (quest["quest"],))
+        dm_state.set_reward_status(db, quest["quest"], "lapsed")        # frees the gear budget it used
         dm_state.add_event(db, quest["guid"], "bounty", f"ignored the bounty \"{quest['title']}\"")
         say(f"  bounty \"{quest['title']}\" was ignored")
         retire(db, quest, say)
@@ -414,7 +419,7 @@ def story_section(db, who):
             }.get(quest["status"], quest["status"])
             through = f", offered through {quest['giver']}" if quest["giver"] else ""
             lines.append(f"- \"{quest['title']}\" ({hunt}){through}, posted {dm_state.ago(quest['issued_at'])} ago: "
-                         f"{outcome}. Beat: {quest['story_beat']}")
+                         f"{outcome}.{paid_text(db, quest['quest'])} Beat: {quest['story_beat']}")
             if quest["circumstances"]:
                 lines.append(f"  How it ended: {quest['circumstances']}")
         lines.append("")
@@ -453,6 +458,23 @@ def story_section(db, who):
         lines += ["", "The server owner turned down your recent ideas for this character, saying:"]
         lines += [f"- {row['reason']}" for row in rejected]
     return "\n".join(lines)
+
+
+def paid_text(db, quest):
+    """' It paid the prize Smite's Mighty Hammer.' for the story, or '' when it paid only coin."""
+    reward = dm_state.reward_of(db, quest)
+    if not reward:
+        return ""
+    names = json.loads(reward["names"] or "[]")
+    what = {"standard": "gear", "prize": "the prize", "capstone": "the book"}.get(reward["tier"], reward["tier"])
+    choice = "a choice of " if len(names) > 1 else ""
+    return f" It paid {choice}{what} {' or '.join(names)}."
+
+
+def gear_tiers(db, who):
+    """The gear tiers the budget allows this character's next bounty."""
+    return dm_state.gear_budget(db, who["guid"], who["level"], every=setting("DM_GEAR_EVERY", 2),
+                                span=setting("DM_PRIZE_LEVEL_SPAN", 4))
 
 
 def arc_text(arc, heading):
@@ -622,26 +644,28 @@ def props_in_use(db):
 def propose(db, who, say):
     """Ask the model for the next bounty and store it as a proposal. Returns the proposal number."""
     context = write_quest.gather(who["name"], skip=recent_targets(db, who["guid"]),
-                                 props_in_use=props_in_use(db))
+                                 props_in_use=props_in_use(db), gear_tiers=gear_tiers(db, who))
     message = write_quest.user_message(context, None, story=story_section(db, context["character"]))
     answer, usage = llm.ask_for_tool_call(SYSTEM, message, TOOL, max_tokens=4096)
-    spec, target, announcement = write_quest.build_spec(answer, context, hot_quest.QUEST_ID_RANGE[0])
+    progress = answer.get("beat_progress")
+    if progress not in ("advance", "hold", "detour", "conclude"):
+        progress = "hold"
+    arc = dm_state.active_arc(db, who["guid"])
+    finale = progress == "conclude" and arc and arc["current_beat"] >= len(json.loads(arc["beats"])) - 1
+    if progress == "conclude" and not finale:
+        progress = "hold"                           # a finale before the last beat is just another bounty
+    # An arc's finale is significant whatever its kind, so it may pay a prize.
+    spec, target, announcement = write_quest.build_spec(answer, context, hot_quest.QUEST_ID_RANGE[0],
+                                                        finale=bool(finale))
     beat = " ".join(str(answer.get("story_beat", "")).split())
     summary = " ".join(str(answer.get("story_so_far", "")).split())
     if not beat or not summary:
         raise write_quest.Rejected("the model left out the story beat or the story summary")
     if len(summary.split()) > 160:
         raise write_quest.Rejected("the story summary is far over 120 words")
-    progress = answer.get("beat_progress")
-    if progress not in ("advance", "hold", "detour", "conclude"):
-        progress = "hold"
-    arc = dm_state.active_arc(db, who["guid"])
     payload = {"beat_progress": progress, "kind": target["kind"], "needs_party": target["needs_party"]}
-    if progress == "conclude":
-        if arc and arc["current_beat"] >= len(json.loads(arc["beats"])) - 1:
-            payload["concludes_arc"] = arc["id"]
-        else:
-            payload["beat_progress"] = "hold"       # a finale before the last beat is just another bounty
+    if finale:
+        payload["concludes_arc"] = arc["id"]
     db.execute("INSERT INTO proposals (ts, guid, name, type, payload, spec, target, announcement, dm_note, story_beat, "
                "story_so_far, model, tokens_in, tokens_out) VALUES (?, ?, ?, 'bounty', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                (dm_state.now(), who["guid"], who["name"], json.dumps(payload), json.dumps(spec),
@@ -699,6 +723,7 @@ def approve_proposal(db, row, say):
                 (target.get("giver") or {}).get("name"),
                 payload.get("concludes_arc"), json.dumps(spec), row["announcement"], row["dm_note"],
                 row["story_beat"], row["model"], stamp))
+    record_reward(db, row, spec, target)
     db.execute("UPDATE characters SET story_so_far = ? WHERE guid = ?", (row["story_so_far"], row["guid"]))
     db.execute("UPDATE proposals SET status = 'approved', decided_at = ? WHERE id = ?", (stamp, row["id"]))
     dm_state.add_event(db, row["guid"], "overseer", f"the Overseer posted the bounty \"{spec['title']}\"")
@@ -710,6 +735,19 @@ def approve_proposal(db, row, say):
                    (min(arc["current_beat"] + 1, last), stamp, arc["id"]))
     db.commit()
     say(f"quest {spec['id']} is live for {row['name']}; the story has moved on.")
+
+
+def record_reward(db, row, spec, target):
+    """Write the bounty's headline reward to the ledger, which the gear budget reads."""
+    gear = target.get("gear")
+    known = dm_state.get_character(db, row["guid"])
+    level = known["level"] if known else 0
+    if gear:
+        dm_state.record_reward(db, row["guid"], spec["id"], gear["tier"], [g["item"] for g in gear["items"]],
+                               [g["name"] for g in gear["items"]], level)
+    elif target.get("capstone"):
+        book = target["capstone"]
+        dm_state.record_reward(db, row["guid"], spec["id"], "capstone", [book["item"]], [book["name"]], level)
 
 
 def settle(db, number, say):
@@ -802,7 +840,6 @@ def show_proposal(row):
         print(f"Model's note: {row['dm_note']}   [{row['model']}, tokens {row['tokens_in']}/{row['tokens_out']}]")
         return
     spec, target = json.loads(row["spec"]), json.loads(row["target"])
-    reward = [f"{spec['reward']['money_copper']} copper"] + [f"item {i['item']}" for i in spec["reward"]["items"]]
     payload = json.loads(row["payload"] or "{}")
     progress = payload.get("beat_progress", "hold")
     kind = payload.get("kind") or target.get("kind") or "hunt"
@@ -817,7 +854,7 @@ Title:    {spec['title']}
 Kind:     {kind}
 Herald:   {herald}
 Hunt:     {objectives}
-Reward:   {', '.join(reward)}
+Reward:   {write_quest.reward_text(spec, target)}
 Briefing:
   {spec['briefing']}
 Objectives:
@@ -982,6 +1019,7 @@ def cmd_purge(db, args):
             failed.append((quest["id"], error))
         db.execute("UPDATE quests SET status = 'purged', retired_at = ? WHERE quest = ?",
                    (dm_state.now(), quest["id"]))
+        dm_state.set_reward_status(db, quest["id"], "lapsed")
     db.commit()
     if gone:
         dm_state.add_event(db, 0, "purged", f"removed quests: {', '.join(str(i) for i in gone)}")
@@ -1066,6 +1104,7 @@ def cmd_context(db, args):
         sys.exit("dm: the Overseer has not noticed this character yet; run a tick while they are online")
     try:
         context = write_quest.gather(args.character, skip=recent_targets(db, who["guid"]),
+                                     gear_tiers=gear_tiers(db, who),
                                      props_in_use=props_in_use(db))
     except write_quest.NoContext as error:
         sys.exit(f"dm: {error}")

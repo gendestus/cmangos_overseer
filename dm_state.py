@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS companions (
     first_ts INTEGER, last_ts INTEGER, sightings INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (quest, guid, how)
 );
+CREATE TABLE IF NOT EXISTS rewards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, guid INTEGER, quest INTEGER,
+    tier TEXT,                                   -- standard, prize, capstone
+    items TEXT,                                  -- JSON list of item ids offered
+    names TEXT,                                  -- JSON list of their names, for the story
+    level INTEGER,                               -- the character's level when it was posted
+    status TEXT NOT NULL DEFAULT 'posted'        -- posted, collected, lapsed
+);
 """
 
 # Columns added after the first release; applied to an existing state.db on open.
@@ -181,6 +189,42 @@ def active_arc(db, guid):
     """The private plan the Overseer is following for this character, if one is approved."""
     return db.execute("SELECT * FROM arcs WHERE guid = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
                       (guid,)).fetchone()
+
+
+def record_reward(db, guid, quest, tier, items, names, level):
+    db.execute("INSERT INTO rewards (ts, guid, quest, tier, items, names, level) VALUES (?, ?, ?, ?, ?, ?, ?)",
+               (now(), guid, quest, tier, json.dumps(items), json.dumps(names), level))
+
+
+def set_reward_status(db, quest, status):
+    """collected when the intended character turns the bounty in; lapsed when it goes unclaimed."""
+    db.execute("UPDATE rewards SET status = ? WHERE quest = ? AND status = 'posted'", (status, quest))
+
+
+def reward_of(db, quest):
+    return db.execute("SELECT * FROM rewards WHERE quest = ? ORDER BY id DESC LIMIT 1", (quest,)).fetchone()
+
+
+def gear_budget(db, guid, level, every, span):
+    """The gear tiers this character's next bounty may pay: a tuple of 'standard' and 'prize'.
+
+    every: at most one gear reward, of either tier, in this many consecutive
+           bounties. A lapsed bounty still counts as a bounty, but not as gear.
+    span:  levels the character must gain between prizes.
+    """
+    recent = [row["quest"] for row in db.execute(
+        "SELECT quest FROM quests WHERE guid = ? ORDER BY issued_at DESC, quest DESC LIMIT ?",
+        (guid, max(0, int(every) - 1)))]
+    paid = {row["quest"] for row in db.execute(
+        "SELECT quest FROM rewards WHERE guid = ? AND tier IN ('standard', 'prize') AND status <> 'lapsed'",
+        (guid,))}
+    if any(quest in paid for quest in recent):
+        return ()
+    last_prize = db.execute("SELECT MAX(level) FROM rewards WHERE guid = ? AND tier = 'prize' "
+                            "AND status <> 'lapsed'", (guid,)).fetchone()[0]
+    if last_prize is not None and level - last_prize < span:
+        return ("standard",)
+    return ("standard", "prize")
 
 
 def proposals_in_last_hour(db):

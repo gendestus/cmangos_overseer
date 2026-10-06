@@ -249,6 +249,9 @@ All settings are read from the environment, or from `.env` in this folder.
 | `DM_COOLDOWN_MINUTES` | `20` | Wait after a bounty ends before proposing the next |
 | `DM_STALE_HOURS` | `24` | An offered bounty nobody accepts is dropped after this |
 | `DM_MAX_PROPOSALS_HOUR` | `6` | Ceiling on model calls per hour |
+| `DM_GEAR_EVERY` | `2` | At most one gear reward in this many consecutive bounties |
+| `DM_PRIZE_LEVEL_SPAN` | `4` | Levels a character must gain between rare prizes |
+| `DM_PRIZE_REACH` | `5` | How many levels above the character a prize may be |
 | `DM_AUTO_APPROVE` | `letter` | Proposal types that skip review: `bounty`, `arc`, `letter` |
 | `DM_CHARACTERS` | empty | If set, the only characters the DM notices. Needed on a playerbot realm |
 | `DM_IGNORE_CHARACTERS` | empty | Names the DM should not track. Applied after `DM_CHARACTERS` |

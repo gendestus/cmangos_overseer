@@ -16,6 +16,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
@@ -54,6 +55,12 @@ CONTEXT = {
                  "unique": False, "needs_party": True}],
     "reward_items": [{"item": 111520, "name": "Grimoire of Summon Voidwalker", "required_level": 10}],
     "money_cap": 650, "xp_weight": 100,
+    "gear": {"standard": [{"item": 1296, "name": "Blackrock Mace", "kind": "mace", "weapon": True, "level": 3,
+                           "required_level": 3, "stats": "+3 Strength"},
+                          {"item": 2900, "name": "Burnished Boots", "kind": "feet", "weapon": False, "level": 3,
+                           "required_level": 0, "stats": "+1 Stamina"}],
+             "prize": [{"item": 7230, "name": "Smite's Mighty Hammer", "kind": "two-handed mace", "weapon": True,
+                        "level": 8, "required_level": 8, "stats": "+11 Strength, +4 Agility"}]},
 }
 
 ANSWER = {
@@ -876,6 +883,248 @@ class MemoryFile(unittest.TestCase):
         self.assertEqual(dm_state.ago(1000, 1030), "a minute")
         self.assertEqual(dm_state.ago(1000, 1000 + 25 * 60), "25 minutes")
         self.assertEqual(dm_state.ago(1000, 1000 + 3 * 3600), "3 hours")
+
+
+def item(entry=1, cls=2, sub=7, slot=13, level=10, stats=()):
+    """A catalogue row as the gear query returns it."""
+    row = {"item": entry, "name": f"Item {entry}", "class": cls, "subclass": sub, "slot": slot,
+           "required_level": level, "level": level}
+    for n in range(1, 11):
+        stat, value = stats[n - 1] if n <= len(stats) else (0, 0)
+        row[f"t{n}"], row[f"v{n}"] = stat, value
+    return row
+
+
+SWORDS, MAIL, CLOTH, SHIELD = 43, 413, 415, 433
+
+
+class GearFilters(unittest.TestCase):
+    """world_query.fit_gear: what a character can use and would want."""
+
+    def test_a_weapon_needs_its_skill(self):
+        self.assertEqual(world_query.fit_gear([item()], {SWORDS}, 1, 8)[0]["kind"], "sword")
+        self.assertEqual(world_query.fit_gear([item()], {CLOTH}, 1, 8), [])
+        self.assertEqual(world_query.fit_gear([item(sub=9)], {SWORDS}, 1, 8), [])     # no skill mapped
+
+    def test_body_armor_is_only_the_heaviest_worn(self):
+        robe, hauberk = item(1, cls=4, sub=1, slot=20), item(2, cls=4, sub=3, slot=5)
+        fit = world_query.fit_gear([robe, hauberk], {CLOTH, 414, MAIL}, 3, 8)
+        self.assertEqual([g["item"] for g in fit], [2])
+        self.assertEqual(fit[0]["kind"], "chest armor")
+
+    def test_a_cloak_and_a_ring_are_exempt_from_armor_weight(self):
+        cloak, ring = item(1, cls=4, sub=1, slot=16), item(2, cls=4, sub=0, slot=11)
+        fit = world_query.fit_gear([cloak, ring], {CLOTH, MAIL}, 3, 8)
+        self.assertEqual(sorted(g["kind"] for g in fit), ["back", "finger"])
+
+    def test_a_shield_needs_the_shield_skill(self):
+        shield = item(cls=4, sub=6, slot=14)
+        self.assertEqual(world_query.fit_gear([shield], {CLOTH}, 2, 8), [])
+        self.assertEqual(len(world_query.fit_gear([shield], {CLOTH, SHIELD}, 2, 8)), 1)
+
+    def test_the_main_stat_must_suit_the_class(self):
+        caster_sword = item(stats=((5, 6), (7, 2)))                   # Intellect first
+        self.assertEqual(world_query.fit_gear([caster_sword], {SWORDS}, 1, 8), [])      # warrior: no
+        self.assertEqual(len(world_query.fit_gear([caster_sword], {SWORDS}, 2, 8)), 1)  # paladin: yes
+        self.assertEqual(len(world_query.fit_gear([item()], {SWORDS}, 1, 8)), 1)        # no stats at all: passes
+
+    def test_one_item_per_kind_weapons_first(self):
+        found = [item(1, level=8), item(2, level=10), item(3, cls=4, sub=0, slot=11, level=12)]
+        fit = world_query.fit_gear(found, {SWORDS}, 1, 8)
+        self.assertEqual([g["item"] for g in fit], [2, 3])           # the better sword, then the ring
+        self.assertEqual(len(world_query.fit_gear(found, {SWORDS}, 1, 1)), 1)
+
+    def test_the_prize_window_reaches_above_and_standard_never_does(self):
+        os.environ["DM_PRIZE_REACH"] = "5"
+        self.assertEqual(world_query.gear_window(16, "standard"), (12, 16))
+        self.assertEqual(world_query.gear_window(16, "prize"), (14, 21))
+        self.assertEqual(world_query.gear_window(2, "standard"), (1, 2))
+        os.environ.pop("DM_PRIZE_REACH")
+
+    def test_the_reader_can_see_skills_and_inventory(self):
+        granted = {target for _, target in db_users.READ_GRANTS}
+        self.assertIn(f"{hot_quest.CHAR_DB}.*", granted)
+
+
+class GearRewards(unittest.TestCase):
+    MARK = [{"target_creature": 471, "count": 1, "label": "Narg dealt with"}]
+
+    def build(self, context=None, **changes):
+        return write_quest.build_spec(dict(ANSWER, **changes), context or CONTEXT, 30000)
+
+    def test_gear_must_be_on_the_list(self):
+        with self.assertRaises(write_quest.Rejected):
+            self.build(reward_gear=[9999])
+
+    def test_tiers_cannot_be_mixed(self):
+        with self.assertRaises(write_quest.Rejected):
+            self.build(kind="mark", objectives=self.MARK, reward_gear=[1296, 7230], reward_money_copper=0)
+
+    def test_one_id_is_fixed_and_several_are_a_choice(self):
+        spec, record, _ = self.build(reward_gear=[1296], reward_money_copper=300)
+        self.assertEqual(spec["reward"]["items"], [{"item": 1296, "count": 1}])
+        self.assertEqual(spec["reward"]["choice_items"], [])
+        self.assertEqual(record["gear"]["tier"], "standard")
+        spec, _, _ = self.build(reward_gear=[1296, 2900], reward_money_copper=300)
+        self.assertEqual(spec["reward"]["items"], [])
+        self.assertEqual([i["item"] for i in spec["reward"]["choice_items"]], [1296, 2900])
+
+    def test_a_prize_needs_a_significant_bounty(self):
+        with self.assertRaises(write_quest.Rejected):
+            self.build(reward_gear=[7230], reward_money_copper=0)                      # a hunt
+        spec, record, _ = self.build(kind="mark", objectives=self.MARK, reward_gear=[7230], reward_money_copper=0)
+        self.assertEqual(record["gear"]["items"][0]["name"], "Smite's Mighty Hammer")
+        journey = [{"target_creature": 471, "count": 1, "label": "Narg found"}]       # Narg is far and rare
+        self.build(kind="journey", objectives=journey, reward_gear=[7230], reward_money_copper=0)
+
+    def test_not_a_capstone_and_gear_together(self):
+        with self.assertRaises(write_quest.Rejected):
+            self.build(reward_item=111520, reward_gear=[1296], reward_money_copper=0)
+
+    def test_the_money_cap_halves_with_gear(self):
+        self.build(reward_gear=[1296], reward_money_copper=325)
+        with self.assertRaises(write_quest.Rejected):
+            self.build(reward_gear=[1296], reward_money_copper=326)
+        self.build(reward_money_copper=650)                                         # coin only: the full cap
+
+    def test_the_prompt_shows_only_the_tiers_allowed(self):
+        text = write_quest.user_message(CONTEXT, None)
+        self.assertIn("1296: Blackrock Mace, mace, level 3, +3 Strength", text)
+        self.assertIn("Prizes (a significant bounty only):", text)
+        no_prize = dict(CONTEXT, gear=dict(CONTEXT["gear"], prize=[]))
+        self.assertNotIn("Prizes", write_quest.user_message(no_prize, None))
+        none = dict(CONTEXT, gear={"standard": [], "prize": []})
+        self.assertNotIn("Blackrock", write_quest.user_message(none, None))
+
+    def test_the_tool_offers_the_field(self):
+        self.assertEqual(write_quest.TOOL["input_schema"]["properties"]["reward_gear"]["maxItems"], 3)
+        self.assertIn("reward_gear", dm.TOOL["input_schema"]["properties"])
+
+
+class GearBudget(unittest.TestCase):
+    def setUp(self):
+        os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
+        self.db = dm_state.connect()
+
+    def tearDown(self):
+        self.db.close()
+
+    def bounty(self, quest, tier=None, level=10, status="posted"):
+        self.db.execute("INSERT INTO quests (quest, guid, title, spec, issued_at, status) "
+                        "VALUES (?, 1, 'T', '{}', ?, 'completed')", (quest, quest))
+        if tier:
+            dm_state.record_reward(self.db, 1, quest, tier, [1], ["X"], level)
+            dm_state.set_reward_status(self.db, quest, status) if status != "posted" else None
+
+    def budget(self, level=10, every=2, span=4):
+        return dm_state.gear_budget(self.db, 1, level, every, span)
+
+    def test_no_history_allows_both(self):
+        self.assertEqual(self.budget(), ("standard", "prize"))
+
+    def test_gear_every_blocks_back_to_back_gear(self):
+        self.bounty(30000, "standard")
+        self.assertEqual(self.budget(), ())                      # the last bounty paid gear
+        self.bounty(30001)                                        # then one paid coin
+        self.assertEqual(self.budget(), ("standard", "prize"))
+        self.assertEqual(self.budget(every=3), ())               # one gear in any three
+
+    def test_a_prize_counts_toward_gear_every(self):
+        self.bounty(30000, "prize")
+        self.assertEqual(self.budget(level=20), ())
+
+    def test_a_capstone_is_not_gear(self):
+        self.bounty(30000, "capstone")
+        self.assertEqual(self.budget(), ("standard", "prize"))
+
+    def test_prizes_need_levels_between_them(self):
+        self.bounty(30000, "prize", level=10)
+        self.bounty(30001)
+        self.assertEqual(self.budget(level=13), ("standard",))
+        self.assertEqual(self.budget(level=14), ("standard", "prize"))
+
+    def test_a_lapsed_reward_frees_the_budget(self):
+        self.bounty(30000, "prize", level=10, status="lapsed")
+        self.assertEqual(self.budget(level=10), ("standard", "prize"))
+
+    def test_the_story_names_what_a_bounty_paid(self):
+        self.bounty(30000, "prize")
+        self.assertIn("It paid the prize X.", dm.paid_text(self.db, 30000))
+        self.assertEqual(dm.paid_text(self.db, 99999), "")
+
+
+class PrizeEndToEnd(unittest.TestCase):
+    """With the stub model: a mark with a prize is proposed, approved, turned in, and collected."""
+
+    def test_a_prize_is_collected(self):
+        os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
+        db = dm_state.connect()
+        who = dict(CONTEXT["character"], map=0, x=0, y=0, online=1)
+        dm_state.save_character(db, who, [], [], [], first=True)
+        answer = dict(ANSWER, kind="mark", objectives=GearRewards.MARK, reward_gear=[7230],
+                      reward_money_copper=100, story_beat="It began.", story_so_far="A start.",
+                      beat_progress="hold")
+        stub = os.path.join(tempfile.mkdtemp(), "answer.json")
+        with open(stub, "w") as handle:
+            json.dump(answer, handle)
+        env = {"DM_LLM_PROVIDER": "stub", "DM_LLM_STUB": stub}
+        gathered = []
+
+        def gather(name, skip=(), props_in_use=(), gear_tiers=()):
+            gathered.append(gear_tiers)
+            return json.loads(json.dumps(CONTEXT))
+
+        with mock.patch.dict(os.environ, env), mock.patch.object(write_quest, "gather", gather), \
+                mock.patch.object(world_query, "next_quest_id", return_value=30005), \
+                mock.patch.object(apply_quest, "apply_spec"):
+            number = dm.propose(db, who, lambda _line: None)
+            self.assertEqual(gathered, [("standard", "prize")])
+            row = db.execute("SELECT * FROM proposals WHERE id = ?", (number,)).fetchone()
+            dm.approve_proposal(db, row, lambda _line: None)
+            reward = dm_state.reward_of(db, 30005)
+            self.assertEqual((reward["tier"], reward["status"]), ("prize", "posted"))
+            self.assertEqual(json.loads(reward["items"]), [7230])
+            self.assertEqual(dm.gear_tiers(db, who), ())          # the next bounty pays coin
+
+            progress = [{"guid": 1, "name": "Zachadin", "quest": 30005, "state": "done"}]
+            dm.observe_bounties(db, [who], progress, lambda _line: None)
+            self.assertEqual(dm_state.reward_of(db, 30005)["status"], "collected")
+            self.assertIn("It paid the prize Smite's Mighty Hammer.", dm.story_section(db, who))
+        db.close()
+
+    def test_which_bounties_are_significant(self):
+        self.assertTrue(write_quest.significant("mark", ["rare"]))
+        self.assertTrue(write_quest.significant("party", ["normal", "elite"]))
+        self.assertFalse(write_quest.significant("journey", ["normal"]))
+        self.assertFalse(write_quest.significant("trophy", ["rare"]))
+
+    def propose_hunt_with_prize(self, beat_progress, current_beat):
+        os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
+        db = dm_state.connect()
+        who = dict(CONTEXT["character"], map=0, x=0, y=0, online=1)
+        dm_state.save_character(db, who, [], [], [], first=True)
+        db.execute("INSERT INTO arcs (guid, premise, lure, adversary, beats, current_beat) VALUES (1, 'p', 'l', 'a', ?, ?)",
+                   (json.dumps(ARC["beats"]), current_beat))
+        answer = dict(ANSWER, reward_gear=[7230], reward_money_copper=0, story_beat="b", story_so_far="s",
+                      beat_progress=beat_progress)
+        stub = os.path.join(tempfile.mkdtemp(), "answer.json")
+        with open(stub, "w") as handle:
+            json.dump(answer, handle)
+        with mock.patch.dict(os.environ, {"DM_LLM_PROVIDER": "stub", "DM_LLM_STUB": stub}), \
+                mock.patch.object(write_quest, "gather", lambda *a, **k: json.loads(json.dumps(CONTEXT))):
+            try:
+                return dm.propose(db, who, lambda _line: None)
+            finally:
+                db.close()
+
+    def test_an_arc_finale_may_pay_a_prize_whatever_its_kind(self):
+        self.assertTrue(self.propose_hunt_with_prize("conclude", current_beat=2))     # the last beat
+
+    def test_a_prize_on_an_ordinary_hunt_is_refused(self):
+        with self.assertRaises(write_quest.Rejected):
+            self.propose_hunt_with_prize("hold", current_beat=2)
+        with self.assertRaises(write_quest.Rejected):                    # "conclude" too early is just a hunt
+            self.propose_hunt_with_prize("conclude", current_beat=0)
 
 
 if __name__ == "__main__":
