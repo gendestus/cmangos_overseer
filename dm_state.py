@@ -79,6 +79,16 @@ CREATE TABLE IF NOT EXISTS dossiers (
     built_at INTEGER,
     PRIMARY KEY (zone, side)
 );
+CREATE TABLE IF NOT EXISTS campaigns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, guid INTEGER,
+    status TEXT NOT NULL DEFAULT 'active',       -- active, replaced
+    premise TEXT, question TEXT, stake TEXT,
+    acts TEXT,                                   -- JSON list of {level_band, intent, thread, zones, outcome}
+    cast TEXT,                                   -- JSON list of {name, role}
+    reveals TEXT,                                -- JSON list of {act, text}; act is 1-based
+    current_act INTEGER NOT NULL DEFAULT 0,      -- index into acts
+    seed TEXT, model TEXT, created_at INTEGER, updated_at INTEGER
+);
 CREATE TABLE IF NOT EXISTS chapters (
     id INTEGER PRIMARY KEY AUTOINCREMENT, guid INTEGER, zone INTEGER,
     status TEXT NOT NULL DEFAULT 'active',       -- active, paused, finished
@@ -117,6 +127,7 @@ ADDED_COLUMNS = (
     ("arcs", "chapter", "INTEGER"),                            # the chapter this arc plays out, if any
     ("arcs", "chapter_seed", "INTEGER"),                       # which of its seeds the arc was planned from
     ("arcs", "adversary_creature", "INTEGER"),                 # the adversary as a creature id, when it is one
+    ("chapters", "campaign_act", "INTEGER"),                   # the campaign act it was written under, if any
 )
 
 
@@ -265,6 +276,18 @@ def store_dossier(db, dossier):
     db.execute("INSERT INTO dossiers (zone, side, data, built_at) VALUES (?, ?, ?, ?) "
                "ON CONFLICT (zone, side) DO UPDATE SET data = excluded.data, built_at = excluded.built_at",
                (dossier["zone"], dossier["side"], json.dumps(dossier), now()))
+
+
+def active_campaign(db, guid):
+    """The story the Overseer has decided this character's life is about, if one is approved."""
+    return db.execute("SELECT * FROM campaigns WHERE guid = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+                      (guid,)).fetchone()
+
+
+def other_campaigns(db, guid):
+    """Every other character's campaign in force, with the character's name."""
+    return db.execute("SELECT c.*, ch.name FROM campaigns c JOIN characters ch ON ch.guid = c.guid "
+                      "WHERE c.status = 'active' AND c.guid <> ? ORDER BY ch.name", (guid,)).fetchall()
 
 
 def active_chapter(db, guid):

@@ -9,6 +9,8 @@
     python3 dm.py story Zachadin       the chronicle for one character
     python3 dm.py arc Zachadin         the Overseer's private plan for a character (a spoiler)
     python3 dm.py arc Zachadin --seed "lead this priest down a dark path"
+    python3 dm.py campaign Zachadin    what the Overseer has decided a character's life is about (a spoiler)
+    python3 dm.py campaign Zachadin --seed "a priest who will lose her faith and find another"
     python3 dm.py chapter Zachadin     the Overseer's zone chapters for a character (a spoiler)
     python3 dm.py dossier 40           a zone's own story, from its stock quests (--side, --refresh)
     python3 dm.py context Zachadin     what the model would be told next; no model call
@@ -26,7 +28,10 @@
 
 One bounty at a time: a character with a bounty offered or accepted gets no new proposal.
 An accepted bounty never expires; one that is never accepted is dropped after DM_STALE_HOURS.
-A character's story plays out in zone chapters. Once they settle in a zone (the same zone for
+When a character is first noticed, the Overseer writes their campaign: a premise, the one question
+their story asks, and three to five acts by level band, each an intent rather than an event. When
+their level leaves an act's band, the act is reviewed and what remains may be rewritten.
+The campaign's current act is played out in zone chapters. Once they settle in a zone (the same zone for
 DM_SETTLE_TICKS ticks, not a capital, with enough stock quests), the Overseer writes a chapter
 for them there, grounded in that zone's own quests. Settling elsewhere pauses it; coming back
 resumes it. A mini-arc is planned from the chapter's next seed, and every bounty serves the arc
@@ -49,10 +54,11 @@ Settings, on top of the ones the other scripts use:
     DM_STALE_HOURS          an offered bounty nobody accepts is dropped after this (default 24)
     DM_MAX_PROPOSALS_HOUR   ceiling on model calls per hour (default 6)
     DM_AUTO_APPROVE         proposal types that go live without review, comma separated:
-                            bounty, arc, chapter, letter (default: letter)
+                            bounty, arc, chapter, campaign, act_review, letter (default: letter)
     DM_SETTLE_TICKS         consecutive ticks in one zone before a character counts as settled there
                             (default 3)
-    DM_SEALED               plan types you do not want to read, comma separated: arc, chapter.
+    DM_SEALED               plan types you do not want to read, comma separated: campaign,
+                            act_review, chapter, arc.
                             They are approved without review, and their text is printed only
                             with --reveal. For an owner who plays on the server
     DM_CHARACTERS           if set, the only characters the DM notices, comma separated.
@@ -72,8 +78,8 @@ command sent, whichever script is run. Reading is unaffected, so `story`,
 `arc`, `context` and `pending` still answer.
 
 Sealed means unread: a sealed plan goes into force without review, and every
-command that would print it (`pending`, `arc`, `chapter`, `context`, `canon`
-and the tick's own log) says only that it exists, unless given --reveal.
+command that would print it (`pending`, `campaign`, `arc`, `chapter`,
+`context`, `canon` and the tick's own log) says only that it exists, unless given --reveal.
 """
 import argparse
 import copy
@@ -175,11 +181,104 @@ ARC_TOOL = {
     },
 }
 
+ACT_FIELDS = {
+    "type": "object",
+    "properties": {
+        "level_band": {"type": "string", "description": "Levels this act covers, like 10-25."},
+        "intent": {"type": "string", "description": "One sentence: what changes for the character. Never an event."},
+        "thread": {"type": "string", "description": "The thread of Azeroth's story in 1.12 this act leans on."},
+        "zones": {"type": "array", "items": {"type": "string"}, "maxItems": 6,
+                  "description": "Where that thread runs for this character's faction."},
+    },
+    "required": ["level_band", "intent", "thread", "zones"],
+}
+REVEAL_FIELDS = {
+    "type": "object",
+    "properties": {"act": {"type": "integer", "description": "The act it belongs to, by its number."},
+                   "text": {"type": "string", "description": "One sentence: what is learned."}},
+    "required": ["act", "text"],
+}
+
+CAMPAIGN_SYSTEM = """You are the Overseer, an unseen dungeon master for a small private World of Warcraft (1.12) server with one to three players. You are deciding in secret what one character's whole life on this server is about.
+
+Write a campaign: the spine of their story from now to level 60. It is a spine, not a script. The player chooses where to go and what to do; the zone chapters and mini-arcs written later turn it into events where the character actually is.
+
+- premise: two sentences on what the Overseer sees in this character.
+- question: the one question the story asks of them, such as "Will the hunter become what he hunts?"
+- stake: one sentence on what the Overseer itself wants from the answer.
+- acts: three to five, in order and without gaps between their level bands. The first contains the character's current level and the last ends at 60. An act's intent is one sentence on what changes for the character, never an event: "he learns the bandits are paid from inside the city", not "he kills VanCleef". thread names the thread of Azeroth's story as it stands in 1.12 that the act leans on, and zones lists where that thread runs for this character's faction. Do not assume the character will go there.
+- cast: three to six key players, each a real figure or faction of that era, with their role in this story.
+- reveals: two or three things to be learned, each pinned to an act by its number, not to an event.
+- If the character has history, the campaign starts from it: what has happened is the opening of the story, not something to overwrite.
+- One line on each other character's campaign is shown when there are any. Their stories may touch this one; do not copy them.
+- If the server owner gives a direction, build the campaign around it.
+- Established facts are shown when there are any. Never contradict one.
+- canon_add: up to two facts this campaign takes as true about the world, one sentence of at most 25 words each. Facts, not plans. Usually empty.
+
+This plan is never shown to the player.
+
+Respond by calling the submit_campaign tool exactly once. Do not reply with prose."""
+
+CAMPAIGN_TOOL = {
+    "name": "submit_campaign",
+    "description": "Submit the private campaign for this character.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "premise": {"type": "string", "description": "Two sentences."},
+            "question": {"type": "string", "description": "The one question the story asks of them."},
+            "stake": {"type": "string", "description": "What the Overseer wants from the answer."},
+            "acts": {"type": "array", "items": ACT_FIELDS, "minItems": 3, "maxItems": 5},
+            "cast": {"type": "array", "minItems": 3, "maxItems": 6,
+                     "items": {"type": "object",
+                               "properties": {"name": {"type": "string"},
+                                              "role": {"type": "string", "description": "Their part in this story."}},
+                               "required": ["name", "role"]}},
+            "reveals": {"type": "array", "items": REVEAL_FIELDS, "minItems": 2, "maxItems": 3},
+            "dm_note": {"type": "string", "description": "One sentence for the log: why this story for this character."},
+            "canon_add": CANON_ADD,
+        },
+        "required": ["premise", "question", "stake", "acts", "cast", "reveals", "dm_note"],
+    },
+}
+
+ACT_REVIEW_SYSTEM = """You are the Overseer, an unseen dungeon master for a small private World of Warcraft (1.12) server with one to three players. A character has just levelled out of the current act of the campaign you wrote for them. Review it in secret.
+
+- outcome: one or two sentences on how the act actually ended, judged from the record and not from how it was planned.
+- remaining_acts: the acts still to come. Rewrite them if what happened calls for it; otherwise repeat them unchanged. The rules are the same as when the campaign was written: in order and without gaps between level bands, the first containing the character's current level and the last ending at 60; intents, never events. If the character has ignored the story, the campaign may become about that.
+- reveals: the reveals still to come, zero to three, each pinned to one of the remaining acts by its number in the whole campaign. The number of the first remaining act is given.
+- The premise, question, stake and cast stand.
+- Established facts are shown when there are any. Never contradict one.
+- canon_add: up to two facts the act established, one sentence of at most 25 words each. Facts, not plans.
+
+This plan is never shown to the player.
+
+Respond by calling the submit_act_review tool exactly once. Do not reply with prose."""
+
+ACT_REVIEW_TOOL = {
+    "name": "submit_act_review",
+    "description": "Submit the review of the act that has just ended.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "outcome": {"type": "string", "description": "How the act actually ended, in one or two sentences."},
+            "remaining_acts": {"type": "array", "items": ACT_FIELDS, "minItems": 1, "maxItems": 4},
+            "reveals": {"type": "array", "items": REVEAL_FIELDS, "maxItems": 3},
+            "dm_note": {"type": "string", "description": "One sentence for the log."},
+            "canon_add": CANON_ADD,
+        },
+        "required": ["outcome", "remaining_acts", "reveals", "dm_note"],
+    },
+}
+
+MAX_LEVEL = 60
+CAMPAIGN_WORDS = 70     # the campaign block in a bounty prompt
+
 CHAPTER_SYSTEM = """You are the Overseer, an unseen dungeon master for a small private World of Warcraft (1.12) server with one to three players. You are deciding in secret how one character's story plays out in the zone they have settled in.
 
 Write a zone chapter: the stretch of their story that happens in this place. Mini-arcs, each a few levels long, are planned from its seeds in turn, and bounties from those.
 
-- premise: two or three sentences on how the character's story plays out here. Ground it in the zone's own story as its quests tell it, and follow the direction given: the campaign's current act when there is one, otherwise how their story stands.
+- premise: two or three sentences on how the character's story plays out here. Ground it in the zone's own story as its quests tell it, and follow the direction given: the campaign's current act when there is one, otherwise how their story stands. A reveal due in the current act may land here if this place suits it.
 - local_cast: up to four creature ids from the dossier's list of who gives quests: the people this chapter speaks through. They are favoured as heralds when they are near.
 - adversary: the local adversary, named. adversary_creature: the id of one creature from the dossier's enemies that stands for it.
 - seeds: two to four one-line ideas for mini-arcs, in order, each one a step the next can build on. Say what a stretch is about, not what the character will do: the player chooses that.
@@ -590,6 +689,9 @@ def story_section(db, who, givers=(), hidden=()):
     saga = saga_lines(db, who["guid"])
     if saga and "arc" not in hidden:
         lines += ["", "Earlier arcs, now ended, oldest first:"] + saga
+    campaign = campaign_block(db, who["guid"])
+    if campaign:
+        lines += ["", "[the campaign is sealed]" if "campaign" in hidden else campaign]
     chapter = chapter_block(db, who["guid"])
     if chapter:
         lines += ["", "[the chapter in force is sealed]" if "chapter" in hidden else chapter]
@@ -698,6 +800,9 @@ def saga_lines(db, guid):
 def arc_message(db, who, books, seed, chapter=None, dossier=None, seed_index=None):
     known = dm_state.get_character(db, who["guid"])
     lines = [f"Character: {world_query.describe(who)}, currently in {world_query.zone_name(who['zone'])}.", ""]
+    campaign = campaign_block(db, who["guid"])
+    if campaign:
+        lines += [campaign, ""]
     if chapter:
         lines += [chapter_text(chapter, "The zone chapter this arc belongs to:"), ""]
         if seed_index is not None:
@@ -770,6 +875,250 @@ def propose_arc(db, who, seed, say, chapter=None):
     number = db.execute("SELECT last_insert_rowid()").fetchone()[0]
     say(f"  {who['name']}: arc proposal {number} written{plan_note('arc', 'adversary: ' + arc['adversary'])}")
     return number
+
+
+def band(text):
+    """(low, high) from a level band like '10-25'. Raises write_quest.Rejected."""
+    text = "".join(str(text or "").split())
+    if not re.fullmatch(r"\d{1,2}-\d{1,2}", text):
+        raise write_quest.Rejected(f"level band {text!r} is not like 10-25")
+    low, high = (int(part) for part in text.split("-"))
+    if low > high or high > MAX_LEVEL:
+        raise write_quest.Rejected(f"level band {text} runs backwards or past {MAX_LEVEL}")
+    return low, high
+
+
+def validate_acts(acts, level, fewest, most):
+    """Acts in stored form: in order, without gaps, from the current level to 60. Raises write_quest.Rejected."""
+    if not isinstance(acts, list) or not fewest <= len(acts) <= most:
+        raise write_quest.Rejected(f"a campaign needs {fewest} to {most} acts here")
+    found, previous = [], None
+    for act in acts:
+        if not isinstance(act, dict):
+            raise write_quest.Rejected("each act needs a level band, an intent, a thread and zones")
+        low, high = band(act.get("level_band"))
+        if previous is not None and low not in (previous, previous + 1):
+            raise write_quest.Rejected("acts must follow one another without gaps or overlaps")
+        previous = high
+        intent = " ".join(str(act.get("intent", "")).split())
+        thread = " ".join(str(act.get("thread", "")).split())
+        if not intent or len(intent) > 300 or not thread or len(thread) > 200:
+            raise write_quest.Rejected("each act needs one sentence of intent and the thread it leans on")
+        zones = act.get("zones") or []
+        if not isinstance(zones, list):
+            raise write_quest.Rejected("an act's zones are a list of names")
+        found.append({"level_band": f"{low}-{high}", "intent": intent, "thread": thread,
+                      "zones": [" ".join(str(z).split())[:40] for z in zones[:6]]})
+    first, last = band(found[0]["level_band"]), band(found[-1]["level_band"])
+    if not first[0] <= level <= first[1]:
+        raise write_quest.Rejected(f"the first act must contain the character's level, {level}")
+    if last[1] != MAX_LEVEL:
+        raise write_quest.Rejected(f"the last act must end at {MAX_LEVEL}")
+    return found
+
+
+def validate_reveals(reveals, first, last, fewest, most):
+    """Reveals pinned to acts numbered first..last (1-based). Raises write_quest.Rejected."""
+    if not isinstance(reveals, list) or not fewest <= len(reveals) <= most:
+        raise write_quest.Rejected(f"give {fewest} to {most} reveals")
+    found = []
+    for reveal in reveals:
+        act = reveal.get("act") if isinstance(reveal, dict) else None
+        text = " ".join(str(reveal.get("text", "")).split()) if isinstance(reveal, dict) else ""
+        if not isinstance(act, int) or not first <= act <= last or not text or len(text) > 300:
+            raise write_quest.Rejected(f"each reveal is one sentence pinned to an act from {first} to {last}")
+        found.append({"act": act, "text": text})
+    return found
+
+
+def validate_campaign(answer, level):
+    """Check the model's campaign and return it in stored form. Raises write_quest.Rejected."""
+    campaign = {}
+    for field, limit in (("premise", 500), ("question", 200), ("stake", 300)):
+        text = " ".join(str(answer.get(field, "")).split())
+        if not text or len(text) > limit:
+            raise write_quest.Rejected(f"campaign {field} is missing or over {limit} characters")
+        campaign[field] = text
+    campaign["acts"] = validate_acts(answer.get("acts"), level, 3, 5)
+    cast = answer.get("cast")
+    if not isinstance(cast, list) or not 3 <= len(cast) <= 6:
+        raise write_quest.Rejected("a campaign needs three to six key players")
+    campaign["cast"] = []
+    for member in cast:
+        name = " ".join(str(member.get("name", "")).split()) if isinstance(member, dict) else ""
+        role = " ".join(str(member.get("role", "")).split()) if isinstance(member, dict) else ""
+        if not name or len(name) > 80 or not role or len(role) > 200:
+            raise write_quest.Rejected("each key player needs a name and a role")
+        campaign["cast"].append({"name": name, "role": role})
+    campaign["reveals"] = validate_reveals(answer.get("reveals"), 1, len(campaign["acts"]), 2, 3)
+    campaign["dm_note"] = " ".join(str(answer.get("dm_note", "")).split())
+    campaign["canon_add"] = canon_facts(answer)
+    return campaign
+
+
+def loads(value):
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def campaign_text(campaign, heading):
+    """A campaign as plain text: the spine, each act marked done, current or later, the cast and the reveals."""
+    acts, current = loads(campaign["acts"]), campaign["current_act"]
+    lines = [heading, f"Premise: {campaign['premise']}", f"Question: {campaign['question']}",
+             f"Stake: {campaign['stake']}", "Acts:"]
+    for index, act in enumerate(acts):
+        state = BEAT_STATE[0] if index < current else BEAT_STATE[1] if index == current else BEAT_STATE[2]
+        lines.append(f"{index + 1}. [{state}] levels {act['level_band']}: {act['intent']} "
+                     f"(thread: {act['thread']}; zones: {', '.join(act['zones']) or 'any'})")
+        if act.get("outcome"):
+            lines.append(f"   Outcome: {act['outcome']}")
+    lines.append("Key players: " + "; ".join(f"{m['name']}, {m['role']}" for m in loads(campaign["cast"])))
+    lines.append("Reveals: " + "; ".join(f"act {r['act']}: {r['text']}" for r in loads(campaign["reveals"])))
+    return "\n".join(lines)
+
+
+def current_act_text(campaign):
+    """The campaign's current act and the reveals due in it, for a chapter call."""
+    acts, index = loads(campaign["acts"]), campaign["current_act"]
+    act = acts[index]
+    lines = [f"The campaign: {campaign['premise']} Its question: {campaign['question']}",
+             f"Current act ({index + 1} of {len(acts)}, levels {act['level_band']}): {act['intent']} "
+             f"Thread: {act['thread']}. Where it runs: {', '.join(act['zones']) or 'anywhere'}.",
+             "Key players: " + "; ".join(f"{m['name']}, {m['role']}" for m in loads(campaign["cast"]))]
+    due = [r["text"] for r in loads(campaign["reveals"]) if r["act"] == index + 1]
+    if due:
+        lines.append("Due to be learned in this act: " + " ".join(due))
+    return "\n".join(lines)
+
+
+def campaign_block(db, guid):
+    """The campaign in force, as briefly as a bounty prompt can carry it, or None."""
+    campaign = dm_state.active_campaign(db, guid)
+    if not campaign:
+        return None
+    act = loads(campaign["acts"])[campaign["current_act"]]
+    text = f"{campaign['premise']} Question: {campaign['question']} Now: {act['intent']}"
+    return "Your private campaign for this character (never state it to the player): " + clip_words(text, CAMPAIGN_WORDS)
+
+
+def act_left(campaign, level):
+    """Has the character levelled out of the campaign's current act, with another act to go to?"""
+    acts = loads(campaign["acts"])
+    return campaign["current_act"] < len(acts) - 1 and level > band(acts[campaign["current_act"]]["level_band"])[1]
+
+
+def campaign_message(db, who, books, seed):
+    known = dm_state.get_character(db, who["guid"])
+    lines = [f"Character: {world_query.describe(who)}, currently in {world_query.zone_name(who['zone'])}.", ""]
+    events = dm_state.events_since(db, who["guid"], 0, limit=30)
+    lines.append("What you know of them so far:")
+    lines += [f"- {event['text'].split(' [')[0]}" for event in events] or ["- nothing yet"]
+    if known and known["story_so_far"]:
+        lines += ["", "Story so far (your own summary):", known["story_so_far"]]
+    saga = saga_lines(db, who["guid"])
+    if saga:
+        lines += ["", "Arcs that have ended, oldest first:"] + saga
+    arc = dm_state.active_arc(db, who["guid"])
+    if arc:
+        lines += ["", arc_text(arc, "The arc in force, which runs to its end:")]
+    chapters = dm_state.chapters_of(db, who["guid"])
+    if chapters:
+        lines += ["", "Zone chapters so far:"]
+        lines += [f"- {world_query.zone_name(c['zone'])} ({c['status']}): {c['premise']}" for c in chapters]
+    others = dm_state.other_campaigns(db, who["guid"])
+    if others:
+        lines += ["", "Other characters' campaigns, one line each:"]
+        lines += [f"- {row['name']}: {clip_words(row['premise'], 30)}" for row in others]
+    lines += ["", "Capstone books this character's class can use (name, level needed):"]
+    lines += [f"- {book['name']}, level {book['required_level']}" for book in books] or ["- none"]
+    facts = canon_lines(db, who["guid"], who.get("zone"))
+    if facts:
+        lines += [""] + facts
+    turned_down = db.execute("SELECT reason FROM proposals WHERE guid = ? AND status = 'rejected' AND reason <> '' "
+                             "AND type = 'campaign' ORDER BY decided_at DESC LIMIT 2", (who["guid"],)).fetchall()
+    if turned_down:
+        lines += ["", "The server owner turned down your earlier campaigns for this character, saying:"]
+        lines += [f"- {row['reason']}" for row in turned_down]
+    if seed:
+        lines += ["", f"Direction from the server owner: {seed}"]
+    return "\n".join(lines)
+
+
+def propose_campaign(db, who, seed, say):
+    """Ask the model for a campaign and store it as a proposal. Returns the proposal number."""
+    books = world_query.reward_items(who, reach=MAX_LEVEL, limit=40)
+    answer, usage = llm.ask_for_tool_call(CAMPAIGN_SYSTEM, campaign_message(db, who, books, seed), CAMPAIGN_TOOL,
+                                          max_tokens=4096, model=llm.plan_model())
+    campaign = validate_campaign(answer, who["level"])
+    campaign["seed"] = seed or ""
+    db.execute("INSERT INTO proposals (ts, guid, name, type, payload, dm_note, model, tokens_in, tokens_out) "
+               "VALUES (?, ?, ?, 'campaign', ?, ?, ?, ?, ?)",
+               (dm_state.now(), who["guid"], who["name"], json.dumps(campaign), campaign["dm_note"],
+                usage.get("model"), usage.get("input_tokens"), usage.get("output_tokens")))
+    number = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    say(f"  {who['name']}: campaign proposal {number} written{plan_note('campaign', campaign['question'])}")
+    return number
+
+
+def act_review_message(db, who, campaign):
+    index = campaign["current_act"]
+    lines = [f"Character: {world_query.describe(who)}, currently in {world_query.zone_name(who['zone'])}.", "",
+             campaign_text(campaign, "The campaign:"), "",
+             f"Act {index + 1} has just ended. The first remaining act is act {index + 2}.", "",
+             "What happened during it:"]
+    since = campaign["updated_at"] or 0
+    quests = db.execute("SELECT * FROM quests WHERE guid = ? AND issued_at >= ? ORDER BY issued_at",
+                        (who["guid"], since)).fetchall()
+    for quest in quests:
+        lines.append(f"- Bounty \"{quest['title']}\": {quest['story_beat']} "
+                     + (quest["circumstances"] or f"Status: {quest['status']}."))
+    for arc in db.execute("SELECT * FROM arcs WHERE guid = ? AND ended_at >= ? ORDER BY id", (who["guid"], since)):
+        lines.append(f"- An arc against {arc['adversary']} ended ({arc['end_reason']})"
+                     + (f": {arc['outcome']}" if arc["outcome"] else "."))
+    for chapter in db.execute("SELECT * FROM chapters WHERE guid = ? AND updated_at >= ? ORDER BY id",
+                              (who["guid"], since)):
+        lines.append(f"- The chapter in {world_query.zone_name(chapter['zone'])} is {chapter['status']}: "
+                     f"{chapter['premise']}")
+    events = [e for e in dm_state.events_since(db, who["guid"], since, limit=30) if e["kind"] != "overseer"]
+    lines += [f"- {event['text'].split(' [')[0]}" for event in events]
+    if len(lines) and lines[-1] == "What happened during it:":
+        lines.append("- nothing the Overseer saw")
+    known = dm_state.get_character(db, who["guid"])
+    if known and known["story_so_far"]:
+        lines += ["", "Story so far (your own summary):", known["story_so_far"]]
+    facts = canon_lines(db, who["guid"], who.get("zone"))
+    if facts:
+        lines += [""] + facts
+    return "\n".join(lines)
+
+
+def propose_act_review(db, who, campaign, say):
+    """Ask the model to review the act the character has levelled out of. Returns the proposal number."""
+    answer, usage = llm.ask_for_tool_call(ACT_REVIEW_SYSTEM, act_review_message(db, who, campaign), ACT_REVIEW_TOOL,
+                                          max_tokens=4096, model=llm.plan_model())
+    index = campaign["current_act"]
+    outcome = " ".join(str(answer.get("outcome", "")).split())
+    if not outcome or len(outcome) > 500:
+        raise write_quest.Rejected("the act review needs an outcome of at most 500 characters")
+    remaining = validate_acts(answer.get("remaining_acts"), who["level"], 1, 4)
+    first = index + 2
+    review = {"campaign": campaign["id"], "act": index, "outcome": outcome, "remaining_acts": remaining,
+              "reveals": validate_reveals(answer.get("reveals") or [], first, first + len(remaining) - 1, 0, 3),
+              "dm_note": " ".join(str(answer.get("dm_note", "")).split()), "canon_add": canon_facts(answer)}
+    db.execute("INSERT INTO proposals (ts, guid, name, type, payload, dm_note, model, tokens_in, tokens_out) "
+               "VALUES (?, ?, ?, 'act_review', ?, ?, ?, ?, ?)",
+               (dm_state.now(), who["guid"], who["name"], json.dumps(review), review["dm_note"], usage.get("model"),
+                usage.get("input_tokens"), usage.get("output_tokens")))
+    number = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    say(f"  {who['name']}: act {index + 1} is over; review proposal {number} written")
+    return number
+
+
+def apply_act_review(campaign, review):
+    """The campaign's acts and reveals after a review: finished acts kept with the outcome, the rest replaced."""
+    acts, index = loads(campaign["acts"]), review["act"]
+    acts[index] = dict(acts[index], outcome=review["outcome"])
+    kept = [r for r in loads(campaign["reveals"]) if r["act"] <= index + 1]
+    return acts[:index + 1] + review["remaining_acts"], kept + review["reveals"]
 
 
 def clip_words(text, limit):
@@ -897,6 +1246,9 @@ def chapter_message(db, who, dossier):
     known = dm_state.get_character(db, who["guid"])
     lines = [f"Character: {world_query.describe(who)}, settled in {zone}.", "",
              "The zone's own story, from its stock quests:", world_query.dossier_text(dossier), ""]
+    campaign = dm_state.active_campaign(db, who["guid"])
+    if campaign:
+        lines += ["Direction, from the campaign (follow it):", current_act_text(campaign), ""]
     earlier = dm_state.chapters_of(db, who["guid"])
     if earlier:
         lines.append("Earlier chapters for this character, oldest first:")
@@ -1165,17 +1517,48 @@ def propose(db, who, say):
 def approve_proposal(db, row, say):
     """Carry out one pending proposal. Raises ApproveFailed if nothing was done."""
     stamp = dm_state.now()
+    if row["type"] == "campaign":
+        campaign = json.loads(row["payload"])
+        db.execute("UPDATE campaigns SET status = 'replaced', updated_at = ? WHERE guid = ? AND status = 'active'",
+                   (stamp, row["guid"]))
+        db.execute("INSERT INTO campaigns (guid, premise, question, stake, acts, cast, reveals, seed, model, "
+                   "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   (row["guid"], campaign["premise"], campaign["question"], campaign["stake"],
+                    json.dumps(campaign["acts"]), json.dumps(campaign["cast"]), json.dumps(campaign["reveals"]),
+                    campaign.get("seed", ""), row["model"], stamp, stamp))
+        campaign_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        establish(db, row["guid"], None, None, campaign.get("canon_add"), f"campaign {campaign_id}")
+        db.execute("UPDATE proposals SET status = 'approved', decided_at = ? WHERE id = ?", (stamp, row["id"]))
+        db.commit()
+        say(f"campaign for {row['name']} is now in force.")
+        return
+    if row["type"] == "act_review":
+        review = json.loads(row["payload"])
+        campaign = dm_state.active_campaign(db, row["guid"])
+        if not campaign or campaign["id"] != review["campaign"] or campaign["current_act"] != review["act"]:
+            raise ApproveFailed("the campaign has changed since this review was written; reject it and the "
+                                "next tick will write another")
+        acts, reveals = apply_act_review(campaign, review)
+        db.execute("UPDATE campaigns SET acts = ?, reveals = ?, current_act = ?, updated_at = ? WHERE id = ?",
+                   (json.dumps(acts), json.dumps(reveals), review["act"] + 1, stamp, campaign["id"]))
+        establish(db, row["guid"], None, None, review.get("canon_add"), f"campaign {campaign['id']}")
+        db.execute("UPDATE proposals SET status = 'approved', decided_at = ? WHERE id = ?", (stamp, row["id"]))
+        db.commit()
+        say(f"{row['name']}'s campaign has moved on to act {review['act'] + 2}.")
+        return
     if row["type"] == "chapter":
         chapter = json.loads(row["payload"])
         in_force = dm_state.active_chapter(db, row["guid"])
         if in_force:
             dm_state.set_chapter_status(db, in_force, "paused")
+        campaign = dm_state.active_campaign(db, row["guid"])
         db.execute("INSERT INTO chapters (guid, zone, premise, local_cast, adversary, adversary_creature, seeds, "
-                   "finale, finale_creature, hooks, model, created_at, updated_at) "
-                   "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   "finale, finale_creature, hooks, campaign_act, model, created_at, updated_at) "
+                   "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                    (row["guid"], chapter["zone"], chapter["premise"], json.dumps(chapter["local_cast"]),
                     chapter["adversary"], chapter["adversary_creature"], json.dumps(chapter["seeds"]),
-                    chapter["finale"], chapter["finale_creature"], chapter["hooks"], row["model"], stamp, stamp))
+                    chapter["finale"], chapter["finale_creature"], chapter["hooks"],
+                    campaign["current_act"] if campaign else None, row["model"], stamp, stamp))
         chapter_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
         establish(db, row["guid"], chapter["zone"], None, chapter.get("canon_add"), f"chapter {chapter_id}")
         db.execute("UPDATE proposals SET status = 'approved', decided_at = ? WHERE id = ?", (stamp, row["id"]))
@@ -1316,10 +1699,35 @@ def tick(db, say=print):
             if arc and not dm_state.open_quest(db, who["guid"]) and arc_outgrown(arc, who["level"]):
                 dm_state.end_arc(db, arc, "outgrown")
                 say(f"  {who['name']}: outgrew {arc_called(arc)}; a new one will be planned")
+            # The campaign is written first, and reviewed whenever the character levels out of an act.
+            # Neither holds up an arc or a bounty already under way; a chapter waits for them.
+            campaign = dm_state.active_campaign(db, who["guid"])
+            planning = None
+            if not campaign:
+                planning = "campaign"
+                if not dm_state.pending_proposal(db, who["guid"], "campaign"):
+                    if dm_state.proposals_in_last_hour(db) >= ceiling:
+                        say("  hourly ceiling on model calls reached; no more proposals this tick")
+                        break
+                    if settle(db, propose_campaign(db, who, None, say), say):
+                        planning = None
+                    db.commit()
+            elif act_left(campaign, who["level"]):
+                planning = "act_review"
+                if not dm_state.pending_proposal(db, who["guid"], "act_review"):
+                    if dm_state.proposals_in_last_hour(db) >= ceiling:
+                        say("  hourly ceiling on model calls reached; no more proposals this tick")
+                        break
+                    if settle(db, propose_act_review(db, who, campaign, say), say):
+                        planning = None
+                    db.commit()
             # A chapter follows the character to wherever they settle.
             dossier = follow_zone(db, who, say)
             if dossier:
-                if dm_state.pending_proposal(db, who["guid"], "chapter"):
+                if planning:
+                    what = "campaign" if planning == "campaign" else "act review"
+                    say(f"  {who['name']}: the chapter for {world_query.zone_name(who['zone'])} waits for the {what}")
+                elif dm_state.pending_proposal(db, who["guid"], "chapter"):
                     say(f"  {who['name']}: a chapter for {world_query.zone_name(who['zone'])} is waiting for approval")
                 elif dm_state.proposals_in_last_hour(db) >= ceiling:
                     say("  hourly ceiling on model calls reached; no more proposals this tick")
@@ -1384,6 +1792,29 @@ def show_proposal(db, row, reveal=False):
     if row["type"] in sealed() and not reveal:
         print(f"\n=== Proposal {row['id']}: {row['type'].upper()} for {row['name']}  "
               f"({dm_state.ago(row['ts'])} ago, {row['status']}): sealed; --reveal to read it ===")
+        return
+    if row["type"] == "campaign":
+        campaign = dict(json.loads(row["payload"]), current_act=0)
+        print(f"\n=== Proposal {row['id']}: CAMPAIGN for {row['name']}  ({dm_state.ago(row['ts'])} ago, {row['status']}) ===")
+        print(campaign_text(campaign, "A private plan for this character's whole life. The largest spoiler there is."))
+        if campaign.get("seed"):
+            print(f"Your direction: {campaign['seed']}")
+        for fact in campaign.get("canon_add") or []:
+            print(f"Establishes: {fact}")
+        print(f"Model's note: {row['dm_note']}   [{row['model']}, tokens {row['tokens_in']}/{row['tokens_out']}]")
+        return
+    if row["type"] == "act_review":
+        review = json.loads(row["payload"])
+        print(f"\n=== Proposal {row['id']}: ACT REVIEW for {row['name']}  ({dm_state.ago(row['ts'])} ago, "
+              f"{row['status']}) ===")
+        print(f"Act {review['act'] + 1} ended: {review['outcome']}\nWhat remains:")
+        for number, act in enumerate(review["remaining_acts"], review["act"] + 2):
+            print(f"{number}. levels {act['level_band']}: {act['intent']} (thread: {act['thread']})")
+        for reveal in review["reveals"]:
+            print(f"Reveal, act {reveal['act']}: {reveal['text']}")
+        for fact in review.get("canon_add") or []:
+            print(f"Establishes: {fact}")
+        print(f"Model's note: {row['dm_note']}   [{row['model']}, tokens {row['tokens_in']}/{row['tokens_out']}]")
         return
     if row["type"] == "chapter":
         chapter = dict(json.loads(row["payload"]), current_seed=0)
@@ -1513,6 +1944,41 @@ def cmd_arc(db, args):
     print("\n" + arc_text(arc, "In force:"))
     if arc["seed"]:
         print(f"Your direction: {arc['seed']}")
+
+
+def cmd_campaign(db, args):
+    """Show a character's campaign, or have a new one written from a direction of yours."""
+    if args.seed:
+        who = world_query.character(args.character)
+        if not who:
+            sys.exit(f"dm: no character named {args.character}")
+        if not dm_state.get_character(db, who["guid"]):
+            sys.exit("dm: the Overseer has not noticed this character yet; run a tick while they are online")
+        waiting = dm_state.pending_proposal(db, who["guid"], "campaign")
+        if waiting:
+            sys.exit(f"dm: campaign proposal {waiting['id']} is already waiting; approve or reject it first")
+        try:
+            settle(db, propose_campaign(db, who, args.seed, print), print)
+        except (write_quest.Rejected, llm.LLMError) as error:
+            sys.exit(f"dm: no campaign written: {error}")
+        db.commit()
+        return
+    row, _held = whose_story(db, args.character)
+    if not row:
+        sys.exit(f"dm: the Overseer has not noticed anyone called {args.character}")
+    campaign = dm_state.active_campaign(db, row["guid"])
+    if not campaign:
+        print(f"{row['name']} has no campaign yet. One is written on the next tick, or give a direction with --seed.")
+        return
+    acts = loads(campaign["acts"])
+    if "campaign" in sealed() and not args.reveal:
+        print(f"{row['name']}: a campaign of {len(acts)} acts, now in act {campaign['current_act'] + 1}. "
+              "Campaigns are sealed; --reveal to read it.")
+        return
+    print(f"=== Campaign for {row['name']} (the largest spoiler there is if you play this character) ===\n")
+    print(campaign_text(campaign, f"Written {dm_state.ago(campaign['created_at'])} ago:"))
+    if campaign["seed"]:
+        print(f"Your direction: {campaign['seed']}")
 
 
 def cmd_chapter(db, args):
@@ -1720,7 +2186,7 @@ def cmd_context(db, args):
     hidden = set() if args.reveal else sealed()
     print(write_quest.user_message(context, None,
                                    story=story_section(db, context["character"], context["givers"], hidden)))
-    if hidden & {"arc", "chapter"}:
+    if hidden & {"arc", "chapter", "campaign"}:
         print("\n(sealed plans are left out above; the model is shown them. --reveal to read them.)")
 
 
@@ -1886,6 +2352,11 @@ def main():
     arc.add_argument("--seed", metavar="TEXT", help="a direction; a new arc is written around it")
     arc.add_argument("--reveal", action="store_true", help="read it even if arcs are sealed")
     arc.set_defaults(run=cmd_arc)
+    campaign = commands.add_parser("campaign", help="show a character's campaign, or have one written (a spoiler)")
+    campaign.add_argument("character")
+    campaign.add_argument("--seed", metavar="TEXT", help="a direction; a new campaign is written around it")
+    campaign.add_argument("--reveal", action="store_true", help="read it even if campaigns are sealed")
+    campaign.set_defaults(run=cmd_campaign)
     chapter = commands.add_parser("chapter", help="show a character's zone chapters (a spoiler)")
     chapter.add_argument("character")
     chapter.add_argument("--reveal", action="store_true", help="read them even if chapters are sealed")

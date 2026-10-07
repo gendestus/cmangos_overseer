@@ -1457,6 +1457,23 @@ CHAPTER = {
     "hooks": "The money came from Stormwind.", "dm_note": "the zone's own story", "canon_add": [],
 }
 
+CAMPAIGN = {
+    "premise": "A paladin who obeys too readily. The Overseer wants to see what he does when the orders are wrong.",
+    "question": "Will he serve the Light or the men who speak for it?", "stake": "A servant who chooses.",
+    "acts": [{"level_band": "3-15", "intent": "He learns the bandits are paid from inside the city.",
+              "thread": "the Defias and the Stonemasons' debt", "zones": ["Westfall", "Redridge Mountains"]},
+             {"level_band": "16-30", "intent": "He finds the Light's own officers looking away.",
+              "thread": "Stormwind's court", "zones": ["Duskwood"]},
+             {"level_band": "31-60", "intent": "He must choose whom to obey.", "thread": "Onyxia in the court",
+              "zones": ["Stormwind City", "Burning Steppes"]}],
+    "cast": [{"name": "Gryan Stoutmantle", "role": "the honest militiaman"},
+             {"name": "Lady Katrana Prestor", "role": "the voice in the king's ear"},
+             {"name": "the Defias Brotherhood", "role": "the debt come due"}],
+    "reveals": [{"act": 1, "text": "The Defias were stonemasons the city never paid."},
+                {"act": 3, "text": "Prestor is not what she seems."}],
+    "dm_note": "obedience is his flaw", "canon_add": [],
+}
+
 
 class ZoneDossier(unittest.TestCase):
     def test_titles_are_deduplicated_and_every_list_is_limited(self):
@@ -1628,7 +1645,10 @@ class Chapters(unittest.TestCase):
             messages.append((tool["name"], message))
             return real(system, message, tool, **kwargs)
 
-        env = {"DM_LLM_PROVIDER": "stub", "DM_LLM_STUB": stub, "DM_AUTO_APPROVE": "chapter,arc"}
+        if not os.path.exists(os.path.join(stub, "submit_campaign.json")):
+            with open(os.path.join(stub, "submit_campaign.json"), "w") as handle:
+                json.dump(CAMPAIGN, handle)
+        env = {"DM_LLM_PROVIDER": "stub", "DM_LLM_STUB": stub, "DM_AUTO_APPROVE": "campaign,act_review,chapter,arc"}
         with mock.patch.dict(os.environ, env), mock.patch.object(dm.llm, "ask_for_tool_call", ask), \
                 mock.patch.object(console, "paused", return_value=None), mock.patch.object(console, "run"), \
                 mock.patch.object(world_query, "online_characters", return_value=[who]), \
@@ -1642,7 +1662,7 @@ class Chapters(unittest.TestCase):
             for _ in range(count):
                 dm.tick(db, say=lambda _line: None)
 
-    def test_settling_writes_a_chapter_and_the_next_arc_plays_its_first_seed(self):
+    def test_first_notice_writes_a_campaign_then_settling_a_chapter_then_an_arc_from_its_first_seed(self):
         db = self.fresh()
         stub = tempfile.mkdtemp()
         for name, answer in (("submit_chapter", CHAPTER),
@@ -1654,11 +1674,16 @@ class Chapters(unittest.TestCase):
         messages = []
         who = self.who()
         self.run_ticks(db, who, 2, stub, messages)
-        self.assertEqual(messages, [])                              # not settled yet: no plan, no call
+        self.assertEqual([name for name, _ in messages], ["submit_campaign"])     # not settled yet: no chapter
+        self.assertIsNotNone(dm_state.active_campaign(db, 1))
+        messages.clear()
         self.run_ticks(db, who, 1, stub, messages)
         self.assertEqual([name for name, _ in messages], ["submit_chapter", "submit_arc"])
         self.assertIn("Gryan Stoutmantle", messages[0][1])          # the chapter was shown the dossier
+        self.assertIn("He learns the bandits are paid from inside the city.", messages[0][1])   # and the act
+        self.assertIn("Due to be learned in this act: The Defias were stonemasons", messages[0][1])
         self.assertIn("Build this arc from seed 1: Learn who pays the bandits.", messages[1][1])
+        self.assertIn("Your private campaign for this character", messages[1][1])
         chapter, arc = dm_state.active_chapter(db, 1), dm_state.active_arc(db, 1)
         self.assertEqual((arc["chapter"], arc["chapter_seed"], arc["adversary_creature"]), (chapter["id"], 0, 95))
         self.assertEqual(chapter["current_seed"], 1)
@@ -1675,6 +1700,7 @@ class Chapters(unittest.TestCase):
         messages = []
         self.run_ticks(db, who, 1, stub, messages)
         self.assertEqual(db.execute("SELECT end_reason FROM chapters").fetchone()[0], "seeds")
+        messages.clear()                                            # the campaign was written in that tick
         self.run_ticks(db, who, 1, stub, messages)
         self.assertEqual(messages[0][0], "submit_chapter")          # then an arc from the sequel's first seed
         self.assertIn("this one is its sequel", messages[0][1])
@@ -1751,10 +1777,139 @@ class Sealing(unittest.TestCase):
             self.assertIn(secret, model)
         self.assertIn("[the arc in force is sealed]", owner)
 
+    def test_a_sealed_campaign_is_not_printed(self):
+        self.db.execute("INSERT INTO proposals (ts, guid, name, type, payload) VALUES (1, 1, 'Zachadin', 'campaign', ?)",
+                        (json.dumps(dm.validate_campaign(CAMPAIGN, 3)),))
+        dm.approve_proposal(self.db, self.db.execute("SELECT * FROM proposals").fetchone(), lambda _line: None)
+        with mock.patch.dict(os.environ, {"DM_SEALED": "campaign"}):
+            hidden = self.printed(dm.cmd_campaign, character="Zachadin", seed=None, reveal=False)
+            shown = self.printed(dm.cmd_campaign, character="Zachadin", seed=None, reveal=True)
+            owner = dm.story_section(self.db, self.who, (), dm.sealed())
+        self.assertIn("a campaign of 3 acts, now in act 1", hidden)
+        self.assertNotIn("Prestor", hidden)
+        self.assertIn("Prestor", shown)
+        self.assertIn("[the campaign is sealed]", owner)
+
     def test_the_tick_log_does_not_name_a_sealed_arcs_adversary(self):
         self.assertEqual(dm.arc_called({"adversary": "the Defias"}), "the arc")
         with mock.patch.dict(os.environ, {"DM_SEALED": ""}):
             self.assertEqual(dm.arc_called({"adversary": "the Defias"}), "the arc against the Defias")
+
+
+class Campaigns(unittest.TestCase):
+    def fresh(self):
+        os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
+        db = dm_state.connect()
+        self.addCleanup(db.close)
+        return db
+
+    def acts(self, *bands):
+        return [{"level_band": b, "intent": "Something changes.", "thread": "a thread", "zones": []} for b in bands]
+
+    def test_a_good_campaign_is_stored(self):
+        campaign = dm.validate_campaign(CAMPAIGN, 3)
+        self.assertEqual([act["level_band"] for act in campaign["acts"]], ["3-15", "16-30", "31-60"])
+        self.assertEqual(len(campaign["reveals"]), 2)
+
+    def test_acts_run_from_the_current_level_to_60_without_gaps(self):
+        for bands, level in ((("3-15", "16-30"), 3),                    # two acts
+                             (("3-15", "18-30", "31-60"), 3),           # a gap
+                             (("3-15", "12-30", "31-60"), 3),           # an overlap
+                             (("5-15", "16-30", "31-60"), 3),           # does not contain the level
+                             (("3-15", "16-30", "31-58"), 3),           # does not reach 60
+                             (("3-15", "16-30", "31-60x"), 3)):         # not a band
+            with self.assertRaises(write_quest.Rejected, msg=str(bands)):
+                dm.validate_campaign(dict(CAMPAIGN, acts=self.acts(*bands)), level)
+        self.assertEqual(len(dm.validate_campaign(dict(CAMPAIGN, acts=self.acts("1-15", "15-30", "30-60")), 15)["acts"]), 3)
+
+    def test_reveals_are_pinned_to_acts_that_exist(self):
+        with self.assertRaises(write_quest.Rejected):
+            dm.validate_campaign(dict(CAMPAIGN, reveals=[{"act": 4, "text": "x"}, {"act": 1, "text": "y"}]), 3)
+        with self.assertRaises(write_quest.Rejected):
+            dm.validate_campaign(dict(CAMPAIGN, cast=CAMPAIGN["cast"][:2]), 3)
+
+    def approve(self, db, kind, payload):
+        db.execute("INSERT INTO proposals (ts, guid, name, type, payload) VALUES (1, 1, 'Zachadin', ?, ?)",
+                   (kind, json.dumps(payload)))
+        dm.approve_proposal(db, db.execute("SELECT * FROM proposals ORDER BY id DESC LIMIT 1").fetchone(),
+                            lambda _line: None)
+
+    def test_an_act_is_left_when_the_level_passes_its_band(self):
+        db = self.fresh()
+        self.approve(db, "campaign", dm.validate_campaign(CAMPAIGN, 3))
+        campaign = dm_state.active_campaign(db, 1)
+        self.assertFalse(dm.act_left(campaign, 15))
+        self.assertTrue(dm.act_left(campaign, 16))
+        db.execute("UPDATE campaigns SET current_act = 2")
+        self.assertFalse(dm.act_left(dm_state.active_campaign(db, 1), 60))     # the last act is never left
+
+    def test_a_review_records_the_outcome_and_rewrites_only_what_remains(self):
+        db = self.fresh()
+        dm_state.save_character(db, dict(CONTEXT["character"], level=16, zone=40), [], [], [], first=True)
+        self.approve(db, "campaign", dm.validate_campaign(CAMPAIGN, 3))
+        campaign = dm_state.active_campaign(db, 1)
+        stub = os.path.join(tempfile.mkdtemp(), "review.json")
+        with open(stub, "w") as handle:
+            json.dump({"outcome": "He refused the order and kept the ledger.",
+                       "remaining_acts": [{"level_band": "16-40", "intent": "He is hunted for the ledger.",
+                                           "thread": "the Defias", "zones": ["Duskwood"]},
+                                          {"level_band": "41-60", "intent": "He decides who reads it.",
+                                           "thread": "the court", "zones": []}],
+                       "reveals": [{"act": 3, "text": "The ledger names Prestor."}], "dm_note": "turned"}, handle)
+        who = dict(CONTEXT["character"], level=16, zone=40)
+        with mock.patch.dict(os.environ, {"DM_LLM_PROVIDER": "stub", "DM_LLM_STUB": stub}):
+            number = dm.propose_act_review(db, who, campaign, lambda _line: None)
+        dm.approve_proposal(db, db.execute("SELECT * FROM proposals WHERE id = ?", (number,)).fetchone(),
+                            lambda _line: None)
+        after = dm_state.active_campaign(db, 1)
+        acts = json.loads(after["acts"])
+        self.assertEqual(after["current_act"], 1)
+        self.assertEqual([a["level_band"] for a in acts], ["3-15", "16-40", "41-60"])
+        self.assertEqual(acts[0]["outcome"], "He refused the order and kept the ledger.")
+        self.assertEqual([r["act"] for r in json.loads(after["reveals"])], [1, 3])
+        self.assertEqual(after["premise"], CAMPAIGN["premise"])
+
+    def test_a_review_written_against_an_older_campaign_is_refused(self):
+        db = self.fresh()
+        self.approve(db, "campaign", dm.validate_campaign(CAMPAIGN, 3))
+        db.execute("UPDATE campaigns SET current_act = 1")
+        with self.assertRaises(dm.ApproveFailed):
+            self.approve(db, "act_review", {"campaign": 1, "act": 0, "outcome": "x", "remaining_acts": [], "reveals": []})
+
+    def test_the_bounty_prompt_carries_a_short_campaign_block(self):
+        db = self.fresh()
+        self.approve(db, "campaign", dict(dm.validate_campaign(CAMPAIGN, 3), premise="word " * 100))
+        block = dm.campaign_block(db, 1)
+        self.assertLessEqual(len(block.split(": ", 1)[1].split()), dm.CAMPAIGN_WORDS + 1)
+        self.assertNotIn("Prestor", block)                  # the cast and the reveals stay out of a bounty
+
+    def test_a_waiting_campaign_holds_back_a_chapter_but_not_a_bounty(self):
+        db = self.fresh()
+        stub = tempfile.mkdtemp()
+        with open(os.path.join(stub, "submit_campaign.json"), "w") as handle:
+            json.dump(CAMPAIGN, handle)
+        who = dict(CONTEXT["character"], zone=40, map=0, x=0, y=0, online=1)
+        db.execute("INSERT INTO arcs (guid, adversary, beats) VALUES (1, 'kobolds', ?)",
+                   (json.dumps([{"level_band": "3-9", "intent": "x"}]),))
+        said, bounties = [], []
+        env = {"DM_LLM_PROVIDER": "stub", "DM_LLM_STUB": stub, "DM_AUTO_APPROVE": "letter"}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(console, "paused", return_value=None), mock.patch.object(console, "run"), \
+                mock.patch.object(world_query, "online_characters", return_value=[who]), \
+                mock.patch.object(world_query, "parties", return_value={}), \
+                mock.patch.object(world_query, "dm_quest_progress", return_value=[]), \
+                mock.patch.object(world_query, "rewarded_quests", return_value={}), \
+                mock.patch.object(world_query, "borrowed_capstones", return_value={}), \
+                mock.patch.object(world_query, "reward_items", return_value=[]), \
+                mock.patch.object(world_query, "zone_dossier", lambda zone, side: dict(DOSSIER, side=side)), \
+                mock.patch.object(dm, "propose", lambda db, who, say: bounties.append(who) or 999), \
+                mock.patch.object(dm, "settle", lambda db, number, say: False):
+            for _ in range(3):
+                dm.tick(db, say=said.append)
+        self.assertEqual(db.execute("SELECT type FROM proposals").fetchall()[0][0], "campaign")
+        self.assertEqual(len(db.execute("SELECT * FROM proposals").fetchall()), 1)      # one campaign, no chapter
+        self.assertTrue(any("waits for the campaign" in line for line in said))
+        self.assertEqual(len(bounties), 3)                  # the arc in force kept the bounties coming
 
 
 if __name__ == "__main__":

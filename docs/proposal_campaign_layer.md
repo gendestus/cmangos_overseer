@@ -1,6 +1,6 @@
 # Proposal: campaign and zone chapters
 
-Status: proposed 2026-10-07. Canon (4.5), dossier and chapters (4.2 to 4.4) and sealing (4.7) built 2026-10-07. A storytelling change; no new game mechanics.
+Status: proposed and built 2026-10-07: canon (4.5), dossier and chapters (4.2 to 4.4), sealing (4.7), then campaigns and act review (4.1, 4.8). A storytelling change; no new game mechanics.
 Audience: whoever implements it (currently Claude Code).
 Reference: the query in 4.2 is `world_query.zone_dossier`. It also filters by side (`RequiredRaces`), which the first prototype did not: unfiltered, an Alliance character in Hillsbrad would have been shown mostly Horde quests.
 
