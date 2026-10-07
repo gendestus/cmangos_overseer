@@ -14,6 +14,10 @@
     python3 dm.py voice McBride        one herald's facts, own lines and note
     python3 dm.py voice 197 "text"     write or replace a note, and pin it
     python3 dm.py voice 197 --forget   clear it; the next bounty through them settles a new one
+    python3 dm.py canon                every fact the story has established
+    python3 dm.py canon Zachadin       one character's facts, and the server-wide ones
+    python3 dm.py canon --add "text"   state a fact yourself (--zone, --creature to tag it)
+    python3 dm.py canon --retire 12    withdraw a fact; no prompt is shown it again
     python3 dm.py pause "why"          the kill switch: nothing reaches the game
     python3 dm.py resume               undo it
     python3 dm.py purge                take every DM quest back out of the game
@@ -83,6 +87,8 @@ Continuity:
 - Other named characters in these notes are real players. When someone helped this character, was helped by them, or claimed a bounty meant for them, use it: the Overseer notices alliances and debts. Name them plainly in the text. Never invent a player.
 - You may have a private arc for this character (shown below when there is one). Each bounty should serve its current beat: nudge toward the lure, bring the adversary closer, foreshadow the signature reward. Do it through what the herald says and what is hunted. Never state the plan to the player. If nothing nearby fits the beat, keep the thread alive in the text.
 - beat_progress: "advance" if this bounty begins the next beat because the character has done enough or outgrown the level band, "hold" to stay on the current beat, "detour" if this bounty steps aside from the arc because of something the character did, "conclude" if this bounty is the arc's finale. Use "conclude" only on the last beat: turning it in ends the arc, so make it a payoff or a twist, and offer the signature reward if it is on the reward list. With no arc, answer "hold".
+- Established facts are shown below when there are any. Never contradict one. A fact about another character is true in their story too: build on it when it fits, but do not take it over.
+- canon_add: up to two facts this bounty establishes, each one sentence of at most 25 words, in the world's terms. Facts, not plans: "Deputy Willem knows the kobolds were paid", never "the Overseer intends". Leave it empty when the bounty establishes nothing new.
 - story_beat: one sentence, past tense, the Overseer's view of what this bounty adds to the story.
 - story_so_far: rewrite the running summary in at most 120 words: who this character is becoming in the Overseer's eyes, what has happened, and one or two open threads. It is your only memory next time, so keep what matters and drop what does not."""
 
@@ -96,6 +102,10 @@ TOOL["input_schema"]["properties"]["story_so_far"] = {
 TOOL["input_schema"]["properties"]["beat_progress"] = {
     "type": "string", "enum": ["advance", "hold", "detour", "conclude"],
     "description": "How this bounty relates to the arc's current beat."}
+CANON_ADD = {
+    "type": "array", "maxItems": 2, "items": {"type": "string"},
+    "description": "Up to two facts this establishes, one sentence of at most 25 words each. Facts, not plans."}
+TOOL["input_schema"]["properties"]["canon_add"] = CANON_ADD
 TOOL["input_schema"]["required"] += ["story_beat", "story_so_far", "beat_progress"]
 
 ARC_SYSTEM = """You are the Overseer, an unseen dungeon master for a small private World of Warcraft (1.12) server with one to three players. You are deciding in secret what you want to make of one character next.
@@ -110,6 +120,8 @@ Write a mini-arc: a short private plan that covers only the next few levels, abo
 - previous_outcome: if an earlier arc has just ended, one or two sentences on how it actually ended, judged from the record of its bounties and not from how it was planned. Otherwise an empty string.
 - If earlier arcs exist, this one must follow from their outcomes. Do not repeat an adversary unless the story calls for a return. A turn is welcome: an ally revealed as a rival, a victory with a cost, a temptation refused.
 - If the server owner gives a direction, build the arc around it.
+- Established facts are shown when there are any. Never contradict one.
+- canon_add: up to two facts this arc's premise takes as true about the world, one sentence of at most 25 words each. Facts, not plans: "the Defias are paid from inside Stormwind", never "the character will learn". Usually empty.
 
 This plan is never shown to the player.
 
@@ -138,6 +150,7 @@ ARC_TOOL = {
             "signature_reward": {"type": "string", "description": "A book name from the list, or an empty string."},
             "previous_outcome": {"type": "string", "description": "How the arc that just ended actually ended, or an empty string."},
             "dm_note": {"type": "string", "description": "One sentence for the log: why this arc for this character."},
+            "canon_add": CANON_ADD,
         },
         "required": ["premise", "lure", "adversary", "beats", "signature_reward", "previous_outcome", "dm_note"],
     },
@@ -146,6 +159,7 @@ ARC_TOOL = {
 ARC_REACH = 10          # an arc's bands and its signature reward stay within this many levels of the character
 
 BEAT_STATE = ("done", "current", "later")
+CANON_PER_ANSWER = 2    # facts one piece of writing may establish
 
 
 class ApproveFailed(Exception):
@@ -399,8 +413,34 @@ def observe_letters(db, say):
 
 # ---- remember and propose ---------------------------------------------------
 
-def story_section(db, who):
-    """Everything the model needs to carry the story forward for one character."""
+def canon_facts(answer):
+    """The facts a model answer wants established, cleaned. Empty or overlong ones are dropped, not fatal."""
+    found = answer.get("canon_add") or []
+    if not isinstance(found, list):
+        return []
+    facts = [dm_state.clean_fact(fact) for fact in found]
+    return [fact for fact in facts if fact][:CANON_PER_ANSWER]
+
+
+def canon_lines(db, guid, zone=None, creatures=()):
+    """The established facts a prompt is shown, newest first, or [] when there are none."""
+    found = dm_state.canon_for(db, guid, zone, creatures)
+    if not found:
+        return []
+    return ["Established facts (never contradict them):"] + [f"- {row['fact']}" for row in found]
+
+
+def establish(db, guid, zone, creature, facts, source):
+    """Write an approved proposal's facts to canon."""
+    for fact in facts or []:
+        dm_state.add_canon(db, guid, zone, creature, fact, source)
+
+
+def story_section(db, who, givers=()):
+    """Everything the model needs to carry the story forward for one character.
+
+    givers is the candidate herald list; facts about any of them are shown.
+    """
     known = dm_state.get_character(db, who["guid"])
     history = dm_state.quest_history(db, who["guid"])
     lines = ["Story so far (your own summary from last time):",
@@ -455,6 +495,9 @@ def story_section(db, who):
     arc = dm_state.active_arc(db, who["guid"])
     if arc:
         lines += ["", arc_text(arc, "Your private arc for this character (never state it to the player):")]
+    facts = canon_lines(db, who["guid"], who.get("zone"), [g["creature"] for g in givers])
+    if facts:
+        lines += [""] + facts
 
     rejected = db.execute("SELECT reason FROM proposals WHERE guid = ? AND status = 'rejected' AND reason <> '' "
                           "AND type = 'bounty' ORDER BY decided_at DESC LIMIT 2", (who["guid"],)).fetchall()
@@ -561,6 +604,9 @@ def arc_message(db, who, books, seed):
     lines += [f"- {event['text'].split(' [')[0]}" for event in events] or ["- nothing yet"]
     if known and known["story_so_far"]:
         lines += ["", "Story so far (your own summary):", known["story_so_far"]]
+    facts = canon_lines(db, who["guid"], who.get("zone"))
+    if facts:
+        lines += [""] + facts
     lines += ["", "Books a signature reward may be chosen from (name, level needed to use it):"]
     lines += [f"- {book['name']}, level {book['required_level']}" for book in books] or ["- none available"]
     turned_down = db.execute("SELECT reason FROM proposals WHERE guid = ? AND status = 'rejected' AND reason <> '' "
@@ -579,6 +625,8 @@ def propose_arc(db, who, seed, say):
     answer, usage = llm.ask_for_tool_call(ARC_SYSTEM, arc_message(db, who, books, seed), ARC_TOOL, max_tokens=4096)
     arc = validate_arc(answer, [book["name"] for book in books], who["level"])
     arc["seed"] = seed or ""
+    arc["canon_add"] = canon_facts(answer)
+    arc["zone"] = who.get("zone")
     db.execute("INSERT INTO proposals (ts, guid, name, type, payload, dm_note, model, tokens_in, tokens_out) "
                "VALUES (?, ?, ?, 'arc', ?, ?, ?, ?, ?)",
                (dm_state.now(), who["guid"], who["name"], json.dumps(arc), arc["dm_note"], usage.get("model"),
@@ -728,7 +776,7 @@ def propose(db, who, say):
     context = write_quest.gather(who["name"], skip=recent_targets(db, who["guid"]),
                                  props_in_use=props_in_use(db), gear_tiers=gear_tiers(db, who))
     enrich_heralds(db, who["guid"], context)
-    message = write_quest.user_message(context, None, story=story_section(db, context["character"]))
+    message = write_quest.user_message(context, None, story=story_section(db, context["character"], context["givers"]))
     answer, usage = llm.ask_for_tool_call(SYSTEM, message, TOOL, max_tokens=4096)
     progress = answer.get("beat_progress")
     if progress not in ("advance", "hold", "detour", "conclude"):
@@ -746,7 +794,8 @@ def propose(db, who, say):
         raise write_quest.Rejected("the model left out the story beat or the story summary")
     if len(summary.split()) > 160:
         raise write_quest.Rejected("the story summary is far over 120 words")
-    payload = {"beat_progress": progress, "kind": target["kind"], "needs_party": target["needs_party"]}
+    payload = {"beat_progress": progress, "kind": target["kind"], "needs_party": target["needs_party"],
+               "canon_add": canon_facts(answer)}
     if finale:
         payload["concludes_arc"] = arc["id"]
     db.execute("INSERT INTO proposals (ts, guid, name, type, payload, spec, target, announcement, dm_note, story_beat, "
@@ -778,6 +827,8 @@ def approve_proposal(db, row, say):
                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                    (row["guid"], arc["premise"], arc["lure"], arc["adversary"], json.dumps(arc["beats"]),
                     arc["signature_reward"], arc.get("seed", ""), row["model"], stamp, stamp))
+        arc_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        establish(db, row["guid"], arc.get("zone"), None, arc.get("canon_add"), f"arc {arc_id}")
         db.execute("UPDATE proposals SET status = 'approved', decided_at = ? WHERE id = ?", (stamp, row["id"]))
         db.commit()
         say(f"arc for {row['name']} is now in force.")
@@ -816,6 +867,7 @@ def approve_proposal(db, row, say):
     if dm_state.settle_voice(db, spec["giver"], herald.get("name"), target.get("herald_voice"), spec["id"]) == "settled":
         say(f"{herald.get('name')}'s voice is now settled: {target['herald_voice']}")
     record_reward(db, row, spec, target)
+    establish(db, row["guid"], spec.get("zone"), spec["giver"], payload.get("canon_add"), f"bounty {spec['id']}")
     db.execute("UPDATE characters SET story_so_far = ? WHERE guid = ?", (row["story_so_far"], row["guid"]))
     db.execute("UPDATE proposals SET status = 'approved', decided_at = ? WHERE id = ?", (stamp, row["id"]))
     dm_state.add_event(db, row["guid"], "overseer", f"the Overseer posted the bounty \"{spec['title']}\"")
@@ -941,6 +993,8 @@ def show_proposal(db, row):
         print(arc_text(arc, "A private plan. Reading it is a spoiler if you play this character."))
         if arc.get("seed"):
             print(f"Your direction: {arc['seed']}")
+        for fact in arc.get("canon_add") or []:
+            print(f"Establishes: {fact}")
         print(f"Model's note: {row['dm_note']}   [{row['model']}, tokens {row['tokens_in']}/{row['tokens_out']}]")
         return
     spec, target = json.loads(row["spec"]), json.loads(row["target"])
@@ -971,6 +1025,8 @@ Story beat:   {row['story_beat']}
 Story so far: {row['story_so_far']}
 Arc:          {progress}
 Model's note: {row['dm_note']}   [{row['model']}, tokens {row['tokens_in']}/{row['tokens_out']}]""")
+    for fact in payload.get("canon_add") or []:
+        print(f"Establishes:  {fact}")
     warning = receipt_warning(db, row["guid"], spec.get("giver"),
                               (spec["briefing"], spec["progress_text"], spec["completion_text"]))
     if warning:
@@ -1218,7 +1274,7 @@ def cmd_context(db, args):
     except write_quest.NoContext as error:
         sys.exit(f"dm: {error}")
     enrich_heralds(db, who["guid"], context)
-    print(write_quest.user_message(context, None, story=story_section(db, context["character"])))
+    print(write_quest.user_message(context, None, story=story_section(db, context["character"], context["givers"])))
 
 
 def cmd_voices(db, _args):
@@ -1288,6 +1344,52 @@ def cmd_voice(db, args):
         print("Voice: not settled yet.")
 
 
+def cmd_canon(db, args):
+    """List the facts the story has established, add one of yours, or withdraw one."""
+    if args.retire is not None:
+        if not dm_state.retire_canon(db, args.retire):
+            sys.exit(f"dm: no active fact {args.retire}")
+        db.commit()
+        print(f"fact {args.retire} is withdrawn; no prompt will be shown it again.")
+        return
+    guid = None
+    if args.character:
+        row, _held = whose_story(db, args.character)
+        if not row:
+            sys.exit(f"dm: the Overseer has not noticed anyone called {args.character}")
+        guid = row["guid"]
+    if args.add is not None:
+        fact = dm_state.clean_fact(args.add)
+        if not fact:
+            sys.exit(f"dm: a fact is one sentence of at most {dm_state.CANON_WORDS} words")
+        number = dm_state.add_canon(db, guid, args.zone, args.creature, fact, "owner")
+        if number is None:
+            sys.exit("dm: that fact is already established")
+        db.commit()
+        about = [args.character] if guid else []
+        if args.zone is not None:
+            about.append(world_query.zone_name(args.zone))
+        if args.creature is not None:
+            about.append(f"creature {args.creature}")
+        print(f"fact {number} established, about {', '.join(about)}." if about
+              else f"fact {number} established; every prompt is shown it.")
+        return
+    found = dm_state.all_canon(db, guid)
+    if not found:
+        print("no facts established yet.")
+    for row in found:
+        about = []
+        if row["guid"] is not None:
+            known = dm_state.get_character(db, row["guid"])
+            about.append(known["name"] if known else f"guid {row['guid']}")
+        if row["zone"] is not None:
+            about.append(world_query.zone_name(row["zone"]))
+        if row["creature"] is not None:
+            about.append(f"creature {row['creature']}")
+        print(f"{row['id']:>4}  {row['fact']}\n      [{', '.join(about) or 'server-wide'}; {row['source']}, "
+              f"{dm_state.ago(row['ts'])} ago]")
+
+
 def cmd_tick(db, _args):
     tick(db)
     db.commit()
@@ -1345,6 +1447,13 @@ def main():
     voice.add_argument("note", nargs="?", help="a new note, which is pinned")
     voice.add_argument("--forget", action="store_true", help="clear the note")
     voice.set_defaults(run=cmd_voice)
+    canon = commands.add_parser("canon", help="list, add or withdraw established facts")
+    canon.add_argument("character", nargs="?", help="only this character's facts, and the server-wide ones")
+    canon.add_argument("--add", metavar="TEXT", help="state a fact yourself; for the character, if one is named")
+    canon.add_argument("--zone", type=int, help="with --add: the zone id it concerns")
+    canon.add_argument("--creature", type=int, help="with --add: the creature id it concerns")
+    canon.add_argument("--retire", type=int, metavar="ID", help="withdraw a fact")
+    canon.set_defaults(run=cmd_canon)
     args = parser.parse_args()
 
     console.load_env()

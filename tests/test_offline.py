@@ -1320,5 +1320,122 @@ class HeraldVoice(unittest.TestCase):
         self.assertEqual((quest["giver_id"], quest["ender_id"], quest["ender"]), (197, 197, "Marshal McBride"))
 
 
+class Canon(unittest.TestCase):
+    """Facts the story has established, and which prompts are shown them."""
+
+    def fresh(self):
+        os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
+        db = dm_state.connect()
+        self.addCleanup(db.close)
+        return db
+
+    def facts(self, rows):
+        return [row["fact"] for row in rows]
+
+    def test_a_character_sees_its_own_facts_and_others_only_by_zone_or_herald(self):
+        db = self.fresh()
+        dm_state.add_canon(db, 1, 12, 197, "McBride suspects the kobolds were paid.", "bounty 30000")
+        dm_state.add_canon(db, 2, 40, 234, "Gryan Stoutmantle trusts Bo.", "bounty 30001")
+        dm_state.add_canon(db, 2, 40, None, "The Westfall harvest burned.", "bounty 30002")
+        dm_state.add_canon(db, None, None, None, "A comet was seen over Stormwind.", "owner")
+        self.assertEqual(self.facts(dm_state.canon_for(db, 1, 12, [197])),
+                         ["A comet was seen over Stormwind.", "McBride suspects the kobolds were paid."])
+        everywhere = "A comet was seen over Stormwind."
+        self.assertEqual(set(self.facts(dm_state.canon_for(db, 1, 40))),
+                         {"McBride suspects the kobolds were paid.", "Gryan Stoutmantle trusts Bo.",
+                          "The Westfall harvest burned.", everywhere})
+        self.assertEqual(set(self.facts(dm_state.canon_for(db, 1, 12, [234]))),
+                         {"McBride suspects the kobolds were paid.", "Gryan Stoutmantle trusts Bo.", everywhere})
+        self.assertEqual(self.facts(dm_state.canon_for(db, 3, 1)), [everywhere])     # a stranger elsewhere
+        self.assertIn(everywhere, self.facts(dm_state.all_canon(db, 1)))
+        self.assertNotIn("Gryan Stoutmantle trusts Bo.", self.facts(dm_state.all_canon(db, 1)))
+
+    def test_newest_first_and_at_most_ten(self):
+        db = self.fresh()
+        for n in range(12):
+            dm_state.add_canon(db, 1, 12, None, f"Fact number {n}.", "owner")
+        shown = self.facts(dm_state.canon_for(db, 1, 12))
+        self.assertEqual(len(shown), dm_state.CANON_SHOWN)
+        self.assertEqual(shown[0], "Fact number 11.")
+
+    def test_a_retired_fact_is_not_shown(self):
+        db = self.fresh()
+        number = dm_state.add_canon(db, 1, 12, None, "The ledger named a noble.", "bounty 30000")
+        self.assertEqual(dm_state.retire_canon(db, number), 1)
+        self.assertEqual(dm_state.canon_for(db, 1, 12), [])
+        self.assertEqual(dm_state.retire_canon(db, number), 0)
+
+    def test_empty_overlong_and_repeated_facts_are_not_recorded(self):
+        db = self.fresh()
+        self.assertIsNone(dm_state.add_canon(db, 1, 12, None, "   ", "owner"))
+        self.assertIsNone(dm_state.add_canon(db, 1, 12, None, "word " * 26, "owner"))
+        self.assertIsNotNone(dm_state.add_canon(db, 1, 12, None, "The mill is haunted.", "owner"))
+        self.assertIsNone(dm_state.add_canon(db, 2, 40, None, "the mill is  haunted.", "owner"))
+
+    def test_an_answer_establishes_at_most_two_clean_facts(self):
+        self.assertEqual(dm.canon_facts({"canon_add": ["One.", "", "word " * 30, "Two.", "Three."]}), ["One.", "Two."])
+        self.assertEqual(dm.canon_facts({"canon_add": "not a list"}), [])
+        self.assertEqual(dm.canon_facts({}), [])
+
+    def test_the_tools_ask_for_facts(self):
+        self.assertIn("canon_add", dm.TOOL["input_schema"]["properties"])
+        self.assertIn("canon_add", dm.ARC_TOOL["input_schema"]["properties"])
+
+    def propose(self, db, who, answer):
+        stub = os.path.join(tempfile.mkdtemp(), "answer.json")
+        with open(stub, "w") as handle:
+            json.dump(dict(ANSWER, story_beat="b", story_so_far="s", beat_progress="hold", **answer), handle)
+        messages = []
+        real = dm.llm.ask_for_tool_call
+
+        def ask(system, message, tool, **kwargs):
+            messages.append(message)
+            return real(system, message, tool, **kwargs)
+
+        context = json.loads(json.dumps(CONTEXT))
+        context["character"] = dict(who)
+        with mock.patch.dict(os.environ, {"DM_LLM_PROVIDER": "stub", "DM_LLM_STUB": stub}), \
+                mock.patch.object(write_quest, "gather", lambda *a, **k: json.loads(json.dumps(context))), \
+                mock.patch.object(dm.llm, "ask_for_tool_call", ask):
+            number = dm.propose(db, who, lambda _line: None)
+        return db.execute("SELECT * FROM proposals WHERE id = ?", (number,)).fetchone(), messages[0]
+
+    def test_an_approved_bounty_fact_reaches_another_character_in_the_same_zone(self):
+        db = self.fresh()
+        ralf = dict(CONTEXT["character"], map=0, x=0, y=0, online=1)
+        bo = dict(ralf, guid=2, name="Bo")
+        for who in (ralf, bo):
+            dm_state.save_character(db, who, [], [], [], first=True)
+        row, _message = self.propose(db, ralf, {"canon_add": ["Marshal McBride keeps a list of the paid kobolds."]})
+        with mock.patch.object(world_query, "next_quest_id", return_value=30005), \
+                mock.patch.object(apply_quest, "apply_spec"):
+            dm.approve_proposal(db, row, lambda _line: None)
+        fact = dm_state.all_canon(db)[0]
+        self.assertEqual((fact["guid"], fact["zone"], fact["creature"], fact["source"]), (1, 12, 197, "bounty 30005"))
+        _row, message = self.propose(db, bo, {})
+        self.assertIn("Established facts (never contradict them):\n- Marshal McBride keeps a list of the paid kobolds.",
+                      message)
+
+    def test_a_rejected_proposal_establishes_nothing(self):
+        db = self.fresh()
+        who = dict(CONTEXT["character"], map=0, x=0, y=0, online=1)
+        dm_state.save_character(db, who, [], [], [], first=True)
+        row, _message = self.propose(db, who, {"canon_add": ["The kobolds answer to someone in a tower."]})
+        self.assertEqual(json.loads(row["payload"])["canon_add"], ["The kobolds answer to someone in a tower."])
+        self.assertEqual(dm_state.all_canon(db), [])
+
+    def test_an_approved_arc_records_its_facts(self):
+        db = self.fresh()
+        who = dict(CONTEXT["character"], map=0, x=0, y=0, online=1)
+        dm_state.save_character(db, who, [], [], [], first=True)
+        arc = dict(dm.validate_arc(ARC, ["Grimoire of Death Coil III"], 3), seed="", zone=12,
+                   canon_add=["Northshire Abbey's library is missing a book."])
+        db.execute("INSERT INTO proposals (ts, guid, name, type, payload) VALUES (1, 1, 'Zachadin', 'arc', ?)",
+                   (json.dumps(arc),))
+        dm.approve_proposal(db, db.execute("SELECT * FROM proposals").fetchone(), lambda _line: None)
+        fact = dm_state.all_canon(db)[0]
+        self.assertEqual((fact["zone"], fact["creature"], fact["source"]), (12, None, "arc 1"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -185,6 +185,9 @@ python3 dm.py run --every 300
 | `dm.py voice <name or id>` | One herald's facts, their own lines from the game, and their note |
 | `dm.py voice <name or id> "text"` | Write or replace that herald's note, and pin it |
 | `dm.py voice <name or id> --forget` | Clear it, so the next bounty through them settles a new one |
+| `dm.py canon [Character]` | Facts the story has established; with a name, that character's and the ones true everywhere |
+| `dm.py canon [Character] --add "..." [--zone N] [--creature N]` | State a fact yourself |
+| `dm.py canon --retire <id>` | Withdraw a fact; no prompt is shown it again |
 | `dm.py pause "why"` | Stop everything that reaches the game. Reading still works |
 | `dm.py resume` | Undo it |
 | `dm.py purge` | Take every DM quest back out of the game, after confirmation |
@@ -242,6 +245,10 @@ Installing the pool needs one restart, because new item types load only at serve
 Each candidate herald is shown to the model with their title, role, sex and level, and with how they actually talk: up to three of their own lines from the world database (a greeting, quest text, small talk). About four in five quest-givers have some. The first bounty through a herald also records a two-sentence **voice note**, and every later bounty through them is shown that note instead, so a herald sounds the same each time. `dm.py pending` shows whether a note is new or settled; it is stored on approval. A note you write with `dm.py voice` is pinned.
 
 Each herald is also listed with their own dealings with the character, the bounties they gave and received and what was handed over, and the model is told a herald may only speak of what they were part of. `dm.py pending` warns when a herald with no dealings says something like "you brought me". It is a warning, not a refusal. The design is in `docs/proposal_herald_voice.md`.
+
+## Canon
+
+Every bounty and arc may establish up to two **facts**: one sentence each, in the world's terms ("Marshal McBride keeps a list of the paid kobolds"), never a plan. They are recorded on approval, so a rejected proposal establishes nothing, and each is tagged with the character, the zone and, for a bounty, the herald. A prompt is shown up to ten, newest first: the character's own, anyone's about the zone they are in or an NPC on their herald list, and any you stated with no tag at all. That is how one character's story can touch another's without contradicting it. `dm.py pending` shows what a proposal would establish. The design is in `docs/proposal_campaign_layer.md`.
 
 ## Settings
 

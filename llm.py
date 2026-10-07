@@ -10,6 +10,8 @@ Settings:
     DM_LLM_PROVIDER     "anthropic" (default) or "stub"
     ANTHROPIC_API_KEY   key for the Claude API
     DM_MODEL            model id (default claude-sonnet-5-5)
+    DM_PLAN_MODEL       model for the rare planning calls: campaign, act review, chapter
+                        (default: DM_MODEL)
     DM_LLM_STUB         for the stub provider: a JSON file holding the tool arguments
                         to return, or a folder of <tool name>.json files, for
                         testing without a key
@@ -28,13 +30,16 @@ class LLMError(Exception):
     pass
 
 
-def ask_for_tool_call(system, user, tool, max_tokens=2048):
-    """Return (tool_arguments, usage) where usage has input and output token counts."""
+def ask_for_tool_call(system, user, tool, max_tokens=2048, model=None):
+    """Return (tool_arguments, usage) where usage has input and output token counts.
+
+    model overrides DM_MODEL for this one call.
+    """
     provider = os.environ.get("DM_LLM_PROVIDER", "anthropic").lower()
     if provider == "stub":
         return _stub(tool)
     if provider == "anthropic":
-        return _anthropic(system, user, tool, max_tokens)
+        return _anthropic(system, user, tool, max_tokens, model)
     raise LLMError(f"unknown DM_LLM_PROVIDER '{provider}'")
 
 
@@ -49,11 +54,16 @@ def _stub(tool):
         raise LLMError(f"stub provider could not read DM_LLM_STUB: {error}") from None
 
 
-def _anthropic(system, user, tool, max_tokens):
+def plan_model():
+    """The model for planning calls, which are rare and benefit from the strongest one."""
+    return os.environ.get("DM_PLAN_MODEL") or None
+
+
+def _anthropic(system, user, tool, max_tokens, model=None):
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not key:
         raise LLMError("ANTHROPIC_API_KEY is not set (see env.example)")
-    model = os.environ.get("DM_MODEL", DEFAULT_MODEL)
+    model = model or os.environ.get("DM_MODEL", DEFAULT_MODEL)
     body = {
         "model": model,
         "max_tokens": max_tokens,

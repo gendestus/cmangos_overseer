@@ -65,6 +65,14 @@ CREATE TABLE IF NOT EXISTS herald_voices (
     pinned INTEGER NOT NULL DEFAULT 0,           -- 1 when the owner wrote or confirmed it
     set_at INTEGER, set_by_quest INTEGER, uses INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS canon (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER,
+    guid INTEGER,                                -- the character it concerns, or NULL for the whole server
+    zone INTEGER, creature INTEGER,              -- where and whom it concerns, when known
+    fact TEXT,                                   -- one sentence, at most 25 words
+    source TEXT,                                 -- 'bounty 30012', 'arc 7', 'chapter 3', 'owner'
+    status TEXT NOT NULL DEFAULT 'active'        -- active, retired
+);
 """
 
 # Columns added after the first release; applied to an existing state.db on open.
@@ -301,6 +309,57 @@ def set_voice(db, creature, name, note):
 def forget_voice(db, creature):
     """Clear a note, so the next bounty through this NPC settles a new one."""
     return db.execute("DELETE FROM herald_voices WHERE creature = ?", (creature,)).rowcount
+
+
+CANON_WORDS = 25        # a fact is one sentence of at most this many words
+CANON_SHOWN = 10        # the most facts a prompt is shown
+
+
+def clean_fact(text):
+    """A fact in stored form, or '' when there is none. Overlong facts are refused, not cut."""
+    text = " ".join(str(text or "").split())
+    if not text or len(text.split()) > CANON_WORDS:
+        return ""
+    return text
+
+
+def add_canon(db, guid, zone, creature, fact, source):
+    """Record a fact the story has established. Returns its id, or None if it was empty, too long or already known."""
+    fact = clean_fact(fact)
+    if not fact:
+        return None
+    if db.execute("SELECT 1 FROM canon WHERE status = 'active' AND fact = ? COLLATE NOCASE", (fact,)).fetchone():
+        return None
+    db.execute("INSERT INTO canon (ts, guid, zone, creature, fact, source) VALUES (?, ?, ?, ?, ?, ?)",
+               (now(), guid, zone, creature, fact, source))
+    return db.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def canon_for(db, guid, zone=None, creatures=(), limit=CANON_SHOWN):
+    """Active facts a prompt about this character should respect, newest first.
+
+    Its own facts, plus anyone's facts about the zone it is in or about an NPC
+    on its herald list: that is how different characters' stories touch
+    without contradicting each other. A fact tied to no character, zone or
+    creature is true everywhere and always matches.
+    """
+    creatures = [int(c) for c in creatures if c is not None]
+    marks = ",".join("?" * len(creatures)) or "NULL"
+    return db.execute(f"SELECT * FROM canon WHERE status = 'active' AND (guid = ? OR zone = ? OR creature IN ({marks}) "
+                      f"OR (guid IS NULL AND zone IS NULL AND creature IS NULL)) "
+                      f"ORDER BY ts DESC, id DESC LIMIT ?", (guid, zone, *creatures, limit)).fetchall()
+
+
+def all_canon(db, guid=None):
+    """Every active fact, oldest first; with a guid, only that character's and the server-wide ones."""
+    if guid is None:
+        return db.execute("SELECT * FROM canon WHERE status = 'active' ORDER BY ts, id").fetchall()
+    return db.execute("SELECT * FROM canon WHERE status = 'active' AND (guid = ? OR guid IS NULL) ORDER BY ts, id",
+                      (guid,)).fetchall()
+
+
+def retire_canon(db, fact_id):
+    return db.execute("UPDATE canon SET status = 'retired' WHERE id = ? AND status = 'active'", (fact_id,)).rowcount
 
 
 def proposals_in_last_hour(db):
