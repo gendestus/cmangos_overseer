@@ -2,7 +2,8 @@
 """The Overseer's loop: watch the players, remember, and propose what comes next.
 
     python3 dm.py tick                 one pass: observe, record, maybe propose
-    python3 dm.py run --every 300      keep ticking every 300 seconds
+    python3 dm.py run --every 300      keep ticking every 300 seconds; at a terminal, a console
+                                       where every command here works too (--no-console: just tick)
     python3 dm.py pending              list proposals waiting for you
     python3 dm.py approve 3            put proposal 3 live (no number: the only one waiting)
     python3 dm.py reject 3 "too easy"  discard it, with a reason the story keeps
@@ -73,6 +74,8 @@ Settings, on top of the ones the other scripts use:
     DM_PRIZE_REACH          how many levels above the character a prize may be (default 5)
     DM_PAUSE                set to 1 to pause without the flag file (`pause` writes the file)
     DM_PAUSE_FILE           where the flag file lives (default: `paused` beside this script)
+    DM_BELL                 set to 1 for a bell in the `run` console when a tick leaves a
+                            proposal waiting
 
 Paused means paused: no tick, no model call, no quest written and no console
 command sent, whichever script is run. Reading is unaffected, so `story`,
@@ -93,6 +96,7 @@ import time
 
 import apply_quest
 import console
+import dm_console
 import dm_state
 import hot_quest
 import llm
@@ -2340,7 +2344,7 @@ def cmd_tick(db, _args):
     db.commit()
 
 
-MIN_EVERY = 30      # every tick forces a server save
+MIN_EVERY = dm_console.MIN_EVERY
 
 
 def run_lock():
@@ -2366,6 +2370,9 @@ def cmd_run(db, args):
     if args.every < MIN_EVERY:
         sys.exit(f"dm: --every must be at least {MIN_EVERY} seconds")
     lock = run_lock()   # noqa: F841 -- held until exit
+    if sys.stdin.isatty() and sys.stdout.isatty() and not args.no_console:
+        dm_console.Console(build_parser(), db, tick, args.every).run()
+        return
     print(f"ticking every {args.every} seconds; Ctrl+C to stop")
     try:
         while True:

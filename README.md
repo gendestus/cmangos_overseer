@@ -28,6 +28,7 @@ By default nothing reaches the game without `approve`. `DM_AUTO_APPROVE` can swi
 | Path | What it is |
 |---|---|
 | `dm.py` | The loop and its commands: `tick`, `run`, `pending`, `approve`, `reject`, `story`, `campaign`, `arc`, `chapter`, `context`, `canon`, `dossier` |
+| `dm_console.py` | The prompt `dm.py run` shows at a terminal, with ticks in the background |
 | `dm_state.py` | The memory file (`state.db`): schema, upgrades, helpers |
 | `world_query.py` | Read-only questions to the game databases |
 | `factions.py` | Friend or foe, read from the server's extracted faction files |
@@ -40,6 +41,7 @@ By default nothing reaches the game without `approve`. `DM_AUTO_APPROVE` can swi
 | `env.example` | Template for `.env` |
 | `tests/test_quest.json` and the two `tests/test_quest_*.sql` | A fixed quest for smoke-testing the pipeline without a model |
 | `tests/test_offline.py` | Checks that need no server: `python3 -m unittest discover tests` |
+| `tests/test_console_pty.py` | The `run` console typed at through a pseudo-terminal, with the game patched out by `tests/console_harness.py` (about 20 s) |
 | `server/` | custom-sql files for the game server: the spell books (step 1) and the DM's story props (step 6) |
 | `docs/ai_dm_spec.md` | Design spec |
 | `docs/DEV_PLAN.md` | What is built and what is next |
@@ -170,6 +172,19 @@ To keep it watching:
 python3 dm.py run --every 300
 ```
 
+At a terminal, `run` ticks in the background and gives you a prompt where every command above works, typed without `python3 dm.py`:
+
+```
+ticking every 300 seconds in the background. Type help, or quit to leave.
+overseer (1 waiting)> p
+...
+overseer (1 waiting)> approve
+```
+
+Tick output never breaks a half-typed line, and a command typed during a tick waits for it to finish. The console adds `tick` (one now), `every <seconds>` (30 or more), `status`, `quiet` / `loud`, `log [n]`, `help` and `quit`, which waits for a tick in progress. Short forms: `p`, `a 3`, `r 3 "why"`. Tab completes commands, character names and proposal numbers; history is kept in `.dm_history`. Set `DM_BELL=1` for a bell when a tick leaves something waiting.
+
+Under a service, a pipe or `nohup`, `run` is the plain loop; `--no-console` forces it. Commands still work from another shell either way. Only one `run` per `state.db` is allowed; a second is refused.
+
 ## Commands
 
 ### The loop
@@ -177,9 +192,9 @@ python3 dm.py run --every 300
 | Command | Effect |
 |---|---|
 | `dm.py tick` | One pass: observe, record, maybe propose |
-| `dm.py run --every 300` | Tick every 300 seconds until stopped |
+| `dm.py run --every 300` | Tick every 300 seconds until stopped; at a terminal, with a console prompt for every command (`--no-console`: just tick) |
 | `dm.py pending` | Show proposals waiting for a decision: campaigns, act reviews, chapters, arcs and bounties |
-| `dm.py approve <n>` | Put proposal `n` into effect |
+| `dm.py approve <n>` | Put proposal `n` into effect. With no number, the only one waiting |
 | `dm.py reject <n> "reason"` | Discard it. The reason is passed to the model next time |
 | `dm.py story <Character>` | The chronicle: story so far, bounties and how each ended, events |
 | `dm.py arc <Character>` | The arc in force and the ones that have ended. A spoiler if you play that character |

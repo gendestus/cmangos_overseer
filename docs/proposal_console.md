@@ -1,8 +1,9 @@
 # Proposal: `dm.py run` as a console
 
-Status: proposed 2026-10-07. A usability change; the DM's behaviour is unchanged.
+Status: implemented 2026-10-07 in `dm_console.py`. A usability change; the DM's behaviour is unchanged.
+Decisions taken (section 7): loud by default; 30 seconds minimum, for `--every` too; `approve` alone takes the only waiting proposal, on the command line as well as at the prompt.
 Audience: whoever implements it (currently Claude Code).
-Reference: `console_loop_prototype.py` beside this file is a working model of the mechanics, with the DM replaced by stand-ins. `console_loop_drive.py` types at it through a pseudo-terminal and is how it was tested.
+Reference: the prototype that settled the mechanics has been removed; `tests/test_console_pty.py` drives the real thing through a pseudo-terminal, with `tests/console_harness.py` patching out the game.
 
 ## 1. Problem
 
@@ -92,7 +93,7 @@ The prototype exists to settle these. Each is marked in its source.
 - **Scheduling, offline:** `every` moves the next tick; `tick` forces one; a failing tick is reported and the loop continues.
 - **End to end, through a pseudo-terminal:** adapt `console_loop_drive.py` to start `dm.py run` with the stub model. It should type a command during a tick, leave a line half-typed across a tick and finish it, and quit during a tick. Pass when the exit status is 0, no prompt is doubled, and the half-typed line survived.
 
-The prototype passes that last test as it stands, three runs out of three.
+The implementation passes that last test three runs out of three.
 
 ## 6. Done when
 

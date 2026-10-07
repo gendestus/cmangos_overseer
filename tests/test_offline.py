@@ -18,6 +18,8 @@ import sqlite3
 import struct
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -28,6 +30,7 @@ import apply_quest      # noqa: E402
 import console          # noqa: E402
 import db_users         # noqa: E402
 import dm               # noqa: E402
+import dm_console       # noqa: E402
 import dm_state         # noqa: E402
 import factions         # noqa: E402
 import hot_quest        # noqa: E402
@@ -1988,6 +1991,195 @@ class RunGroundwork(unittest.TestCase):
         with self.assertRaises(SystemExit) as stop:
             self.approve()
         self.assertIn("no proposals waiting", stop.exception.code)
+
+
+class ConsoleDispatch(unittest.TestCase):
+    """The console in front of `run`: a mistake never ends the session, and ticks keep their own time."""
+
+    def setUp(self):
+        os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
+        self.db = dm_state.connect()
+        self.out = io.StringIO()
+        self.ticked = []
+        self.console = dm_console.Console(dm.build_parser(), self.db, self.fake_tick, 300, out=self.out)
+        patcher = mock.patch.object(console, "paused", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        self.db.close()
+
+    def fake_tick(self, db, say):
+        self.ticked.append(db)
+        say("tick: 1 character(s) online")
+        say("  Gendestus: no proposal (a bounty is already out)")
+
+    def type(self, line):
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(io.StringIO()):
+            going = self.console.handle(line)
+        return going, self.out.getvalue() + printed.getvalue()
+
+    def add(self, kind="bounty"):
+        self.db.execute("INSERT INTO proposals (guid, name, spec, type) VALUES (1, 'Gendestus', '{}', ?)", (kind,))
+        self.db.commit()
+
+    def test_an_unknown_command_is_answered(self):
+        self.assertEqual(self.type("frobnicate"), (True, "no such command: frobnicate. Type help.\n"))
+
+    def test_an_argparse_error_leaves_the_session_running(self):
+        self.assertTrue(self.type("approve x")[0])
+
+    def test_a_command_that_exits_leaves_the_session_running(self):
+        going, shown = self.type("approve 9")
+        self.assertTrue(going)
+        self.assertIn("dm: no pending proposal 9", shown)
+
+    def test_a_command_that_raises_leaves_the_session_running(self):
+        with mock.patch.object(dm, "cmd_pending", side_effect=world_query.QueryError("no database")):
+            self.console.parser = dm.build_parser()     # set_defaults captured the function, so rebuild
+        going, shown = self.type("pending")
+        self.assertTrue(going)
+        self.assertIn("pending failed: no database", shown)
+
+    def test_unreadable_quoting_is_answered(self):
+        going, shown = self.type('reject 3 "unfinished')
+        self.assertTrue(going)
+        self.assertIn("could not read that", shown)
+
+    def test_run_is_refused(self):
+        self.assertIn("already running.", self.type("run --every 60")[1])
+
+    def test_short_forms_resolve(self):
+        self.assertIn("no proposals waiting.", self.type("p")[1])
+        self.add()
+        with mock.patch.object(dm, "approve_proposal", lambda db, row, say: print(f"approved {row['id']}")):
+            self.assertIn("approved 1", self.type("a 1")[1])
+        self.add()
+        self.type('r 2 "too easy"')
+        self.assertEqual(self.db.execute("SELECT reason FROM proposals WHERE id = 2").fetchone()[0], "too easy")
+
+    def test_quit_and_exit_leave(self):
+        self.assertFalse(self.type("quit")[0])
+        self.assertFalse(self.type("exit")[0])
+
+    def test_help_lists_console_and_dm_commands(self):
+        shown = self.type("help")[1]
+        self.assertIn("every <seconds>", shown)
+        self.assertIn("approve", shown)
+        self.assertIn("--reveal", self.type("help pending")[1])
+
+    def test_what_a_command_left_uncommitted_does_not_hold_the_database(self):
+        def half_done(db, args):
+            db.execute("INSERT INTO seen_letters VALUES (1)")
+            sys.exit("dm: gave up")
+        with mock.patch.object(dm, "cmd_voices", half_done):
+            parser = dm.build_parser()
+        self.console.parser = parser
+        self.type("voices")
+        self.assertFalse(self.db.in_transaction)
+
+    # -- scheduling ----------------------------------------------------------------
+    def test_every_moves_the_next_tick(self):
+        self.console.next_at = time.time() + 1000
+        self.type("every 60")
+        self.assertEqual(self.console.every, 60)
+        self.assertAlmostEqual(self.console.next_at, time.time() + 60, delta=2)
+        self.assertTrue(self.console.wake.is_set())
+
+    def test_every_has_a_floor(self):
+        self.assertIn("30 or more", self.type("every 5")[1])
+        self.assertEqual(self.console.every, 300)
+
+    def test_tick_forces_one(self):
+        self.console.next_at = time.time() + 1000
+        self.assertFalse(self.console.due(time.time()))
+        self.type("tick")
+        self.assertTrue(self.console.due(time.time()))
+
+    def test_a_tick_runs_and_counts(self):
+        self.console.run_one_tick(self.db)
+        self.assertEqual(len(self.ticked), 1)
+        self.assertEqual(self.console.ticks, 1)
+        self.assertTrue(self.console.last.startswith("ok"))
+        self.assertIn("Gendestus: no proposal", self.out.getvalue())
+
+    def test_a_failing_tick_is_reported_and_the_loop_goes_on(self):
+        def broken(db, say):
+            raise world_query.QueryError("the game database is down")
+        self.console.tick = broken
+        self.console.run_one_tick(self.db)
+        self.assertIn("tick failed: the game database is down", self.out.getvalue())
+        self.assertTrue(self.console.last.startswith("failed"))
+        self.console.tick = self.fake_tick
+        self.console.run_one_tick(self.db)
+        self.assertEqual(self.console.ticks, 2)
+
+    def test_a_new_proposal_is_announced(self):
+        self.console.tick = lambda db, say: self.add()
+        self.console.run_one_tick(self.db)
+        self.assertIn("waiting for you: 1 (bounty for Gendestus)", self.out.getvalue())
+
+    def test_the_ticker_ticks_on_its_own_connection_and_stops(self):
+        self.console.every = 3600
+        thread = threading.Thread(target=self.console.ticker)
+        thread.start()
+        for _ in range(50):
+            if self.ticked:
+                break
+            time.sleep(0.02)
+        self.console.stopping = True
+        self.console.wake.set()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(self.ticked), 1)
+        self.assertIsNot(self.ticked[0], self.db)
+
+    # -- conveniences -------------------------------------------------------------
+    def test_quiet_keeps_the_summary_and_logs_the_rest(self):
+        self.type("quiet")
+        self.out.truncate(0)
+        self.out.seek(0)
+        self.console.run_one_tick(self.db)
+        self.assertIn("tick: 1 character(s) online", self.out.getvalue())
+        self.assertNotIn("Gendestus", self.out.getvalue())
+        self.assertIn("Gendestus", self.type("log 1")[1])
+
+    def test_the_log_is_bounded(self):
+        for number in range(dm_console.LOG_LINES + 10):
+            self.console.tick_say(str(number))
+        self.assertEqual(len(self.console.log), dm_console.LOG_LINES)
+
+    def test_the_prompt_shows_what_waits(self):
+        self.console.refresh()
+        self.assertEqual(self.console.prompt, "overseer> ")
+        self.add()
+        self.add()
+        self.console.refresh()
+        self.assertEqual(self.console.prompt, "overseer (2 waiting)> ")
+        with mock.patch.object(console, "paused", return_value="testing"):
+            self.console.refresh()
+        self.assertEqual(self.console.prompt, "overseer (paused)> ")
+
+    def test_completion(self):
+        self.add()
+        self.db.execute("INSERT INTO characters (guid, name) VALUES (1, 'Gendestus')")
+        self.db.commit()
+        self.console.refresh()
+        self.assertIn("approve", self.console.candidates("", "app"))
+        self.assertNotIn("run", self.console.candidates("", "r"))
+        self.assertEqual(self.console.candidates("a ", ""), ["1"])
+        self.assertEqual(self.console.candidates("story ", "gen"), ["Gendestus"])
+        self.assertEqual(self.console.candidates("story Gendestus ", ""), [])
+
+    def test_a_bare_print_from_another_thread_goes_through_the_console(self):
+        routed = dm_console.ThreadRouted(self.console, self.out)
+        thread = threading.Thread(target=lambda: routed.write("from a tick\nhalf"))
+        thread.start()
+        thread.join()
+        self.assertEqual(list(self.console.log), ["from a tick"])
+        routed.write("main thread\n")
+        self.assertIn("main thread", self.out.getvalue())
 
 
 if __name__ == "__main__":
