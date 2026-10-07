@@ -184,6 +184,7 @@ python3 dm.py run --every 300
 | `dm.py story <Character>` | The chronicle: story so far, bounties and how each ended, events |
 | `dm.py arc <Character>` | The arc in force and the ones that have ended. A spoiler if you play that character |
 | `dm.py arc <Character> --seed "..."` | Have a new arc written around your direction |
+| `dm.py arc <Character> --end` | Close the arc in force without writing another; the next comes from the chapter |
 | `dm.py campaign <Character>` | The campaign in force: premise, question, acts and how the finished ones ended. The largest spoiler |
 | `dm.py campaign <Character> --seed "..."` | Have a new campaign written around your direction; it replaces the old one |
 | `dm.py chapter <Character>` | Every zone chapter, in force, paused and finished. A spoiler |

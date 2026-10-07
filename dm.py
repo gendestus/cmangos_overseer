@@ -9,6 +9,7 @@
     python3 dm.py story Zachadin       the chronicle for one character
     python3 dm.py arc Zachadin         the Overseer's private plan for a character (a spoiler)
     python3 dm.py arc Zachadin --seed "lead this priest down a dark path"
+    python3 dm.py arc Zachadin --end   close the arc in force; the next is planned from the chapter
     python3 dm.py campaign Zachadin    what the Overseer has decided a character's life is about (a spoiler)
     python3 dm.py campaign Zachadin --seed "a priest who will lose her faith and find another"
     python3 dm.py chapter Zachadin     the Overseer's zone chapters for a character (a spoiler)
@@ -1918,6 +1919,20 @@ def cmd_arc(db, args):
         sys.exit(f"dm: no character named {args.character}")
     if not dm_state.get_character(db, who["guid"]):
         sys.exit("dm: the Overseer has not noticed this character yet; run a tick while they are online")
+    if args.end:
+        arc = dm_state.active_arc(db, who["guid"])
+        withdrawn = dm_state.withdraw_proposals(db, who["guid"], "arc")
+        if not arc and not withdrawn:
+            sys.exit(f"dm: {who['name']} has no arc in force and none waiting")
+        if arc:
+            dm_state.end_arc(db, arc, "replaced")
+            dm_state.add_event(db, who["guid"], "overseer", "the server owner closed the Overseer's plan for them")
+        db.commit()
+        print(f"{who['name']}'s arc is closed" + (" and the one waiting was withdrawn" if withdrawn else "")
+              + ". The next arc is planned from their chapter's next seed, once they have one.")
+        if dm_state.open_quest(db, who["guid"]):
+            print("The bounty already out stays out; take it back with apply_quest.py --retire if you want it gone.")
+        return
     if args.seed:
         waiting = dm_state.pending_proposal(db, who["guid"], "arc")
         if waiting:
@@ -2352,6 +2367,7 @@ def main():
     arc.add_argument("character")
     arc.add_argument("--seed", metavar="TEXT", help="a direction; a new arc is written around it")
     arc.add_argument("--reveal", action="store_true", help="read it even if arcs are sealed")
+    arc.add_argument("--end", action="store_true", help="close the arc in force without writing another")
     arc.set_defaults(run=cmd_arc)
     campaign = commands.add_parser("campaign", help="show a character's campaign, or have one written (a spoiler)")
     campaign.add_argument("character")

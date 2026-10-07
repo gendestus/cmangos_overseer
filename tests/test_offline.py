@@ -1610,6 +1610,21 @@ class Chapters(unittest.TestCase):
                 dm.validate_arc(dict(ARC, adversary_creature=creature), books, 3, enemies)
         self.assertIsNone(dm.validate_arc(ARC, books, 3)["adversary_creature"])      # no chapter, no constraint
 
+    def test_the_owner_can_close_an_arc_without_writing_another(self):
+        db = self.fresh()
+        self.ticks(db, self.who(), 1)
+        db.execute("INSERT INTO arcs (guid, adversary, beats) VALUES (1, 'Blackrock', '[]')")
+        db.execute("INSERT INTO proposals (ts, guid, name, type, payload) VALUES (1, 1, 'Zachadin', 'arc', '{}')")
+        args = argparse.Namespace(character="Zachadin", end=True, seed=None, reveal=False)
+        out = io.StringIO()
+        with mock.patch.object(world_query, "character", return_value=self.who()), contextlib.redirect_stdout(out):
+            dm.cmd_arc(db, args)
+        self.assertIsNone(dm_state.active_arc(db, 1))
+        self.assertIsNone(dm_state.pending_proposal(db, 1, "arc"))
+        self.assertIn("the server owner replaced it", dm.saga_lines(db, 1)[0])
+        with mock.patch.object(world_query, "character", return_value=self.who()), self.assertRaises(SystemExit):
+            dm.cmd_arc(db, args)                        # nothing left to close
+
     def test_the_finale_bounty_finishes_the_chapter(self):
         db = self.fresh()
         who = self.who()
