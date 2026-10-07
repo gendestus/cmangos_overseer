@@ -4,7 +4,7 @@
     python3 dm.py tick                 one pass: observe, record, maybe propose
     python3 dm.py run --every 300      keep ticking every 300 seconds
     python3 dm.py pending              list proposals waiting for you
-    python3 dm.py approve 3            put proposal 3 live
+    python3 dm.py approve 3            put proposal 3 live (no number: the only one waiting)
     python3 dm.py reject 3 "too easy"  discard it, with a reason the story keeps
     python3 dm.py story Zachadin       the chronicle for one character
     python3 dm.py arc Zachadin         the Overseer's private plan for a character (a spoiler)
@@ -84,6 +84,7 @@ command that would print it (`pending`, `campaign`, `arc`, `chapter`,
 """
 import argparse
 import copy
+import fcntl
 import json
 import os
 import re
@@ -1892,7 +1893,17 @@ def cmd_approve(db, args):
     if stopped:
         sys.exit(f"dm: the DM is paused ({stopped}); nothing was applied.\n"
                  f"    resume with: python3 dm.py resume")
-    row = db.execute("SELECT * FROM proposals WHERE id = ? AND status = 'pending'", (args.number,)).fetchone()
+    if args.number is None:
+        found = db.execute("SELECT * FROM proposals WHERE status = 'pending' ORDER BY id").fetchall()
+        if not found:
+            sys.exit("dm: no proposals waiting")
+        if len(found) > 1:
+            for row in found:
+                show_proposal(db, row)
+            sys.exit(f"dm: {len(found)} proposals are waiting; say which: approve <number>")
+        row = found[0]
+    else:
+        row = db.execute("SELECT * FROM proposals WHERE id = ? AND status = 'pending'", (args.number,)).fetchone()
     if not row:
         sys.exit(f"dm: no pending proposal {args.number}")
     try:
@@ -2329,7 +2340,32 @@ def cmd_tick(db, _args):
     db.commit()
 
 
+MIN_EVERY = 30      # every tick forces a server save
+
+
+def run_lock():
+    """Hold the one `run` allowed per state.db for as long as this process lives."""
+    path = dm_state.state_path() + ".run.lock"
+    handle = open(path, "a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.seek(0)
+        holder = handle.read().strip() or "another process"
+        handle.close()
+        sys.exit(f"dm: already running against this state.db (pid {holder}); "
+                 "use its console, or run commands from here")
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
+
+
 def cmd_run(db, args):
+    if args.every < MIN_EVERY:
+        sys.exit(f"dm: --every must be at least {MIN_EVERY} seconds")
+    lock = run_lock()   # noqa: F841 -- held until exit
     print(f"ticking every {args.every} seconds; Ctrl+C to stop")
     try:
         while True:
@@ -2343,18 +2379,20 @@ def cmd_run(db, args):
         print("\nstopped.")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="The Overseer's loop.")
+def build_parser():
+    parser = argparse.ArgumentParser(prog="dm.py", description="The Overseer's loop.")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("tick", help="one pass: observe, record, maybe propose").set_defaults(run=cmd_tick)
     loop = commands.add_parser("run", help="keep ticking")
-    loop.add_argument("--every", type=int, default=300, help="seconds between ticks (default 300)")
+    loop.add_argument("--every", type=int, default=300,
+                      help=f"seconds between ticks (default 300, at least {MIN_EVERY})")
+    loop.add_argument("--no-console", action="store_true", help="the plain loop, even at a terminal")
     loop.set_defaults(run=cmd_run)
     pending = commands.add_parser("pending", help="list proposals waiting for approval")
     pending.add_argument("--reveal", action="store_true", help="print sealed proposals too")
     pending.set_defaults(run=cmd_pending)
     approve = commands.add_parser("approve", help="put a proposal live")
-    approve.add_argument("number", type=int)
+    approve.add_argument("number", type=int, nargs="?", help="optional when only one proposal is waiting")
     approve.set_defaults(run=cmd_approve)
     reject = commands.add_parser("reject", help="discard a proposal")
     reject.add_argument("number", type=int)
@@ -2408,7 +2446,12 @@ def main():
     canon.add_argument("--retire", type=int, metavar="ID", help="withdraw a fact")
     canon.add_argument("--reveal", action="store_true", help="include facts from sealed plans")
     canon.set_defaults(run=cmd_canon)
-    args = parser.parse_args()
+    parser.known = set(commands.choices)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
 
     console.load_env()
     db = dm_state.connect()

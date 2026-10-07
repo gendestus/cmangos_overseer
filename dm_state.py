@@ -135,9 +135,13 @@ def now():
     return int(time.time())
 
 
+def state_path():
+    return os.environ.get("DM_STATE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.db")
+
+
 def connect():
-    path = os.environ.get("DM_STATE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.db")
-    db = sqlite3.connect(path)
+    db = sqlite3.connect(state_path())
+    db.execute("PRAGMA busy_timeout = 5000")    # a console's two connections, and other shells, wait for each other
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
     for table, column, declaration in ADDED_COLUMNS:

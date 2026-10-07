@@ -1927,5 +1927,68 @@ class Campaigns(unittest.TestCase):
         self.assertEqual(len(bounties), 3)                  # the arc in force kept the bounties coming
 
 
+class RunGroundwork(unittest.TestCase):
+    """What the console needs from dm.py: a reusable parser, one run per state.db, patient connections."""
+
+    def setUp(self):
+        os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
+        self.db = dm_state.connect()
+
+    def tearDown(self):
+        self.db.close()
+
+    def add(self, kind="bounty"):
+        self.db.execute("INSERT INTO proposals (guid, name, spec, type) VALUES (1, 'Zachadin', '{}', ?)", (kind,))
+        self.db.commit()
+
+    def approve(self, number=None):
+        applied = []
+        with mock.patch.object(console, "paused", return_value=None), \
+                mock.patch.object(dm, "show_proposal"), \
+                mock.patch.object(dm, "approve_proposal", lambda db, row, say: applied.append(row["id"])):
+            dm.cmd_approve(self.db, argparse.Namespace(number=number))
+        return applied
+
+    def test_the_parser_is_reusable_and_knows_its_commands(self):
+        parser = dm.build_parser()
+        self.assertIn("approve", parser.known)
+        self.assertIn("run", parser.known)
+        self.assertTrue(parser.parse_args(["run", "--no-console"]).no_console)
+        self.assertIsNone(parser.parse_args(["approve"]).number)
+
+    def test_connections_wait_for_each_other(self):
+        self.assertEqual(self.db.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
+
+    def test_a_second_run_is_refused(self):
+        held = dm.run_lock()
+        try:
+            with self.assertRaises(SystemExit) as stop:
+                dm.run_lock()
+            self.assertIn(str(os.getpid()), str(stop.exception.code))
+        finally:
+            held.close()
+        dm.run_lock().close()                   # free again once the first lets go
+
+    def test_too_short_an_interval_is_refused(self):
+        with self.assertRaises(SystemExit):
+            dm.cmd_run(self.db, argparse.Namespace(every=5, no_console=True))
+
+    def test_approve_alone_takes_the_only_proposal(self):
+        self.add()
+        self.assertEqual(self.approve(), [1])
+
+    def test_approve_alone_refuses_a_choice(self):
+        self.add()
+        self.add("arc")
+        with self.assertRaises(SystemExit) as stop:
+            self.approve()
+        self.assertIn("2 proposals are waiting", stop.exception.code)
+
+    def test_approve_alone_with_nothing_waiting(self):
+        with self.assertRaises(SystemExit) as stop:
+            self.approve()
+        self.assertIn("no proposals waiting", stop.exception.code)
+
+
 if __name__ == "__main__":
     unittest.main()
