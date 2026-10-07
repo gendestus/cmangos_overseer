@@ -258,6 +258,10 @@ A character's story plays out in **chapters**, one per zone. A character has set
 
 Each arc is planned from the chapter's next seed, and its adversary must be one of the zone's enemies. Settling in another zone pauses the chapter and ends its arc; coming back resumes it. A chapter finishes when a bounty against its finale creature is turned in or its seeds run out, and a character who stays on gets a sequel. An arc already in force when a chapter is written runs to its end first. Dossiers are built once and kept in `state.db`; `dm.py dossier <zone> --refresh` rebuilds one after the world database changes.
 
+### Sealed plans
+
+Chapters and arcs are spoilers if you play on the server. List them in `DM_SEALED` and they go into force without review, while `pending`, `arc`, `chapter`, `context`, `canon` and the tick's log say only that they exist. Each of those commands takes `--reveal` to read them anyway. The model is always shown everything.
+
 ## Canon
 
 Every bounty and arc may establish up to two **facts**: one sentence each, in the world's terms ("Marshal McBride keeps a list of the paid kobolds"), never a plan. They are recorded on approval, so a rejected proposal establishes nothing, and each is tagged with the character, the zone and, for a bounty, the herald. A prompt is shown up to ten, newest first: the character's own, anyone's about the zone they are in or an NPC on their herald list, and any you stated with no tag at all. That is how one character's story can touch another's without contradicting it. `dm.py pending` shows what a proposal would establish. The design is in `docs/proposal_campaign_layer.md`.
@@ -282,6 +286,7 @@ All settings are read from the environment, or from `.env` in this folder.
 | `DM_PRIZE_LEVEL_SPAN` | `4` | Levels a character must gain between rare prizes |
 | `DM_PRIZE_REACH` | `5` | How many levels above the character a prize may be |
 | `DM_AUTO_APPROVE` | `letter` | Proposal types that skip review: `bounty`, `arc`, `chapter`, `letter` |
+| `DM_SEALED` | empty | Plan types you do not want to read: `arc`, `chapter`. Approved without review and printed only with `--reveal` |
 | `DM_SETTLE_TICKS` | `3` | Ticks in one zone before a character counts as settled there |
 | `DM_PLAN_MODEL` | `DM_MODEL` | Model for the rare planning calls (chapters) |
 | `DM_CHARACTERS` | empty | If set, the only characters the DM notices. Needed on a playerbot realm |

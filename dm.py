@@ -52,6 +52,9 @@ Settings, on top of the ones the other scripts use:
                             bounty, arc, chapter, letter (default: letter)
     DM_SETTLE_TICKS         consecutive ticks in one zone before a character counts as settled there
                             (default 3)
+    DM_SEALED               plan types you do not want to read, comma separated: arc, chapter.
+                            They are approved without review, and their text is printed only
+                            with --reveal. For an owner who plays on the server
     DM_CHARACTERS           if set, the only characters the DM notices, comma separated.
                             Set this on a playerbot realm, where a thousand characters
                             exist and only a few of them are people
@@ -67,6 +70,10 @@ Settings, on top of the ones the other scripts use:
 Paused means paused: no tick, no model call, no quest written and no console
 command sent, whichever script is run. Reading is unaffected, so `story`,
 `arc`, `context` and `pending` still answer.
+
+Sealed means unread: a sealed plan goes into force without review, and every
+command that would print it (`pending`, `arc`, `chapter`, `context`, `canon`
+and the tick's own log) says only that it exists, unless given --reveal.
 """
 import argparse
 import copy
@@ -226,8 +233,30 @@ class ApproveFailed(Exception):
 
 
 def auto_approved():
-    """Proposal types that go live without waiting for a person."""
-    return {part.strip().lower() for part in os.environ.get("DM_AUTO_APPROVE", "letter").split(",") if part.strip()}
+    """Proposal types that go live without waiting for a person. A sealed type is one of them."""
+    found = {part.strip().lower() for part in os.environ.get("DM_AUTO_APPROVE", "letter").split(",") if part.strip()}
+    return found | sealed()
+
+
+def sealed():
+    """Plan types the owner has chosen not to read: approved without review, and printed only with --reveal."""
+    return {part.strip().lower() for part in os.environ.get("DM_SEALED", "").split(",") if part.strip()}
+
+
+def arc_called(arc):
+    """'the arc against the Scourge', or just 'the arc' when arcs are sealed."""
+    return "the arc" if "arc" in sealed() else f"the arc against {arc['adversary']}"
+
+
+def plan_note(kind, text):
+    """' (adversary: X)' for the log, or '' when plans of this kind are sealed."""
+    return "" if kind in sealed() else f" ({text})"
+
+
+def fact_sealed(row, shown):
+    """Whether a canon fact came from a plan whose kind is sealed and not revealed."""
+    kind = (row["source"] or "").split(" ")[0]
+    return kind in sealed() - shown
 
 
 def setting(name, default):
@@ -435,7 +464,7 @@ def observe_bounties(db, players, progress, say):
                                 (quest["concludes_arc"],)).fetchone() if quest["concludes_arc"] else None
             if finale:
                 dm_state.end_arc(db, finale, "resolved")
-                say(f"  {row['name']}: the arc against {finale['adversary']} has ended; a new one will be planned")
+                say(f"  {row['name']}: {arc_called(finale)} has ended; a new one will be planned")
             chapter = dm_state.active_chapter(db, quest["guid"])
             if chapter and chapter["finale_creature"] is not None:
                 try:
@@ -503,10 +532,12 @@ def establish(db, guid, zone, creature, facts, source):
         dm_state.add_canon(db, guid, zone, creature, fact, source)
 
 
-def story_section(db, who, givers=()):
+def story_section(db, who, givers=(), hidden=()):
     """Everything the model needs to carry the story forward for one character.
 
     givers is the candidate herald list; facts about any of them are shown.
+    hidden is plan kinds to leave out, for printing to an owner who has sealed
+    them; the model is always shown everything.
     """
     known = dm_state.get_character(db, who["guid"])
     history = dm_state.quest_history(db, who["guid"])
@@ -557,15 +588,22 @@ def story_section(db, who, givers=()):
         lines.append("- nothing new")
 
     saga = saga_lines(db, who["guid"])
-    if saga:
+    if saga and "arc" not in hidden:
         lines += ["", "Earlier arcs, now ended, oldest first:"] + saga
     chapter = chapter_block(db, who["guid"])
     if chapter:
-        lines += ["", chapter]
+        lines += ["", "[the chapter in force is sealed]" if "chapter" in hidden else chapter]
     arc = dm_state.active_arc(db, who["guid"])
     if arc:
-        lines += ["", arc_text(arc, "Your private arc for this character (never state it to the player):")]
+        lines += ["", "[the arc in force is sealed]" if "arc" in hidden
+                  else arc_text(arc, "Your private arc for this character (never state it to the player):")]
     facts = canon_lines(db, who["guid"], who.get("zone"), [g["creature"] for g in givers])
+    if facts and hidden:
+        found = dm_state.canon_for(db, who["guid"], who.get("zone"), [g["creature"] for g in givers])
+        kept = [row for row in found if (row["source"] or "").split(" ")[0] not in hidden]
+        facts = ["Established facts (never contradict them):"] + [f"- {row['fact']}" for row in kept]
+        if len(kept) < len(found):
+            facts.append(f"- [{len(found) - len(kept)} more, from sealed plans]")
     if facts:
         lines += [""] + facts
 
@@ -730,7 +768,7 @@ def propose_arc(db, who, seed, say, chapter=None):
                (dm_state.now(), who["guid"], who["name"], json.dumps(arc), arc["dm_note"], usage.get("model"),
                 usage.get("input_tokens"), usage.get("output_tokens")))
     number = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-    say(f"  {who['name']}: arc proposal {number} written (adversary: {arc['adversary']})")
+    say(f"  {who['name']}: arc proposal {number} written{plan_note('arc', 'adversary: ' + arc['adversary'])}")
     return number
 
 
@@ -788,7 +826,7 @@ def follow_zone(db, who, say):
         arc = dm_state.active_arc(db, guid)
         if arc:
             dm_state.end_arc(db, arc, "left")
-            say(f"  {who['name']}: the arc against {arc['adversary']} ends here")
+            say(f"  {who['name']}: {arc_called(arc)} ends here")
         if dm_state.withdraw_proposals(db, guid, "arc"):
             say(f"  {who['name']}: the arc waiting for approval no longer fits and was withdrawn")
     waiting = dm_state.pending_proposal(db, guid, "chapter")
@@ -939,8 +977,8 @@ def propose_chapter(db, who, dossier, say):
                (dm_state.now(), who["guid"], who["name"], json.dumps(chapter), chapter["dm_note"], usage.get("model"),
                 usage.get("input_tokens"), usage.get("output_tokens")))
     number = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-    say(f"  {who['name']}: chapter proposal {number} written for {world_query.zone_name(dossier['zone'])} "
-        f"(adversary: {chapter['adversary']})")
+    say(f"  {who['name']}: chapter proposal {number} written for {world_query.zone_name(dossier['zone'])}"
+        + plan_note("chapter", "adversary: " + chapter["adversary"]))
     return number
 
 
@@ -1277,7 +1315,7 @@ def tick(db, say=print):
             arc = dm_state.active_arc(db, who["guid"])
             if arc and not dm_state.open_quest(db, who["guid"]) and arc_outgrown(arc, who["level"]):
                 dm_state.end_arc(db, arc, "outgrown")
-                say(f"  {who['name']}: outgrew the arc against {arc['adversary']}; a new one will be planned")
+                say(f"  {who['name']}: outgrew {arc_called(arc)}; a new one will be planned")
             # A chapter follows the character to wherever they settle.
             dossier = follow_zone(db, who, say)
             if dossier:
@@ -1342,7 +1380,11 @@ def voice_text(db, creature, written):
     return f"settled{pinned}, and kept: {stored['note']}\n          (the model wrote: {written or 'nothing'})"
 
 
-def show_proposal(db, row):
+def show_proposal(db, row, reveal=False):
+    if row["type"] in sealed() and not reveal:
+        print(f"\n=== Proposal {row['id']}: {row['type'].upper()} for {row['name']}  "
+              f"({dm_state.ago(row['ts'])} ago, {row['status']}): sealed; --reveal to read it ===")
+        return
     if row["type"] == "chapter":
         chapter = dict(json.loads(row["payload"]), current_seed=0)
         print(f"\n=== Proposal {row['id']}: CHAPTER for {row['name']}  ({dm_state.ago(row['ts'])} ago, {row['status']}) ===")
@@ -1399,7 +1441,7 @@ Model's note: {row['dm_note']}   [{row['model']}, tokens {row['tokens_in']}/{row
         print(f"** warning: {warning}")
 
 
-def cmd_pending(db, _args):
+def cmd_pending(db, args):
     stopped = console.paused()
     if stopped:
         print(f"** the DM is paused ({stopped}). Nothing can reach the game until you resume. **\n")
@@ -1407,7 +1449,7 @@ def cmd_pending(db, _args):
     if not found:
         print("no proposals waiting.")
     for row in found:
-        show_proposal(db, row)
+        show_proposal(db, row, reveal=args.reveal)
     if found:
         print("\napprove with: python3 dm.py approve <number>    reject with: python3 dm.py reject <number> \"why\"")
 
@@ -1454,6 +1496,11 @@ def cmd_arc(db, args):
             sys.exit(f"dm: no arc written: {error}")
         db.commit()
         return
+    if "arc" in sealed() and not args.reveal:
+        arc = dm_state.active_arc(db, who["guid"])
+        print(f"{who['name']}: {len(dm_state.past_arcs(db, who['guid'], limit=1000))} arc(s) ended, "
+              f"{'one' if arc else 'none'} in force. Arcs are sealed; --reveal to read them.")
+        return
     print(f"=== Arcs for {who['name']} (spoilers if you play this character) ===")
     saga = saga_lines(db, who["guid"])
     if saga:
@@ -1474,6 +1521,11 @@ def cmd_chapter(db, args):
     if not row:
         sys.exit(f"dm: the Overseer has not noticed anyone called {args.character}")
     found = dm_state.chapters_of(db, row["guid"])
+    if "chapter" in sealed() and not args.reveal:
+        print(f"{row['name']}: {len(found)} chapter(s)" + "".join(
+            f"\n  {world_query.zone_name(c['zone'])}: {c['status']}" for c in found)
+            + "\nChapters are sealed; --reveal to read them.")
+        return
     print(f"=== Chapters for {row['name']} (spoilers if you play this character) ===")
     if not found:
         print(f"\nNone yet. One is written once they spend {settle_ticks()} ticks in a zone with its own quests.")
@@ -1665,7 +1717,11 @@ def cmd_context(db, args):
     except write_quest.NoContext as error:
         sys.exit(f"dm: {error}")
     enrich_heralds(db, who["guid"], context)
-    print(write_quest.user_message(context, None, story=story_section(db, context["character"], context["givers"])))
+    hidden = set() if args.reveal else sealed()
+    print(write_quest.user_message(context, None,
+                                   story=story_section(db, context["character"], context["givers"], hidden)))
+    if hidden & {"arc", "chapter"}:
+        print("\n(sealed plans are left out above; the model is shown them. --reveal to read them.)")
 
 
 def cmd_voices(db, _args):
@@ -1766,8 +1822,13 @@ def cmd_canon(db, args):
               else f"fact {number} established; every prompt is shown it.")
         return
     found = dm_state.all_canon(db, guid)
-    if not found:
+    shown = sealed() if args.reveal else set()
+    hidden = [row for row in found if fact_sealed(row, shown)]
+    found = [row for row in found if not fact_sealed(row, shown)]
+    if not found and not hidden:
         print("no facts established yet.")
+    if hidden:
+        print(f"({len(hidden)} fact(s) from sealed plans not shown; --reveal to read them)")
     for row in found:
         about = []
         if row["guid"] is not None:
@@ -1807,7 +1868,9 @@ def main():
     loop = commands.add_parser("run", help="keep ticking")
     loop.add_argument("--every", type=int, default=300, help="seconds between ticks (default 300)")
     loop.set_defaults(run=cmd_run)
-    commands.add_parser("pending", help="list proposals waiting for approval").set_defaults(run=cmd_pending)
+    pending = commands.add_parser("pending", help="list proposals waiting for approval")
+    pending.add_argument("--reveal", action="store_true", help="print sealed proposals too")
+    pending.set_defaults(run=cmd_pending)
     approve = commands.add_parser("approve", help="put a proposal live")
     approve.add_argument("number", type=int)
     approve.set_defaults(run=cmd_approve)
@@ -1821,9 +1884,11 @@ def main():
     arc = commands.add_parser("arc", help="show a character's private arc, or reseed it")
     arc.add_argument("character")
     arc.add_argument("--seed", metavar="TEXT", help="a direction; a new arc is written around it")
+    arc.add_argument("--reveal", action="store_true", help="read it even if arcs are sealed")
     arc.set_defaults(run=cmd_arc)
     chapter = commands.add_parser("chapter", help="show a character's zone chapters (a spoiler)")
     chapter.add_argument("character")
+    chapter.add_argument("--reveal", action="store_true", help="read them even if chapters are sealed")
     chapter.set_defaults(run=cmd_chapter)
     dossier = commands.add_parser("dossier", help="a zone's own story, from its stock quests")
     dossier.add_argument("zone", type=int)
@@ -1839,6 +1904,7 @@ def main():
     purge.set_defaults(run=cmd_purge)
     context = commands.add_parser("context", help="show what the model would be told; no model call")
     context.add_argument("character")
+    context.add_argument("--reveal", action="store_true", help="include sealed plans")
     context.set_defaults(run=cmd_context)
     commands.add_parser("voices", help="every herald's settled voice note").set_defaults(run=cmd_voices)
     voice = commands.add_parser("voice", help="show one herald's voice, or set or clear its note")
@@ -1852,6 +1918,7 @@ def main():
     canon.add_argument("--zone", type=int, help="with --add: the zone id it concerns")
     canon.add_argument("--creature", type=int, help="with --add: the creature id it concerns")
     canon.add_argument("--retire", type=int, metavar="ID", help="withdraw a fact")
+    canon.add_argument("--reveal", action="store_true", help="include facts from sealed plans")
     canon.set_defaults(run=cmd_canon)
     args = parser.parse_args()
 

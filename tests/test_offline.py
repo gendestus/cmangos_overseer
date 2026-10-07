@@ -7,7 +7,10 @@ They cover the rules the DM enforces on a model's answer, the SQL renderer,
 the console allow-list and the memory file's schema upgrade. Anything that
 talks to the game is tested by hand with the smoke tests in the README.
 """
+import argparse
+import contextlib
 import inspect
+import io
 import json
 import os
 import re
@@ -1676,6 +1679,82 @@ class Chapters(unittest.TestCase):
         self.assertEqual(messages[0][0], "submit_chapter")          # then an arc from the sequel's first seed
         self.assertIn("this one is its sequel", messages[0][1])
         self.assertEqual([c["status"] for c in dm_state.chapters_of(db, 1)], ["finished", "active"])
+
+
+class Sealing(unittest.TestCase):
+    """A plan the owner chose not to read is put in force without being printed."""
+
+    def setUp(self):
+        os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
+        self.db = dm_state.connect()
+        self.addCleanup(self.db.close)
+        sealed = mock.patch.dict(os.environ, {"DM_SEALED": "chapter,arc", "DM_AUTO_APPROVE": "letter"})
+        sealed.start()
+        self.addCleanup(sealed.stop)
+        self.who = dict(CONTEXT["character"], zone=40, map=0, x=0, y=0, online=1)
+        dm_state.save_character(self.db, self.who, [], [], [], first=True)
+
+    def printed(self, command, **args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            command(self.db, argparse.Namespace(**args))
+        return out.getvalue()
+
+    def propose_chapter(self):
+        stub = os.path.join(tempfile.mkdtemp(), "chapter.json")
+        with open(stub, "w") as handle:
+            json.dump(CHAPTER, handle)
+        said = []
+        with mock.patch.dict(os.environ, {"DM_LLM_PROVIDER": "stub", "DM_LLM_STUB": stub}):
+            number = dm.propose_chapter(self.db, self.who, DOSSIER, said.append)
+        return number, said
+
+    def test_a_sealed_type_is_approved_without_review(self):
+        self.assertTrue({"chapter", "arc", "letter"} <= dm.auto_approved())
+        number, said = self.propose_chapter()
+        self.assertTrue(dm.settle(self.db, number, said.append))
+        self.assertEqual(dm_state.active_chapter(self.db, 1)["premise"], CHAPTER["premise"])
+        log = "\n".join(said)
+        self.assertNotIn("Defias", log)
+        self.assertNotIn(CHAPTER["premise"], log)
+
+    def test_pending_chapter_and_canon_hide_its_text_unless_revealed(self):
+        number, _said = self.propose_chapter()
+        hidden = self.printed(dm.cmd_pending, reveal=False)
+        self.assertIn("sealed", hidden)
+        self.assertNotIn(CHAPTER["premise"], hidden)
+        self.assertIn(CHAPTER["premise"], self.printed(dm.cmd_pending, reveal=True))
+
+        row = self.db.execute("SELECT * FROM proposals WHERE id = ?", (number,)).fetchone()
+        payload = dict(json.loads(row["payload"]), canon_add=["The Defias are paid from inside Stormwind."])
+        self.db.execute("UPDATE proposals SET payload = ? WHERE id = ?", (json.dumps(payload), number))
+        dm.approve_proposal(self.db, self.db.execute("SELECT * FROM proposals WHERE id = ?", (number,)).fetchone(),
+                            lambda _line: None)
+        listing = self.printed(dm.cmd_chapter, character="Zachadin", reveal=False)
+        self.assertIn("Westfall: active", listing)
+        self.assertNotIn(CHAPTER["premise"], listing)
+        self.assertIn(CHAPTER["premise"], self.printed(dm.cmd_chapter, character="Zachadin", reveal=True))
+        canon = dict(character=None, add=None, zone=None, creature=None, retire=None)
+        self.assertNotIn("paid from inside", self.printed(dm.cmd_canon, reveal=False, **canon))
+        self.assertIn("paid from inside", self.printed(dm.cmd_canon, reveal=True, **canon))
+
+    def test_the_owners_copy_of_the_prompt_leaves_sealed_plans_out_and_the_models_does_not(self):
+        number, _said = self.propose_chapter()
+        dm.approve_proposal(self.db, self.db.execute("SELECT * FROM proposals WHERE id = ?", (number,)).fetchone(),
+                            lambda _line: None)
+        self.db.execute("INSERT INTO arcs (guid, premise, lure, adversary, beats, signature_reward) "
+                        "VALUES (1, 'A secret premise.', 'A secret lure.', 'the Defias', '[]', '')")
+        owner = dm.story_section(self.db, self.who, (), dm.sealed())
+        model = dm.story_section(self.db, self.who)
+        for secret in ("A secret lure.", CHAPTER["premise"].split()[0] + " is starving"):
+            self.assertNotIn(secret, owner)
+            self.assertIn(secret, model)
+        self.assertIn("[the arc in force is sealed]", owner)
+
+    def test_the_tick_log_does_not_name_a_sealed_arcs_adversary(self):
+        self.assertEqual(dm.arc_called({"adversary": "the Defias"}), "the arc")
+        with mock.patch.dict(os.environ, {"DM_SEALED": ""}):
+            self.assertEqual(dm.arc_called({"adversary": "the Defias"}), "the arc against the Defias")
 
 
 if __name__ == "__main__":
