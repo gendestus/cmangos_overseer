@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS proposals (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, guid INTEGER, name TEXT, spec TEXT,
     target TEXT, announcement TEXT, dm_note TEXT, story_beat TEXT, story_so_far TEXT,
     model TEXT, tokens_in INTEGER, tokens_out INTEGER,
-    status TEXT NOT NULL DEFAULT 'pending',      -- pending, approved, rejected
+    status TEXT NOT NULL DEFAULT 'pending',      -- pending, approved, rejected, withdrawn
     decided_at INTEGER, reason TEXT
 );
 CREATE TABLE IF NOT EXISTS seen_letters (id INTEGER PRIMARY KEY);
@@ -73,6 +73,25 @@ CREATE TABLE IF NOT EXISTS canon (
     source TEXT,                                 -- 'bounty 30012', 'arc 7', 'chapter 3', 'owner'
     status TEXT NOT NULL DEFAULT 'active'        -- active, retired
 );
+CREATE TABLE IF NOT EXISTS dossiers (
+    zone INTEGER, side TEXT,                     -- alliance or horde: each sees only the quests it can take
+    data TEXT,                                   -- JSON from world_query.zone_dossier
+    built_at INTEGER,
+    PRIMARY KEY (zone, side)
+);
+CREATE TABLE IF NOT EXISTS chapters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, guid INTEGER, zone INTEGER,
+    status TEXT NOT NULL DEFAULT 'active',       -- active, paused, finished
+    premise TEXT,
+    local_cast TEXT,                             -- JSON list of creature ids from the dossier, favoured as heralds
+    adversary TEXT, adversary_creature INTEGER,  -- the local adversary, from the dossier's enemies
+    seeds TEXT,                                  -- JSON list of one-line ideas for mini-arcs, in order
+    current_seed INTEGER NOT NULL DEFAULT 0,     -- index of the next seed an arc is planned from
+    finale TEXT, finale_creature INTEGER,        -- what ends the chapter; the creature when there is one
+    hooks TEXT, model TEXT,
+    created_at INTEGER, updated_at INTEGER, ended_at INTEGER,
+    end_reason TEXT                              -- finale, seeds (they ran out)
+);
 """
 
 # Columns added after the first release; applied to an existing state.db on open.
@@ -94,6 +113,10 @@ ADDED_COLUMNS = (
     ("quests", "ender_id", "INTEGER"),                         # creature id of the NPC who receives the turn-in
     ("quests", "ender", "TEXT"),                               # and their name
     ("quests", "handed_over", "TEXT"),                         # what the character gives at turn-in, e.g. "12 Stolen Book"
+    ("characters", "zone_ticks", "INTEGER NOT NULL DEFAULT 0"),  # consecutive ticks seen in the same zone
+    ("arcs", "chapter", "INTEGER"),                            # the chapter this arc plays out, if any
+    ("arcs", "chapter_seed", "INTEGER"),                       # which of its seeds the arc was planned from
+    ("arcs", "adversary_creature", "INTEGER"),                 # the adversary as a creature id, when it is one
 )
 
 
@@ -161,14 +184,16 @@ def save_character(db, who, known_quests, known_spells, party, first=False):
     stamp = now()
     if first:
         db.execute("INSERT INTO characters (guid, name, race, class, level, zone, first_seen, last_seen, "
-                   "known_quests, known_spells, party) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   "known_quests, known_spells, party, zone_ticks) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
                    (who["guid"], who["name"], who["race"], who["class"], who["level"], who["zone"], stamp, stamp,
                     json.dumps(sorted(known_quests)), json.dumps(sorted(known_spells)), json.dumps(party)))
     else:
+        # Every right-hand side reads the old row, so zone_ticks compares against the zone last seen.
         db.execute("UPDATE characters SET name = ?, level = ?, zone = ?, last_seen = ?, known_quests = ?, "
-                   "known_spells = ?, party = ? WHERE guid = ?",
+                   "known_spells = ?, party = ?, zone_ticks = CASE WHEN zone = ? THEN zone_ticks + 1 ELSE 1 END "
+                   "WHERE guid = ?",
                    (who["name"], who["level"], who["zone"], stamp, json.dumps(sorted(known_quests)),
-                    json.dumps(sorted(known_spells)), json.dumps(party), who["guid"]))
+                    json.dumps(sorted(known_spells)), json.dumps(party), who["zone"], who["guid"]))
 
 
 def note_companion(db, quest, other, descr, how):
@@ -220,7 +245,7 @@ def past_arcs(db, guid, limit=6):
 
 
 def end_arc(db, arc, reason):
-    """Close an arc. reason: resolved (its finale was turned in), outgrown, or replaced."""
+    """Close an arc. reason: resolved (its finale was turned in), outgrown, replaced, or left (settled elsewhere)."""
     db.execute("UPDATE arcs SET status = ?, end_reason = ?, ended_at = ?, updated_at = ? WHERE id = ?",
                ("superseded" if reason == "replaced" else "completed", reason, now(), now(), arc["id"]))
 
@@ -229,6 +254,47 @@ def active_arc(db, guid):
     """The private plan the Overseer is following for this character, if one is approved."""
     return db.execute("SELECT * FROM arcs WHERE guid = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
                       (guid,)).fetchone()
+
+
+def cached_dossier(db, zone, side):
+    row = db.execute("SELECT data FROM dossiers WHERE zone = ? AND side = ?", (zone, side)).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def store_dossier(db, dossier):
+    db.execute("INSERT INTO dossiers (zone, side, data, built_at) VALUES (?, ?, ?, ?) "
+               "ON CONFLICT (zone, side) DO UPDATE SET data = excluded.data, built_at = excluded.built_at",
+               (dossier["zone"], dossier["side"], json.dumps(dossier), now()))
+
+
+def active_chapter(db, guid):
+    """The chapter in force for this character: where their story is playing out now."""
+    return db.execute("SELECT * FROM chapters WHERE guid = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+                      (guid,)).fetchone()
+
+
+def paused_chapter(db, guid, zone):
+    """A chapter this character left unfinished in this zone, to resume on their return."""
+    return db.execute("SELECT * FROM chapters WHERE guid = ? AND zone = ? AND status = 'paused' "
+                      "ORDER BY id DESC LIMIT 1", (guid, zone)).fetchone()
+
+
+def chapters_of(db, guid):
+    """Every chapter for this character, oldest first."""
+    return db.execute("SELECT * FROM chapters WHERE guid = ? ORDER BY id", (guid,)).fetchall()
+
+
+def set_chapter_status(db, chapter, status, reason=None):
+    """Pause, resume (active) or finish a chapter. reason, on finishing: finale or seeds."""
+    stamp = now()
+    db.execute("UPDATE chapters SET status = ?, updated_at = ?, ended_at = ?, end_reason = ? WHERE id = ?",
+               (status, stamp, stamp if status == "finished" else None, reason, chapter["id"]))
+
+
+def withdraw_proposals(db, guid, kind):
+    """Set aside pending proposals of one type that events have made moot. Not a rejection: no reason reaches the model."""
+    return db.execute("UPDATE proposals SET status = 'withdrawn', decided_at = ? WHERE guid = ? AND type = ? "
+                      "AND status = 'pending'", (now(), guid, kind)).rowcount
 
 
 def record_reward(db, guid, quest, tier, items, names, level):

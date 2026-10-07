@@ -362,6 +362,8 @@ def herald_block(g):
         block.append(f"  In {own} own words: " + " / ".join(f'"{line["text"]}"' for line in g["lines"]))
     if g.get("history") is not None:
         block.append(f"  With this character: {g['history']}")
+    if g.get("chapter_cast"):
+        block.append("  Part of this chapter's cast: prefer them when the errand fits.")
     return block
 
 

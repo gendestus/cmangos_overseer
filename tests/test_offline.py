@@ -1437,5 +1437,246 @@ class Canon(unittest.TestCase):
         self.assertEqual((fact["zone"], fact["creature"], fact["source"]), (12, None, "arc 1"))
 
 
+DOSSIER = {
+    "zone": 40, "side": "alliance", "quests": 35, "low": 9, "high": 44,
+    "quest_lines": [{"title": "The People's Militia", "level": 14}],
+    "cast": [{"creature": 234, "name": "Gryan Stoutmantle", "title": "The People's Militia", "quests": 6},
+             {"creature": 392, "name": "Captain Grayson", "title": "", "quests": 3}],
+    "enemies": [{"creature": 95, "name": "Defias Smuggler", "low": 11, "high": 12, "notable": False},
+                {"creature": 639, "name": "Edwin VanCleef", "low": 21, "high": 21, "notable": True}],
+}
+
+CHAPTER = {
+    "premise": "Westfall is starving and the Defias are paid to keep it so.", "local_cast": [234],
+    "adversary": "the Defias Brotherhood", "adversary_creature": 95,
+    "seeds": ["Learn who pays the bandits.", "Follow the money to the coast."],
+    "finale": "Edwin VanCleef falls in the Deadmines.", "finale_creature": 639,
+    "hooks": "The money came from Stormwind.", "dm_note": "the zone's own story", "canon_add": [],
+}
+
+
+class ZoneDossier(unittest.TestCase):
+    def test_titles_are_deduplicated_and_every_list_is_limited(self):
+        lines = [{"title": f"Quest {n % 30}", "level": n} for n in range(60)]
+        cast = [{"creature": n, "name": f"Giver {n}", "title": "", "faction": 12, "quests": 1} for n in range(30)]
+        foes = [{"creature": n, "name": f"Foe {n}", "low": n, "high": n + 1, "notable": 0} for n in range(30)]
+        d = world_query.shape_dossier(40, "alliance", {"quests": 60, "low": 1, "high": 60}, lines, cast, foes)
+        titles = [q["title"] for q in d["quest_lines"]]
+        self.assertEqual(len(titles), len(set(titles)))
+        self.assertEqual(len(titles), world_query.DOSSIER_LIMITS["quests"])
+        self.assertEqual(len(d["cast"]), world_query.DOSSIER_LIMITS["cast"])
+        self.assertEqual(len(d["enemies"]), world_query.DOSSIER_LIMITS["enemies"])
+
+    def test_givers_hostile_to_the_side_are_left_out(self):
+        cast = [{"creature": 1, "name": "Ally", "title": "", "faction": 12, "quests": 2},
+                {"creature": 2, "name": "Foe", "title": "", "faction": 85, "quests": 9}]
+        d = world_query.shape_dossier(267, "alliance", {"quests": 12}, [], cast, [], friendly=lambda f: f == 12)
+        self.assertEqual([c["name"] for c in d["cast"]], ["Ally"])
+
+    def test_the_text_carries_ids_and_marks_notable_creatures(self):
+        text = world_query.dossier_text(DOSSIER)
+        self.assertIn("234 Gryan Stoutmantle <The People's Militia> (6)", text)
+        self.assertIn("639 Edwin VanCleef (21-21, notable)", text)
+        self.assertTrue(text.startswith("Westfall: 35 stock quests, levels 9 to 44."))
+
+    def test_races_fall_on_their_side(self):
+        self.assertEqual([world_query.side(r) for r in (1, 3, 4, 7)], ["alliance"] * 4)
+        self.assertEqual([world_query.side(r) for r in (2, 5, 6, 8)], ["horde"] * 4)
+
+
+class Chapters(unittest.TestCase):
+    def fresh(self):
+        os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
+        db = dm_state.connect()
+        self.addCleanup(db.close)
+        return db
+
+    def who(self, zone=40, **changes):
+        return dict(CONTEXT["character"], zone=zone, map=0, x=0, y=0, online=1, **changes)
+
+    def ticks(self, db, who, count):
+        """Record `count` ticks of this character standing in its zone."""
+        if not dm_state.get_character(db, who["guid"]):
+            dm_state.save_character(db, who, [], [], [], first=True)
+            count -= 1
+        for _ in range(count):
+            dm_state.save_character(db, who, [], [], [])
+
+    def dossier(self, quests=35):
+        return lambda zone, side: dict(DOSSIER, zone=zone, side=side, quests=quests)
+
+    def chapter(self, db, zone=40, **changes):
+        db.execute("INSERT INTO proposals (ts, guid, name, type, payload) VALUES (1, 1, 'Zachadin', 'chapter', ?)",
+                   (json.dumps(dict(CHAPTER, zone=zone, side="alliance", **changes)),))
+        row = db.execute("SELECT * FROM proposals ORDER BY id DESC LIMIT 1").fetchone()
+        dm.approve_proposal(db, row, lambda _line: None)
+        return dm_state.active_chapter(db, 1)
+
+    def test_a_zone_change_resets_the_count(self):
+        db = self.fresh()
+        self.ticks(db, self.who(12), 2)
+        self.ticks(db, self.who(40), 1)
+        self.assertEqual(dm_state.get_character(db, 1)["zone_ticks"], 1)
+        self.ticks(db, self.who(40), 2)
+        self.assertEqual(dm_state.get_character(db, 1)["zone_ticks"], 3)
+
+    def test_three_steady_ticks_settle_a_character(self):
+        db = self.fresh()
+        with mock.patch.object(world_query, "zone_dossier", self.dossier()):
+            self.ticks(db, self.who(), 2)
+            self.assertIsNone(dm.settled_dossier(db, self.who()))
+            self.ticks(db, self.who(), 1)
+            self.assertEqual(dm.settled_dossier(db, self.who())["zone"], 40)
+
+    def test_a_city_never_settles_a_character(self):
+        db = self.fresh()
+        with mock.patch.object(world_query, "zone_dossier", self.dossier()):
+            self.ticks(db, self.who(1519), 5)
+            self.assertIsNone(dm.settled_dossier(db, self.who(1519)))
+
+    def test_a_zone_with_too_few_quests_does_not_settle_a_character(self):
+        db = self.fresh()
+        with mock.patch.object(world_query, "zone_dossier", self.dossier(quests=9)):
+            self.ticks(db, self.who(), 5)
+            self.assertIsNone(dm.settled_dossier(db, self.who()))
+
+    def test_a_dossier_is_built_once_and_cached(self):
+        db = self.fresh()
+        built = mock.Mock(side_effect=self.dossier())
+        with mock.patch.object(world_query, "zone_dossier", built):
+            dm.dossier_for(db, 40, "alliance")
+            dm.dossier_for(db, 40, "alliance")
+            dm.dossier_for(db, 40, "horde")
+        self.assertEqual(built.call_count, 2)
+
+    def test_leaving_pauses_the_chapter_and_ends_its_arc_and_returning_resumes_it(self):
+        db = self.fresh()
+        with mock.patch.object(world_query, "zone_dossier", self.dossier()):
+            self.ticks(db, self.who(12), 3)
+            elwynn = self.chapter(db, zone=12)
+            db.execute("INSERT INTO arcs (guid, adversary, beats, chapter) VALUES (1, 'kobolds', '[]', ?)", (elwynn["id"],))
+            db.execute("INSERT INTO proposals (ts, guid, name, type, payload) VALUES (1, 1, 'Z', 'arc', '{}')")
+            self.ticks(db, self.who(40), 3)
+            self.assertEqual(dm.follow_zone(db, self.who(40), lambda _line: None)["zone"], 40)
+            self.assertEqual(db.execute("SELECT status FROM chapters").fetchone()[0], "paused")
+            self.assertEqual(db.execute("SELECT end_reason FROM arcs").fetchone()[0], "left")
+            self.assertIsNone(dm_state.pending_proposal(db, 1, "arc"))
+            self.assertIn("left for another zone", dm.saga_lines(db, 1)[0])
+            self.ticks(db, self.who(12), 3)
+            self.assertIsNone(dm.follow_zone(db, self.who(12), lambda _line: None))
+            self.assertEqual(dm_state.active_chapter(db, 1)["id"], elwynn["id"])
+
+    def test_a_city_is_an_interlude(self):
+        db = self.fresh()
+        with mock.patch.object(world_query, "zone_dossier", self.dossier()):
+            self.chapter(db)
+            self.ticks(db, self.who(1519), 5)
+            self.assertIsNone(dm.follow_zone(db, self.who(1519), lambda _line: None))
+            self.assertEqual(dm_state.active_chapter(db, 1)["zone"], 40)
+
+    def test_a_chapter_must_come_from_the_dossier(self):
+        self.assertEqual(dm.validate_chapter(CHAPTER, DOSSIER)["local_cast"], [234])
+        for bad in ({"local_cast": [999]}, {"adversary_creature": 999}, {"finale_creature": 999},
+                    {"seeds": ["only one"]}, {"premise": ""}):
+            with self.assertRaises(write_quest.Rejected):
+                dm.validate_chapter(dict(CHAPTER, **bad), DOSSIER)
+
+    def test_an_arc_whose_adversary_is_not_in_the_dossier_is_rejected(self):
+        enemies = {95, 639}
+        books = ["Grimoire of Death Coil III"]
+        self.assertEqual(dm.validate_arc(dict(ARC, adversary_creature=95), books, 3, enemies)["adversary_creature"], 95)
+        for creature in (999, None):
+            with self.assertRaises(write_quest.Rejected):
+                dm.validate_arc(dict(ARC, adversary_creature=creature), books, 3, enemies)
+        self.assertIsNone(dm.validate_arc(ARC, books, 3)["adversary_creature"])      # no chapter, no constraint
+
+    def test_the_finale_bounty_finishes_the_chapter(self):
+        db = self.fresh()
+        who = self.who()
+        self.ticks(db, who, 1)
+        chapter = self.chapter(db)
+        db.execute("INSERT INTO arcs (guid, adversary, beats, chapter) VALUES (1, 'Defias', '[]', ?)", (chapter["id"],))
+        spec = {"kill": [{"creature": 639, "count": 1}]}
+        db.execute("INSERT INTO quests (quest, guid, title, spec, issued_at, status, retired_at) "
+                   "VALUES (30001, 1, 'The End', ?, 1, 'accepted', 1)", (json.dumps(spec),))
+        progress = [{"guid": 1, "name": "Zachadin", "quest": 30001, "state": "done"}]
+        dm.observe_bounties(db, [who], progress, lambda _line: None)
+        row = db.execute("SELECT status, end_reason FROM chapters").fetchone()
+        self.assertEqual((row["status"], row["end_reason"]), ("finished", "finale"))
+        self.assertIsNone(dm_state.active_arc(db, 1))
+
+    def test_the_bounty_prompt_carries_the_chapter_and_marks_its_cast(self):
+        db = self.fresh()
+        self.ticks(db, self.who(), 1)
+        self.chapter(db, premise="word " * 200)
+        block = dm.chapter_block(db, 1)
+        self.assertLessEqual(len(block.split(":", 1)[1].split()), dm.CHAPTER_WORDS + 1)
+        context = {"givers": [{"creature": 234, "name": "Gryan Stoutmantle", "distance": 5, "direction": "north"},
+                              {"creature": 197, "name": "Marshal McBride", "distance": 9, "direction": "south"}]}
+        dm.enrich_heralds(db, 1, context)
+        self.assertIn("Part of this chapter's cast", "\n".join(write_quest.herald_block(context["givers"][0])))
+        self.assertNotIn("chapter's cast", "\n".join(write_quest.herald_block(context["givers"][1])))
+
+    def run_ticks(self, db, who, count, stub, messages):
+        """Run real ticks with the stub model and a fake game around one online character."""
+        real = dm.llm.ask_for_tool_call
+
+        def ask(system, message, tool, **kwargs):
+            messages.append((tool["name"], message))
+            return real(system, message, tool, **kwargs)
+
+        env = {"DM_LLM_PROVIDER": "stub", "DM_LLM_STUB": stub, "DM_AUTO_APPROVE": "chapter,arc"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(dm.llm, "ask_for_tool_call", ask), \
+                mock.patch.object(console, "paused", return_value=None), mock.patch.object(console, "run"), \
+                mock.patch.object(world_query, "online_characters", return_value=[who]), \
+                mock.patch.object(world_query, "parties", return_value={}), \
+                mock.patch.object(world_query, "dm_quest_progress", return_value=[]), \
+                mock.patch.object(world_query, "rewarded_quests", return_value={}), \
+                mock.patch.object(world_query, "borrowed_capstones", return_value={}), \
+                mock.patch.object(world_query, "reward_items", return_value=[]), \
+                mock.patch.object(world_query, "zone_dossier", self.dossier()), \
+                mock.patch.object(dm, "wants_bounty", return_value="not in this test"):
+            for _ in range(count):
+                dm.tick(db, say=lambda _line: None)
+
+    def test_settling_writes_a_chapter_and_the_next_arc_plays_its_first_seed(self):
+        db = self.fresh()
+        stub = tempfile.mkdtemp()
+        for name, answer in (("submit_chapter", CHAPTER),
+                             ("submit_arc", dict(ARC, signature_reward="", adversary_creature=95,
+                                                 beats=[{"level_band": "3-5", "intent": "Ask."},
+                                                        {"level_band": "5-8", "intent": "Answer."}]))):
+            with open(os.path.join(stub, name + ".json"), "w") as handle:
+                json.dump(answer, handle)
+        messages = []
+        who = self.who()
+        self.run_ticks(db, who, 2, stub, messages)
+        self.assertEqual(messages, [])                              # not settled yet: no plan, no call
+        self.run_ticks(db, who, 1, stub, messages)
+        self.assertEqual([name for name, _ in messages], ["submit_chapter", "submit_arc"])
+        self.assertIn("Gryan Stoutmantle", messages[0][1])          # the chapter was shown the dossier
+        self.assertIn("Build this arc from seed 1: Learn who pays the bandits.", messages[1][1])
+        chapter, arc = dm_state.active_chapter(db, 1), dm_state.active_arc(db, 1)
+        self.assertEqual((arc["chapter"], arc["chapter_seed"], arc["adversary_creature"]), (chapter["id"], 0, 95))
+        self.assertEqual(chapter["current_seed"], 1)
+
+    def test_a_chapter_whose_seeds_run_out_finishes_and_a_sequel_follows(self):
+        db = self.fresh()
+        stub = tempfile.mkdtemp()
+        with open(os.path.join(stub, "submit_chapter.json"), "w") as handle:
+            json.dump(CHAPTER, handle)
+        who = self.who()
+        self.ticks(db, who, 3)
+        self.chapter(db, current_seed=0)
+        db.execute("UPDATE chapters SET current_seed = 2")
+        messages = []
+        self.run_ticks(db, who, 1, stub, messages)
+        self.assertEqual(db.execute("SELECT end_reason FROM chapters").fetchone()[0], "seeds")
+        self.run_ticks(db, who, 1, stub, messages)
+        self.assertEqual(messages[0][0], "submit_chapter")          # then an arc from the sequel's first seed
+        self.assertIn("this one is its sequel", messages[0][1])
+        self.assertEqual([c["status"] for c in dm_state.chapters_of(db, 1)], ["finished", "active"])
+
+
 if __name__ == "__main__":
     unittest.main()

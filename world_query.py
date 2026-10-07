@@ -598,6 +598,91 @@ def zone_name(zone):
     return ZONES.get(zone, f"zone {zone}")
 
 
+# ---- a zone's own story -------------------------------------------------------
+# The stock quests filed under a zone are its canonical story and cast. See
+# docs/proposal_campaign_layer.md, 4.2.
+
+CAPITALS = frozenset((1497, 1519, 1537, 1637, 1638, 1657))     # interludes: no chapter of their own
+SIDE_RACES = {"alliance": 1 | 4 | 8 | 64, "horde": 2 | 16 | 32 | 128}   # RequiredRaces masks
+SIDE_MODEL_RACE = {"alliance": 1, "horde": 2}       # a race to ask the faction files about, per side
+DOSSIER_LIMITS = {"quests": 24, "cast": 14, "enemies": 16}
+DOSSIER_MIN_QUESTS = 10                              # fewer than this and a zone gets no chapter
+
+
+def side(race):
+    """'alliance' or 'horde' for a race id."""
+    return "alliance" if (1 << (int(race) - 1)) & SIDE_RACES["alliance"] else "horde"
+
+
+def fetch_dossier(zone, side_name):
+    """The raw rows behind a zone's dossier, for one side: quests the other side cannot take are left out."""
+    zone, mask = int(zone), SIDE_RACES[side_name]
+    stock = (f"q.ZoneOrSort = {zone} AND q.entry < {STOCK_QUESTS_BELOW} "
+             f"AND (q.RequiredRaces = 0 OR (q.RequiredRaces & {mask}) <> 0)")
+    span = rows(f"""SELECT JSON_OBJECT('quests', COUNT(*), 'low', MIN(q.QuestLevel), 'high', MAX(q.QuestLevel))
+                    FROM {hot_quest.WORLD_DB}.quest_template q WHERE {stock} AND q.QuestLevel > 0;""")[0]
+    lines = rows(f"""SELECT JSON_OBJECT('title', q.Title, 'level', MIN(q.QuestLevel))
+                     FROM {hot_quest.WORLD_DB}.quest_template q WHERE {stock} AND q.QuestLevel > 0
+                     GROUP BY q.Title ORDER BY MIN(q.QuestLevel), MIN(q.entry)
+                     LIMIT {DOSSIER_LIMITS['quests']};""")
+    cast = rows(f"""SELECT JSON_OBJECT('creature', t.Entry, 'name', t.Name, 'title', IFNULL(t.SubName, ''),
+                                       'faction', t.Faction, 'quests', COUNT(DISTINCT q.entry))
+                    FROM {hot_quest.WORLD_DB}.quest_template q
+                    JOIN {hot_quest.WORLD_DB}.creature_questrelation r ON r.quest = q.entry
+                    JOIN {hot_quest.WORLD_DB}.creature_template t ON t.Entry = r.id
+                    WHERE {stock}
+                    GROUP BY t.Entry ORDER BY COUNT(DISTINCT q.entry) DESC, t.Name
+                    LIMIT {DOSSIER_LIMITS['cast'] * 2};""")
+    foes = rows(f"""SELECT JSON_OBJECT('creature', t.Entry, 'name', t.Name, 'low', t.MinLevel, 'high', t.MaxLevel,
+                                       'notable', t.`Rank` > 0)
+                    FROM {hot_quest.WORLD_DB}.quest_template q
+                    JOIN {hot_quest.WORLD_DB}.creature_template t
+                      ON t.Entry IN (q.ReqCreatureOrGOId1, q.ReqCreatureOrGOId2, q.ReqCreatureOrGOId3, q.ReqCreatureOrGOId4)
+                    WHERE {stock}
+                    GROUP BY t.Entry ORDER BY t.MinLevel, t.Name LIMIT {DOSSIER_LIMITS['enemies']};""")
+    return span, lines, cast, foes
+
+
+def shape_dossier(zone, side_name, span, lines, cast, foes, friendly=lambda faction: True):
+    """A dossier from its raw rows: deduplicated, limited, and without givers hostile to this side."""
+    titles, seen = [], set()
+    for row in lines:
+        if row["title"] not in seen:
+            seen.add(row["title"])
+            titles.append({"title": row["title"], "level": int(row["level"])})
+    people = [{key: row[key] for key in ("creature", "name", "title", "quests")}
+              for row in cast if friendly(row.get("faction"))]
+    enemies = [{"creature": row["creature"], "name": row["name"], "low": int(row["low"]), "high": int(row["high"]),
+                "notable": bool(row["notable"])} for row in foes]
+    return {"zone": int(zone), "side": side_name, "quests": int(span.get("quests") or 0),
+            "low": int(span.get("low") or 0), "high": int(span.get("high") or 0),
+            "quest_lines": titles[:DOSSIER_LIMITS["quests"]], "cast": people[:DOSSIER_LIMITS["cast"]],
+            "enemies": enemies[:DOSSIER_LIMITS["enemies"]]}
+
+
+def zone_dossier(zone, side_name):
+    """A zone's own story, as one side sees it: its quests, who gives them, and what they send players against."""
+    tables = factions.get()
+    race = SIDE_MODEL_RACE[side_name]
+    friendly = (lambda faction: tables.is_hostile(faction, race) is False) if tables else (lambda faction: True)
+    return shape_dossier(zone, side_name, *fetch_dossier(zone, side_name), friendly=friendly)
+
+
+def dossier_text(d):
+    """A dossier as prompt text, with creature ids so the model can name them."""
+    if not d["quests"]:
+        return f"{zone_name(d['zone'])}: no stock quests for this side."
+    people = "; ".join(f"{c['creature']} {c['name']}" + (f" <{c['title']}>" if c["title"] else "") + f" ({c['quests']})"
+                       for c in d["cast"])
+    foes = "; ".join(f"{e['creature']} {e['name']} ({e['low']}-{e['high']}{', notable' if e['notable'] else ''})"
+                     for e in d["enemies"])
+    return "\n".join([
+        f"{zone_name(d['zone'])}: {d['quests']} stock quests, levels {d['low']} to {d['high']}.",
+        "Its quests, in level order: " + "; ".join(q["title"] for q in d["quest_lines"]) + ".",
+        "Who gives them (id, name, quests given): " + (people or "nobody listed") + ".",
+        "What they send players against (id, name, levels): " + (foes or "nothing listed") + "."])
+
+
 def online_characters():
     """Every character currently logged in."""
     found = rows(f"""

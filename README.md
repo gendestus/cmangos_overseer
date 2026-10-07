@@ -8,7 +8,7 @@ It runs beside a [cmangos-deploy](https://github.com/mserajnik/cmangos-deploy) s
 
 1. **Observe.** A tick forces a save and reads the game databases: who is online, where, what they finished, who they are grouped with.
 2. **Remember.** Anything new goes into the DM's own memory file, `state.db`: a chronicle per character, every bounty and how it ended, and a running story summary.
-3. **Plan.** The first time a character is noticed, the model writes a private mini-arc for them: what the Overseer wants them to become over the next few levels, the enemy the story turns toward, and two to four beats. When an arc ends, the next is planned from how it actually went, so the story can turn.
+3. **Plan.** Once a character settles in a zone, the model writes a private **chapter** for them there, grounded in that zone's own stock quests: who gives them and what they send players against. From the chapter's next seed it writes a mini-arc: what the Overseer wants them to become over the next few levels, the enemy the story turns toward, and two to four beats. When an arc ends, the next is planned from how it actually went, so the story can turn.
 4. **Propose.** When a character has no bounty out, the model is given the arc, the story so far, and real NPCs, creatures and rewards. Creatures come with their rank, how many are alive, and the distance and compass bearing of the nearest one, in two tiers: nearby, and far enough to be worth a journey. A named elite is offered only to a character with company or a wide level margin, and the last two bounties' targets are left out. It picks a **kind** of bounty, which NPC the Overseer speaks through, and one or two objectives; the proposal is stored, not applied.
 5. **Approve.** You review and approve. Only then is the quest written to the game, reloaded through the server's remote console, and announced.
 
@@ -27,7 +27,7 @@ By default nothing reaches the game without `approve`. `DM_AUTO_APPROVE` can swi
 
 | Path | What it is |
 |---|---|
-| `dm.py` | The loop and its commands: `tick`, `run`, `pending`, `approve`, `reject`, `story`, `arc`, `context` |
+| `dm.py` | The loop and its commands: `tick`, `run`, `pending`, `approve`, `reject`, `story`, `arc`, `chapter`, `context`, `canon`, `dossier` |
 | `dm_state.py` | The memory file (`state.db`): schema, upgrades, helpers |
 | `world_query.py` | Read-only questions to the game databases |
 | `factions.py` | Friend or foe, read from the server's extracted faction files |
@@ -153,11 +153,15 @@ python3 write_quest.py <Character> --dry-run     # the model writes a quest; not
 With a character online:
 
 ```
-python3 dm.py tick        # notices the character and writes an arc
+python3 dm.py tick        # notices the character
+python3 dm.py tick
+python3 dm.py tick        # three ticks in one zone: writes a chapter for it
 python3 dm.py pending
-python3 dm.py approve 1   # the arc
+python3 dm.py approve 1   # the chapter
+python3 dm.py tick        # writes an arc from the chapter's first seed
+python3 dm.py approve 2   # the arc
 python3 dm.py tick        # now writes the first bounty
-python3 dm.py approve 2
+python3 dm.py approve 3
 ```
 
 To keep it watching:
@@ -174,12 +178,14 @@ python3 dm.py run --every 300
 |---|---|
 | `dm.py tick` | One pass: observe, record, maybe propose |
 | `dm.py run --every 300` | Tick every 300 seconds until stopped |
-| `dm.py pending` | Show proposals waiting for a decision: arcs and bounties |
+| `dm.py pending` | Show proposals waiting for a decision: chapters, arcs and bounties |
 | `dm.py approve <n>` | Put proposal `n` into effect |
 | `dm.py reject <n> "reason"` | Discard it. The reason is passed to the model next time |
 | `dm.py story <Character>` | The chronicle: story so far, bounties and how each ended, events |
 | `dm.py arc <Character>` | The arc in force and the ones that have ended. A spoiler if you play that character |
 | `dm.py arc <Character> --seed "..."` | Have a new arc written around your direction |
+| `dm.py chapter <Character>` | Every zone chapter, in force, paused and finished. A spoiler |
+| `dm.py dossier <zone id> [--side horde] [--refresh]` | A zone's own story, as a chapter is shown it |
 | `dm.py context <Character>` | Exactly what the model would be told next. No model call |
 | `dm.py voices` | Every herald's settled voice note |
 | `dm.py voice <name or id>` | One herald's facts, their own lines from the game, and their note |
@@ -246,6 +252,12 @@ Each candidate herald is shown to the model with their title, role, sex and leve
 
 Each herald is also listed with their own dealings with the character, the bounties they gave and received and what was handed over, and the model is told a herald may only speak of what they were part of. `dm.py pending` warns when a herald with no dealings says something like "you brought me". It is a warning, not a refusal. The design is in `docs/proposal_herald_voice.md`.
 
+## Chapters
+
+A character's story plays out in **chapters**, one per zone. A character has settled in a zone once they have been in it for `DM_SETTLE_TICKS` ticks running; a capital city, or a zone with fewer than ten stock quests for their side, is an interlude in which the chapter in force stays in force. On settling, the model is shown the zone's **dossier**, built from the stock quests filed under it that their side can take: the quests in level order, who gives them, and what they send players against. It writes a premise, up to four of those quest-givers as the chapter's cast (favoured as heralds when near), a local adversary from the dossier's enemies, two to four seeds for mini-arcs, and a finale.
+
+Each arc is planned from the chapter's next seed, and its adversary must be one of the zone's enemies. Settling in another zone pauses the chapter and ends its arc; coming back resumes it. A chapter finishes when a bounty against its finale creature is turned in or its seeds run out, and a character who stays on gets a sequel. An arc already in force when a chapter is written runs to its end first. Dossiers are built once and kept in `state.db`; `dm.py dossier <zone> --refresh` rebuilds one after the world database changes.
+
 ## Canon
 
 Every bounty and arc may establish up to two **facts**: one sentence each, in the world's terms ("Marshal McBride keeps a list of the paid kobolds"), never a plan. They are recorded on approval, so a rejected proposal establishes nothing, and each is tagged with the character, the zone and, for a bounty, the herald. A prompt is shown up to ten, newest first: the character's own, anyone's about the zone they are in or an NPC on their herald list, and any you stated with no tag at all. That is how one character's story can touch another's without contradicting it. `dm.py pending` shows what a proposal would establish. The design is in `docs/proposal_campaign_layer.md`.
@@ -269,7 +281,9 @@ All settings are read from the environment, or from `.env` in this folder.
 | `DM_GEAR_EVERY` | `2` | At most one gear reward in this many consecutive bounties |
 | `DM_PRIZE_LEVEL_SPAN` | `4` | Levels a character must gain between rare prizes |
 | `DM_PRIZE_REACH` | `5` | How many levels above the character a prize may be |
-| `DM_AUTO_APPROVE` | `letter` | Proposal types that skip review: `bounty`, `arc`, `letter` |
+| `DM_AUTO_APPROVE` | `letter` | Proposal types that skip review: `bounty`, `arc`, `chapter`, `letter` |
+| `DM_SETTLE_TICKS` | `3` | Ticks in one zone before a character counts as settled there |
+| `DM_PLAN_MODEL` | `DM_MODEL` | Model for the rare planning calls (chapters) |
 | `DM_CHARACTERS` | empty | If set, the only characters the DM notices. Needed on a playerbot realm |
 | `DM_IGNORE_CHARACTERS` | empty | Names the DM should not track. Applied after `DM_CHARACTERS` |
 | `DM_MAIL_CHARACTER` | empty | A character the DM owns; mail to it is read as letters to the Overseer |

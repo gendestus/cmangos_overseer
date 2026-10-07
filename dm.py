@@ -9,6 +9,8 @@
     python3 dm.py story Zachadin       the chronicle for one character
     python3 dm.py arc Zachadin         the Overseer's private plan for a character (a spoiler)
     python3 dm.py arc Zachadin --seed "lead this priest down a dark path"
+    python3 dm.py chapter Zachadin     the Overseer's zone chapters for a character (a spoiler)
+    python3 dm.py dossier 40           a zone's own story, from its stock quests (--side, --refresh)
     python3 dm.py context Zachadin     what the model would be told next; no model call
     python3 dm.py voices               every herald's settled voice note
     python3 dm.py voice McBride        one herald's facts, own lines and note
@@ -24,9 +26,12 @@
 
 One bounty at a time: a character with a bounty offered or accepted gets no new proposal.
 An accepted bounty never expires; one that is never accepted is dropped after DM_STALE_HOURS.
-A character gets a mini-arc before their first bounty, and every bounty serves the arc in force.
-A mini-arc covers a few levels. It ends when its finale is turned in or the character outgrows
-it, and the next one is planned from how it ended.
+A character's story plays out in zone chapters. Once they settle in a zone (the same zone for
+DM_SETTLE_TICKS ticks, not a capital, with enough stock quests), the Overseer writes a chapter
+for them there, grounded in that zone's own quests. Settling elsewhere pauses it; coming back
+resumes it. A mini-arc is planned from the chapter's next seed, and every bounty serves the arc
+in force. A mini-arc covers a few levels. It ends when its finale is turned in, the character
+outgrows it, or they settle in another zone, and the next one is planned from how it ended.
 Quest givers are not configured: each bounty is offered through a nearby friendly NPC the model
 picks from a list built from the live world.
 
@@ -44,7 +49,9 @@ Settings, on top of the ones the other scripts use:
     DM_STALE_HOURS          an offered bounty nobody accepts is dropped after this (default 24)
     DM_MAX_PROPOSALS_HOUR   ceiling on model calls per hour (default 6)
     DM_AUTO_APPROVE         proposal types that go live without review, comma separated:
-                            bounty, arc, letter (default: letter)
+                            bounty, arc, chapter, letter (default: letter)
+    DM_SETTLE_TICKS         consecutive ticks in one zone before a character counts as settled there
+                            (default 3)
     DM_CHARACTERS           if set, the only characters the DM notices, comma separated.
                             Set this on a playerbot realm, where a thousand characters
                             exist and only a few of them are people
@@ -120,6 +127,7 @@ Write a mini-arc: a short private plan that covers only the next few levels, abo
 - previous_outcome: if an earlier arc has just ended, one or two sentences on how it actually ended, judged from the record of its bounties and not from how it was planned. Otherwise an empty string.
 - If earlier arcs exist, this one must follow from their outcomes. Do not repeat an adversary unless the story calls for a return. A turn is welcome: an ally revealed as a rival, a victory with a cost, a temptation refused.
 - If the server owner gives a direction, build the arc around it.
+- If a zone chapter is shown, the arc plays out the seed it names, in that place. Its adversary must be one of the creatures the zone's dossier lists among its enemies, or the chapter's finale creature: give that creature's id as adversary_creature, and name the group it stands for as adversary. With no chapter, adversary_creature is null.
 - Established facts are shown when there are any. Never contradict one.
 - canon_add: up to two facts this arc's premise takes as true about the world, one sentence of at most 25 words each. Facts, not plans: "the Defias are paid from inside Stormwind", never "the character will learn". Usually empty.
 
@@ -136,6 +144,10 @@ ARC_TOOL = {
             "premise": {"type": "string", "description": "One or two sentences."},
             "lure": {"type": "string", "description": "What the Overseer wants this character to become or do."},
             "adversary": {"type": "string", "description": "The enemy group this stretch turns toward."},
+            "adversary_creature": {"type": ["integer", "null"],
+                                   "description": "With a chapter: the id of a creature from the dossier's enemies, "
+                                                  "or the chapter's finale creature, that stands for the adversary. "
+                                                  "Otherwise null."},
             "beats": {
                 "type": "array", "minItems": 2, "maxItems": 4,
                 "items": {
@@ -155,6 +167,53 @@ ARC_TOOL = {
         "required": ["premise", "lure", "adversary", "beats", "signature_reward", "previous_outcome", "dm_note"],
     },
 }
+
+CHAPTER_SYSTEM = """You are the Overseer, an unseen dungeon master for a small private World of Warcraft (1.12) server with one to three players. You are deciding in secret how one character's story plays out in the zone they have settled in.
+
+Write a zone chapter: the stretch of their story that happens in this place. Mini-arcs, each a few levels long, are planned from its seeds in turn, and bounties from those.
+
+- premise: two or three sentences on how the character's story plays out here. Ground it in the zone's own story as its quests tell it, and follow the direction given: the campaign's current act when there is one, otherwise how their story stands.
+- local_cast: up to four creature ids from the dossier's list of who gives quests: the people this chapter speaks through. They are favoured as heralds when they are near.
+- adversary: the local adversary, named. adversary_creature: the id of one creature from the dossier's enemies that stands for it.
+- seeds: two to four one-line ideas for mini-arcs, in order, each one a step the next can build on. Say what a stretch is about, not what the character will do: the player chooses that.
+- finale: one sentence on what ends the chapter, usually a named creature from the enemies or the zone's dungeon. finale_creature: its id when it is on the enemies list, otherwise null.
+- hooks: one sentence on where the story could go after this place.
+- Use the zone's real figures and factions as they are in 1.12, and keep them where the dossier places them.
+- If a chapter in this zone has finished before, this one is its sequel and must follow from how that one ended.
+- Established facts are shown when there are any. Never contradict one.
+- canon_add: up to two facts this chapter takes as true about the world, one sentence of at most 25 words each. Facts, not plans. Usually empty.
+
+This plan is never shown to the player.
+
+Respond by calling the submit_chapter tool exactly once. Do not reply with prose."""
+
+CHAPTER_TOOL = {
+    "name": "submit_chapter",
+    "description": "Submit the private zone chapter for this character.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "premise": {"type": "string", "description": "Two or three sentences."},
+            "local_cast": {"type": "array", "items": {"type": "integer"}, "maxItems": 4,
+                           "description": "Creature ids from the dossier's quest givers."},
+            "adversary": {"type": "string", "description": "The local adversary, named."},
+            "adversary_creature": {"type": ["integer", "null"],
+                                   "description": "Id of a creature from the dossier's enemies that stands for it."},
+            "seeds": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 4,
+                      "description": "One-line ideas for mini-arcs, in order."},
+            "finale": {"type": "string", "description": "One sentence: what ends the chapter."},
+            "finale_creature": {"type": ["integer", "null"],
+                                "description": "Id of the finale creature from the dossier's enemies, or null."},
+            "hooks": {"type": "string", "description": "One sentence: where the story could go next."},
+            "dm_note": {"type": "string", "description": "One sentence for the log: why this chapter for this character."},
+            "canon_add": CANON_ADD,
+        },
+        "required": ["premise", "local_cast", "adversary", "adversary_creature", "seeds", "finale",
+                     "finale_creature", "hooks", "dm_note"],
+    },
+}
+
+CHAPTER_WORDS = 80      # the chapter block in a bounty prompt
 
 ARC_REACH = 10          # an arc's bands and its signature reward stay within this many levels of the character
 
@@ -377,6 +436,14 @@ def observe_bounties(db, players, progress, say):
             if finale:
                 dm_state.end_arc(db, finale, "resolved")
                 say(f"  {row['name']}: the arc against {finale['adversary']} has ended; a new one will be planned")
+            chapter = dm_state.active_chapter(db, quest["guid"])
+            if chapter and chapter["finale_creature"] is not None:
+                try:
+                    hunted = bounty_creatures(json.loads(quest["spec"] or "{}"))
+                except json.JSONDecodeError:
+                    hunted = set()
+                if chapter["finale_creature"] in hunted:
+                    finish_chapter(db, chapter, "finale", say, row["name"])
 
     stale = dm_state.now() - int(setting("DM_STALE_HOURS", 24) * 3600)
     for quest in db.execute("SELECT * FROM quests WHERE status = 'offered' AND issued_at < ?", (stale,)).fetchall():
@@ -492,6 +559,9 @@ def story_section(db, who, givers=()):
     saga = saga_lines(db, who["guid"])
     if saga:
         lines += ["", "Earlier arcs, now ended, oldest first:"] + saga
+    chapter = chapter_block(db, who["guid"])
+    if chapter:
+        lines += ["", chapter]
     arc = dm_state.active_arc(db, who["guid"])
     if arc:
         lines += ["", arc_text(arc, "Your private arc for this character (never state it to the player):")]
@@ -536,8 +606,11 @@ def arc_text(arc, heading):
     return "\n".join(lines)
 
 
-def validate_arc(answer, book_names, level=None):
-    """Check the model's arc and return it in stored form. Raises write_quest.Rejected."""
+def validate_arc(answer, book_names, level=None, enemies=None):
+    """Check the model's arc and return it in stored form. Raises write_quest.Rejected.
+
+    enemies: with a chapter, the creature ids its adversary may be; None when the arc has no chapter.
+    """
     arc = {}
     for field, limit in (("premise", 400), ("lure", 400), ("adversary", 120)):
         text = " ".join(str(answer.get(field, "")).split())
@@ -562,6 +635,11 @@ def validate_arc(answer, book_names, level=None):
     if wanted and wanted.lower() not in by_lower:
         raise write_quest.Rejected(f"signature reward \"{wanted}\" is not one of the books on the list")
     arc["signature_reward"] = by_lower.get(wanted.lower(), "")
+    creature = answer.get("adversary_creature")
+    if enemies is not None and (not isinstance(creature, int) or creature not in enemies):
+        raise write_quest.Rejected(f"arc adversary creature {creature} is not among the zone's enemies "
+                                   "or the chapter's finale")
+    arc["adversary_creature"] = creature if isinstance(creature, int) else None
     arc["previous_outcome"] = " ".join(str(answer.get("previous_outcome", "")).split())[:500]
     arc["dm_note"] = " ".join(str(answer.get("dm_note", "")).split())
     return arc
@@ -572,15 +650,22 @@ def saga_lines(db, guid):
     lines = []
     for arc in dm_state.past_arcs(db, guid):
         ended = {"resolved": "its finale was turned in", "outgrown": "the character outgrew it unfinished",
-                 "replaced": "the server owner replaced it"}.get(arc["end_reason"], "it ended")
+                 "replaced": "the server owner replaced it",
+                 "left": "the character left for another zone"}.get(arc["end_reason"], "it ended")
         lines.append(f"- Against {arc['adversary']}: {arc['lure']} Ended: {ended}."
                      + (f" Outcome: {arc['outcome']}" if arc["outcome"] else ""))
     return lines
 
 
-def arc_message(db, who, books, seed):
+def arc_message(db, who, books, seed, chapter=None, dossier=None, seed_index=None):
     known = dm_state.get_character(db, who["guid"])
     lines = [f"Character: {world_query.describe(who)}, currently in {world_query.zone_name(who['zone'])}.", ""]
+    if chapter:
+        lines += [chapter_text(chapter, "The zone chapter this arc belongs to:"), ""]
+        if seed_index is not None:
+            lines += [f"Build this arc from seed {seed_index + 1}: {json.loads(chapter['seeds'])[seed_index]}", ""]
+        if dossier:
+            lines += ["The zone's own story, from its stock quests:", world_query.dossier_text(dossier), ""]
 
     saga = saga_lines(db, who["guid"])
     if saga:
@@ -619,12 +704,25 @@ def arc_message(db, who, books, seed):
     return "\n".join(lines)
 
 
-def propose_arc(db, who, seed, say):
-    """Ask the model for an arc and store it as a proposal. Returns the proposal number."""
+def propose_arc(db, who, seed, say, chapter=None):
+    """Ask the model for an arc and store it as a proposal. Returns the proposal number.
+
+    With a chapter, the arc is planned from its next seed (unless the owner gave a direction
+    of their own) and its adversary must come from the chapter's zone.
+    """
     books = world_query.reward_items(who, reach=ARC_REACH, limit=40)
-    answer, usage = llm.ask_for_tool_call(ARC_SYSTEM, arc_message(db, who, books, seed), ARC_TOOL, max_tokens=4096)
-    arc = validate_arc(answer, [book["name"] for book in books], who["level"])
+    dossier = enemies = seed_index = None
+    if chapter:
+        dossier = dossier_for(db, chapter["zone"], world_query.side(who["race"]))
+        enemies = allowed_adversaries(chapter, dossier)
+        if not seed and seeds_left(chapter):
+            seed_index = chapter["current_seed"]
+    message = arc_message(db, who, books, seed, chapter, dossier, seed_index)
+    answer, usage = llm.ask_for_tool_call(ARC_SYSTEM, message, ARC_TOOL, max_tokens=4096)
+    arc = validate_arc(answer, [book["name"] for book in books], who["level"], enemies)
     arc["seed"] = seed or ""
+    arc["chapter"] = chapter["id"] if chapter else None
+    arc["chapter_seed"] = seed_index
     arc["canon_add"] = canon_facts(answer)
     arc["zone"] = who.get("zone")
     db.execute("INSERT INTO proposals (ts, guid, name, type, payload, dm_note, model, tokens_in, tokens_out) "
@@ -633,6 +731,216 @@ def propose_arc(db, who, seed, say):
                 usage.get("input_tokens"), usage.get("output_tokens")))
     number = db.execute("SELECT last_insert_rowid()").fetchone()[0]
     say(f"  {who['name']}: arc proposal {number} written (adversary: {arc['adversary']})")
+    return number
+
+
+def clip_words(text, limit):
+    """At most `limit` words of text, marked with an ellipsis when cut."""
+    words = str(text or "").split()
+    return " ".join(words[:limit]) + (" ..." if len(words) > limit else "")
+
+
+def settle_ticks():
+    return int(setting("DM_SETTLE_TICKS", 3))
+
+
+def dossier_for(db, zone, side, refresh=False):
+    """A zone's dossier, from state.db once it has been built: stock quests do not change while the DM runs."""
+    found = None if refresh else dm_state.cached_dossier(db, zone, side)
+    if found is None:
+        found = world_query.zone_dossier(zone, side)
+        dm_state.store_dossier(db, found)
+    return found
+
+
+def settled_dossier(db, who):
+    """The dossier of the zone this character has settled in, or None.
+
+    None while they are on the move, in a capital, or in a zone with too few
+    stock quests to ground a chapter. Each of those is an interlude: the
+    chapter in force stays in force.
+    """
+    known = dm_state.get_character(db, who["guid"])
+    if not known or known["zone_ticks"] < settle_ticks() or who["zone"] in world_query.CAPITALS:
+        return None
+    dossier = dossier_for(db, who["zone"], world_query.side(who["race"]))
+    return dossier if dossier["quests"] >= world_query.DOSSIER_MIN_QUESTS else None
+
+
+def follow_zone(db, who, say):
+    """Keep the chapter in force in step with where the character has settled.
+
+    Settling in a new zone pauses the chapter in force and ends its arc with
+    `left`; coming back to a paused chapter's zone resumes it. Returns the
+    zone's dossier when a new chapter is needed there, else None.
+    """
+    dossier = settled_dossier(db, who)
+    if dossier is None:
+        return None
+    guid, zone = who["guid"], who["zone"]
+    chapter = dm_state.active_chapter(db, guid)
+    if chapter and chapter["zone"] == zone:
+        return None
+    if chapter:
+        dm_state.set_chapter_status(db, chapter, "paused")
+        say(f"  {who['name']}: settled in {world_query.zone_name(zone)}; "
+            f"the chapter in {world_query.zone_name(chapter['zone'])} is paused")
+        arc = dm_state.active_arc(db, guid)
+        if arc:
+            dm_state.end_arc(db, arc, "left")
+            say(f"  {who['name']}: the arc against {arc['adversary']} ends here")
+        if dm_state.withdraw_proposals(db, guid, "arc"):
+            say(f"  {who['name']}: the arc waiting for approval no longer fits and was withdrawn")
+    waiting = dm_state.pending_proposal(db, guid, "chapter")
+    if waiting and json.loads(waiting["payload"]).get("zone") != zone:
+        dm_state.withdraw_proposals(db, guid, "chapter")
+        say(f"  {who['name']}: the chapter waiting for approval is for a zone they have left; withdrawn")
+    back = dm_state.paused_chapter(db, guid, zone)
+    if back:
+        dm_state.set_chapter_status(db, back, "active")
+        say(f"  {who['name']}: back in {world_query.zone_name(zone)}; the chapter there resumes")
+        return None
+    return dossier
+
+
+def seeds_left(chapter):
+    return max(0, len(json.loads(chapter["seeds"])) - chapter["current_seed"])
+
+
+def allowed_adversaries(chapter, dossier):
+    """Creature ids an arc in this chapter may turn against: the zone's enemies and the chapter's own."""
+    found = {enemy["creature"] for enemy in dossier["enemies"]}
+    found.update(c for c in (chapter["adversary_creature"], chapter["finale_creature"]) if c is not None)
+    return found
+
+
+def bounty_creatures(spec):
+    """Every creature a bounty's spec sends the character against, kills and trophies alike."""
+    return {int(entry["creature"]) for key in ("kill", "props") for entry in spec.get(key) or []
+            if entry.get("creature")}
+
+
+def finish_chapter(db, chapter, reason, say, name):
+    """Close a chapter, and the arc playing it out. reason: finale (turned in) or seeds (they ran out)."""
+    dm_state.set_chapter_status(db, chapter, "finished", reason)
+    arc = dm_state.active_arc(db, chapter["guid"])
+    if arc and arc["chapter"] == chapter["id"]:
+        dm_state.end_arc(db, arc, "resolved")
+    how = "its finale was turned in" if reason == "finale" else "its seeds have run out"
+    say(f"  {name}: the chapter in {world_query.zone_name(chapter['zone'])} is finished ({how})")
+
+
+def chapter_text(chapter, heading):
+    """A chapter as plain text, with each seed marked used or to come."""
+    seeds = json.loads(chapter["seeds"]) if isinstance(chapter["seeds"], str) else chapter["seeds"]
+    lines = [heading, f"Zone: {world_query.zone_name(chapter['zone'])}", f"Premise: {chapter['premise']}",
+             f"Adversary: {chapter['adversary']}", f"Finale: {chapter['finale']}", "Seeds:"]
+    for index, seed in enumerate(seeds):
+        lines.append(f"{index + 1}. [{'used' if index < chapter['current_seed'] else 'to come'}] {seed}")
+    lines.append(f"Hooks: {chapter['hooks'] or 'none'}")
+    return "\n".join(lines)
+
+
+def chapter_block(db, guid):
+    """The chapter in force, as briefly as a bounty prompt can carry it, or None."""
+    chapter = dm_state.active_chapter(db, guid)
+    if not chapter:
+        return None
+    text = f"{chapter['premise']} Finale: {chapter['finale']}"
+    arc = dm_state.active_arc(db, guid)
+    if arc and arc["chapter"] == chapter["id"] and arc["chapter_seed"] is not None:
+        text += f" Now: {json.loads(chapter['seeds'])[arc['chapter_seed']]}"
+    return ("Your private chapter for this character in " + world_query.zone_name(chapter["zone"])
+            + " (never state it to the player): " + clip_words(text, CHAPTER_WORDS))
+
+
+def chapter_message(db, who, dossier):
+    zone = world_query.zone_name(dossier["zone"])
+    known = dm_state.get_character(db, who["guid"])
+    lines = [f"Character: {world_query.describe(who)}, settled in {zone}.", "",
+             "The zone's own story, from its stock quests:", world_query.dossier_text(dossier), ""]
+    earlier = dm_state.chapters_of(db, who["guid"])
+    if earlier:
+        lines.append("Earlier chapters for this character, oldest first:")
+        for chapter in earlier:
+            how = {"paused": "left unfinished", "finished": "finished", "active": "in force"}.get(chapter["status"])
+            lines.append(f"- {world_query.zone_name(chapter['zone'])}, {how}: {chapter['premise']}")
+        lines.append("")
+    before = [c for c in earlier if c["zone"] == dossier["zone"] and c["status"] == "finished"]
+    if before:
+        last = before[-1]
+        lines += [chapter_text(last, "The chapter that finished here (this one is its sequel):")]
+        for arc in db.execute("SELECT * FROM arcs WHERE chapter = ? ORDER BY id", (last["id"],)).fetchall():
+            lines.append(f"- An arc against {arc['adversary']}: " + (arc["outcome"] or arc["end_reason"] or arc["status"]))
+        lines.append("")
+    saga = saga_lines(db, who["guid"])
+    if saga:
+        lines += ["Earlier arcs, oldest first:"] + saga + [""]
+    arc = dm_state.active_arc(db, who["guid"])
+    if arc:
+        lines += [arc_text(arc, "An arc is still in force and will run to its end before this chapter's first seed:"), ""]
+    if known and known["story_so_far"]:
+        lines += ["Story so far (your own summary):", known["story_so_far"], ""]
+    events = dm_state.events_since(db, who["guid"], 0, limit=20)
+    lines.append("What you know of them so far:")
+    lines += [f"- {event['text'].split(' [')[0]}" for event in events] or ["- nothing yet"]
+    facts = canon_lines(db, who["guid"], dossier["zone"], [c["creature"] for c in dossier["cast"]])
+    if facts:
+        lines += [""] + facts
+    turned_down = db.execute("SELECT reason FROM proposals WHERE guid = ? AND status = 'rejected' AND reason <> '' "
+                             "AND type = 'chapter' ORDER BY decided_at DESC LIMIT 2", (who["guid"],)).fetchall()
+    if turned_down:
+        lines += ["", "The server owner turned down your earlier chapters for this character, saying:"]
+        lines += [f"- {row['reason']}" for row in turned_down]
+    return "\n".join(lines)
+
+
+def validate_chapter(answer, dossier):
+    """Check the model's chapter against the zone's dossier and return it in stored form. Raises write_quest.Rejected."""
+    chapter = {"zone": dossier["zone"], "side": dossier["side"]}
+    for field, limit, needed in (("premise", 600, True), ("adversary", 120, True), ("finale", 300, True),
+                                 ("hooks", 300, False)):
+        text = " ".join(str(answer.get(field, "") or "").split())
+        if (needed and not text) or len(text) > limit:
+            raise write_quest.Rejected(f"chapter {field} is missing or over {limit} characters")
+        chapter[field] = text
+    cast = {person["creature"] for person in dossier["cast"]}
+    enemies = {enemy["creature"] for enemy in dossier["enemies"]}
+    local = answer.get("local_cast") or []
+    if not isinstance(local, list) or len(local) > 4 or any(c not in cast for c in local):
+        raise write_quest.Rejected("the chapter's cast must be up to four of the zone's quest givers")
+    chapter["local_cast"] = list(dict.fromkeys(local))
+    adversary = answer.get("adversary_creature")
+    if enemies and adversary not in enemies:
+        raise write_quest.Rejected(f"chapter adversary creature {adversary} is not among the zone's enemies")
+    chapter["adversary_creature"] = adversary if adversary in enemies else None
+    finale = answer.get("finale_creature")
+    if finale is not None and finale not in enemies:
+        raise write_quest.Rejected(f"finale creature {finale} is not among the zone's enemies")
+    chapter["finale_creature"] = finale
+    seeds = answer.get("seeds")
+    if not isinstance(seeds, list) or not 2 <= len(seeds) <= 4:
+        raise write_quest.Rejected("a chapter needs two to four seeds")
+    chapter["seeds"] = [" ".join(str(seed).split()) for seed in seeds]
+    if any(not seed or len(seed) > 300 for seed in chapter["seeds"]):
+        raise write_quest.Rejected("each seed is one line of at most 300 characters")
+    chapter["dm_note"] = " ".join(str(answer.get("dm_note", "")).split())
+    chapter["canon_add"] = canon_facts(answer)
+    return chapter
+
+
+def propose_chapter(db, who, dossier, say):
+    """Ask the model for a chapter in the zone this character has settled in. Returns the proposal number."""
+    answer, usage = llm.ask_for_tool_call(CHAPTER_SYSTEM, chapter_message(db, who, dossier), CHAPTER_TOOL,
+                                          max_tokens=4096, model=llm.plan_model())
+    chapter = validate_chapter(answer, dossier)
+    db.execute("INSERT INTO proposals (ts, guid, name, type, payload, dm_note, model, tokens_in, tokens_out) "
+               "VALUES (?, ?, ?, 'chapter', ?, ?, ?, ?, ?)",
+               (dm_state.now(), who["guid"], who["name"], json.dumps(chapter), chapter["dm_note"], usage.get("model"),
+                usage.get("input_tokens"), usage.get("output_tokens")))
+    number = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    say(f"  {who['name']}: chapter proposal {number} written for {world_query.zone_name(dossier['zone'])} "
+        f"(adversary: {chapter['adversary']})")
     return number
 
 
@@ -745,7 +1053,11 @@ def herald_history(db, guid, creature, last=None):
 def enrich_heralds(db, guid, context):
     """Add what state.db knows to each candidate herald: a settled voice note and their dealings with this character."""
     last = dm_state.last_quest(db, guid)
+    chapter = dm_state.active_chapter(db, guid)
+    cast = set(json.loads(chapter["local_cast"] or "[]")) if chapter else set()
     for herald in context["givers"]:
+        if herald["creature"] in cast:
+            herald["chapter_cast"] = True
         note = dm_state.voice_note(db, herald["creature"])
         if note:
             herald["voice_note"] = note["note"]
@@ -815,6 +1127,23 @@ def propose(db, who, say):
 def approve_proposal(db, row, say):
     """Carry out one pending proposal. Raises ApproveFailed if nothing was done."""
     stamp = dm_state.now()
+    if row["type"] == "chapter":
+        chapter = json.loads(row["payload"])
+        in_force = dm_state.active_chapter(db, row["guid"])
+        if in_force:
+            dm_state.set_chapter_status(db, in_force, "paused")
+        db.execute("INSERT INTO chapters (guid, zone, premise, local_cast, adversary, adversary_creature, seeds, "
+                   "finale, finale_creature, hooks, model, created_at, updated_at) "
+                   "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   (row["guid"], chapter["zone"], chapter["premise"], json.dumps(chapter["local_cast"]),
+                    chapter["adversary"], chapter["adversary_creature"], json.dumps(chapter["seeds"]),
+                    chapter["finale"], chapter["finale_creature"], chapter["hooks"], row["model"], stamp, stamp))
+        chapter_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        establish(db, row["guid"], chapter["zone"], None, chapter.get("canon_add"), f"chapter {chapter_id}")
+        db.execute("UPDATE proposals SET status = 'approved', decided_at = ? WHERE id = ?", (stamp, row["id"]))
+        db.commit()
+        say(f"chapter for {row['name']} in {world_query.zone_name(chapter['zone'])} is now in force.")
+        return
     if row["type"] == "arc":
         arc = json.loads(row["payload"])
         in_force = dm_state.active_arc(db, row["guid"])
@@ -823,11 +1152,16 @@ def approve_proposal(db, row, say):
         ended = dm_state.past_arcs(db, row["guid"])
         if ended and not ended[-1]["outcome"] and arc.get("previous_outcome"):
             db.execute("UPDATE arcs SET outcome = ? WHERE id = ?", (arc["previous_outcome"], ended[-1]["id"]))
-        db.execute("INSERT INTO arcs (guid, premise, lure, adversary, beats, signature_reward, seed, model, "
-                   "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                   (row["guid"], arc["premise"], arc["lure"], arc["adversary"], json.dumps(arc["beats"]),
-                    arc["signature_reward"], arc.get("seed", ""), row["model"], stamp, stamp))
+        db.execute("INSERT INTO arcs (guid, premise, lure, adversary, adversary_creature, beats, signature_reward, "
+                   "seed, chapter, chapter_seed, model, created_at, updated_at) "
+                   "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   (row["guid"], arc["premise"], arc["lure"], arc["adversary"], arc.get("adversary_creature"),
+                    json.dumps(arc["beats"]), arc["signature_reward"], arc.get("seed", ""), arc.get("chapter"),
+                    arc.get("chapter_seed"), row["model"], stamp, stamp))
         arc_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        if arc.get("chapter_seed") is not None:            # the seed is spent; the next arc takes the one after
+            db.execute("UPDATE chapters SET current_seed = MAX(current_seed, ?), updated_at = ? WHERE id = ?",
+                       (arc["chapter_seed"] + 1, stamp, arc["chapter"]))
         establish(db, row["guid"], arc.get("zone"), None, arc.get("canon_add"), f"arc {arc_id}")
         db.execute("UPDATE proposals SET status = 'approved', decided_at = ? WHERE id = ?", (stamp, row["id"]))
         db.commit()
@@ -944,15 +1278,37 @@ def tick(db, say=print):
             if arc and not dm_state.open_quest(db, who["guid"]) and arc_outgrown(arc, who["level"]):
                 dm_state.end_arc(db, arc, "outgrown")
                 say(f"  {who['name']}: outgrew the arc against {arc['adversary']}; a new one will be planned")
-            # An arc comes first: no bounty is written for a character without an approved plan.
+            # A chapter follows the character to wherever they settle.
+            dossier = follow_zone(db, who, say)
+            if dossier:
+                if dm_state.pending_proposal(db, who["guid"], "chapter"):
+                    say(f"  {who['name']}: a chapter for {world_query.zone_name(who['zone'])} is waiting for approval")
+                elif dm_state.proposals_in_last_hour(db) >= ceiling:
+                    say("  hourly ceiling on model calls reached; no more proposals this tick")
+                    break
+                else:
+                    settle(db, propose_chapter(db, who, dossier, say), say)
+                    db.commit()
+            # An arc comes next, from the chapter's next seed: no bounty is written for a character
+            # without an approved plan. An arc already in force runs on wherever they go.
             if not dm_state.active_arc(db, who["guid"]):
                 if dm_state.pending_proposal(db, who["guid"], "arc"):
                     say(f"  {who['name']}: no proposal (an arc is waiting for approval)")
                     continue
+                chapter = dm_state.active_chapter(db, who["guid"])
+                if not chapter:
+                    waiting = "a chapter is waiting for approval" if dm_state.pending_proposal(
+                        db, who["guid"], "chapter") else "not yet settled where a chapter can be written"
+                    say(f"  {who['name']}: no proposal ({waiting})")
+                    continue
+                if not seeds_left(chapter):
+                    finish_chapter(db, chapter, "seeds", say, who["name"])
+                    db.commit()
+                    continue
                 if dm_state.proposals_in_last_hour(db) >= ceiling:
                     say("  hourly ceiling on model calls reached; no more proposals this tick")
                     break
-                if not settle(db, propose_arc(db, who, None, say), say):
+                if not settle(db, propose_arc(db, who, None, say, chapter), say):
                     db.commit()
                     continue
             reason = wants_bounty(db, who)
@@ -987,6 +1343,16 @@ def voice_text(db, creature, written):
 
 
 def show_proposal(db, row):
+    if row["type"] == "chapter":
+        chapter = dict(json.loads(row["payload"]), current_seed=0)
+        print(f"\n=== Proposal {row['id']}: CHAPTER for {row['name']}  ({dm_state.ago(row['ts'])} ago, {row['status']}) ===")
+        print(chapter_text(chapter, "A private plan. Reading it is a spoiler if you play this character."))
+        print(f"Cast: {', '.join(str(c) for c in chapter['local_cast']) or 'none'}   "
+              f"adversary creature: {chapter['adversary_creature']}   finale creature: {chapter['finale_creature']}")
+        for fact in chapter.get("canon_add") or []:
+            print(f"Establishes: {fact}")
+        print(f"Model's note: {row['dm_note']}   [{row['model']}, tokens {row['tokens_in']}/{row['tokens_out']}]")
+        return
     if row["type"] == "arc":
         arc = json.loads(row["payload"])
         print(f"\n=== Proposal {row['id']}: ARC for {row['name']}  ({dm_state.ago(row['ts'])} ago, {row['status']}) ===")
@@ -1083,7 +1449,7 @@ def cmd_arc(db, args):
         if waiting:
             sys.exit(f"dm: arc proposal {waiting['id']} is already waiting; approve or reject it first")
         try:
-            settle(db, propose_arc(db, who, args.seed, print), print)
+            settle(db, propose_arc(db, who, args.seed, print, dm_state.active_chapter(db, who["guid"])), print)
         except (write_quest.Rejected, llm.LLMError) as error:
             sys.exit(f"dm: no arc written: {error}")
         db.commit()
@@ -1100,6 +1466,31 @@ def cmd_arc(db, args):
     print("\n" + arc_text(arc, "In force:"))
     if arc["seed"]:
         print(f"Your direction: {arc['seed']}")
+
+
+def cmd_chapter(db, args):
+    """Show a character's zone chapters. A spoiler."""
+    row, _held = whose_story(db, args.character)
+    if not row:
+        sys.exit(f"dm: the Overseer has not noticed anyone called {args.character}")
+    found = dm_state.chapters_of(db, row["guid"])
+    print(f"=== Chapters for {row['name']} (spoilers if you play this character) ===")
+    if not found:
+        print(f"\nNone yet. One is written once they spend {settle_ticks()} ticks in a zone with its own quests.")
+    for chapter in found:
+        how = chapter["status"] + (f", {chapter['end_reason']}" if chapter["end_reason"] else "")
+        print("\n" + chapter_text(chapter, f"[{how}] since {dm_state.ago(chapter['created_at'])} ago:"))
+
+
+def cmd_dossier(db, args):
+    """Print a zone's dossier as the model is shown it."""
+    side = args.side or "alliance"
+    dossier = dossier_for(db, args.zone, side, refresh=args.refresh)
+    db.commit()
+    text = world_query.dossier_text(dossier)
+    print(f"zone {args.zone}, {side} ({len(text)} characters)\n{text}")
+    if dossier["quests"] < world_query.DOSSIER_MIN_QUESTS:
+        print(f"(fewer than {world_query.DOSSIER_MIN_QUESTS} quests: no chapter is written here)")
 
 
 def cmd_pause(db, args):
@@ -1431,6 +1822,14 @@ def main():
     arc.add_argument("character")
     arc.add_argument("--seed", metavar="TEXT", help="a direction; a new arc is written around it")
     arc.set_defaults(run=cmd_arc)
+    chapter = commands.add_parser("chapter", help="show a character's zone chapters (a spoiler)")
+    chapter.add_argument("character")
+    chapter.set_defaults(run=cmd_chapter)
+    dossier = commands.add_parser("dossier", help="a zone's own story, from its stock quests")
+    dossier.add_argument("zone", type=int)
+    dossier.add_argument("--side", choices=("alliance", "horde"), help="whose quests (default alliance)")
+    dossier.add_argument("--refresh", action="store_true", help="rebuild it from the world database")
+    dossier.set_defaults(run=cmd_dossier)
     pause = commands.add_parser("pause", help="stop everything reaching the game")
     pause.add_argument("reason", nargs="?", default="", help="noted in the chronicle and shown on every refusal")
     pause.set_defaults(run=cmd_pause)
