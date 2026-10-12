@@ -54,6 +54,11 @@ def _stub(tool):
         raise LLMError(f"stub provider could not read DM_LLM_STUB: {error}") from None
 
 
+def model_name(model=None):
+    """The model a call with this override would use."""
+    return model or os.environ.get("DM_MODEL", DEFAULT_MODEL)
+
+
 def plan_model():
     """The model for planning calls, which are rare and benefit from the strongest one."""
     return os.environ.get("DM_PLAN_MODEL") or None
@@ -63,7 +68,7 @@ def _anthropic(system, user, tool, max_tokens, model=None):
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not key:
         raise LLMError("ANTHROPIC_API_KEY is not set (see env.example)")
-    model = model or os.environ.get("DM_MODEL", DEFAULT_MODEL)
+    model = model_name(model)
     body = {
         "model": model,
         "max_tokens": max_tokens,

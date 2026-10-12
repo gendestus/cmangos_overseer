@@ -1,0 +1,27 @@
+{
+  "writers": [
+    {
+      "name": "champion",
+      "stance": "wants the character and their faction to succeed",
+      "prompts": ["shared.md", "arc.md", "writer.md", "champion.md"],
+      "max_tokens": 4096
+    },
+    {
+      "name": "tormentor",
+      "stance": "wants the character and their faction to suffer",
+      "prompts": ["shared.md", "arc.md", "writer.md", "tormentor.md"],
+      "max_tokens": 4096
+    },
+    {
+      "name": "trickster",
+      "stance": "wants a dramatic twist wherever possible",
+      "prompts": ["shared.md", "arc.md", "writer.md", "trickster.md"],
+      "max_tokens": 4096
+    }
+  ],
+  "weaver": {
+    "name": "weaver",
+    "prompts": ["shared.md", "arc.md", "weaver.md"],
+    "max_tokens": 6000
+  }
+}

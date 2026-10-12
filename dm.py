@@ -14,6 +14,8 @@
     python3 dm.py campaign Zachadin    what the Overseer has decided a character's life is about (a spoiler)
     python3 dm.py campaign Zachadin --seed "a priest who will lose her faith and find another"
     python3 dm.py chapter Zachadin     the Overseer's zone chapters for a character (a spoiler)
+    python3 dm.py room                 check the writers' rooms (writers/) and list who is in each
+    python3 dm.py room 7               the drafts the room wrote for proposal 7 (a spoiler)
     python3 dm.py dossier 40           a zone's own story, from its stock quests (--side, --refresh)
     python3 dm.py context Zachadin     what the model would be told next; no model call
     python3 dm.py voices               every herald's settled voice note
@@ -74,6 +76,8 @@ Settings, on top of the ones the other scripts use:
     DM_PRIZE_REACH          how many levels above the character a prize may be (default 5)
     DM_PAUSE                set to 1 to pause without the flag file (`pause` writes the file)
     DM_PAUSE_FILE           where the flag file lives (default: `paused` beside this script)
+    DM_WRITERS_ROOM         the writers' rooms folder (default writers/), or "off" for one call per plan
+                            (see room.py)
     DM_BELL                 set to 1 for a bell in the `run` console when a tick leaves a
                             proposal waiting
 
@@ -100,6 +104,7 @@ import dm_console
 import dm_state
 import hot_quest
 import llm
+import room
 import world_query
 import write_quest
 
@@ -134,26 +139,6 @@ CANON_ADD = {
     "description": "Up to two facts this establishes, one sentence of at most 25 words each. Facts, not plans."}
 TOOL["input_schema"]["properties"]["canon_add"] = CANON_ADD
 TOOL["input_schema"]["required"] += ["story_beat", "story_so_far", "beat_progress"]
-
-ARC_SYSTEM = """You are the Overseer, an unseen dungeon master for a small private World of Warcraft (1.12) server with one to three players. You are deciding in secret what you want to make of one character next.
-
-Write a mini-arc: a short private plan that covers only the next few levels, about four to eight. A character's story is a chain of these. Each one ends, and what happened in it shapes the next, so the story can twist.
-
-- premise: one or two sentences on what the Overseer sees in this character now.
-- lure: what you want them to become or to do in this stretch. It can tempt, corrupt, ennoble or test, and it should be specific to their race and class.
-- adversary: one enemy group or kind of creature from Azeroth as it is in 1.12 that this stretch turns toward. It must suit the levels just ahead and be reachable for their faction.
-- beats: two to four steps. Each has a level band such as "6-9" and one sentence of intent. The first beat starts at the character's current level, the bands stay within about eight levels of it, and the last beat is a payoff or a twist that leaves a hook for whatever comes next.
-- signature_reward: the name of one book from the list given, or an empty string. It is the prize of this arc. Prefer a power that is not the character's own by class when it fits the lure.
-- previous_outcome: if an earlier arc has just ended, one or two sentences on how it actually ended, judged from the record of its bounties and not from how it was planned. Otherwise an empty string.
-- If earlier arcs exist, this one must follow from their outcomes. Do not repeat an adversary unless the story calls for a return. A turn is welcome: an ally revealed as a rival, a victory with a cost, a temptation refused.
-- If the server owner gives a direction, build the arc around it.
-- If a zone chapter is shown, the arc plays out the seed it names, in that place. Its adversary must be one of the creatures the zone's dossier lists among its enemies, or the chapter's finale creature: give that creature's id as adversary_creature, and name the group it stands for as adversary. With no chapter, adversary_creature is null.
-- Established facts are shown when there are any. Never contradict one.
-- canon_add: up to two facts this arc's premise takes as true about the world, one sentence of at most 25 words each. Facts, not plans: "the Defias are paid from inside Stormwind", never "the character will learn". Usually empty.
-
-This plan is never shown to the player.
-
-Respond by calling the submit_arc tool exactly once. Do not reply with prose."""
 
 ARC_TOOL = {
     "name": "submit_arc",
@@ -205,26 +190,6 @@ REVEAL_FIELDS = {
                    "text": {"type": "string", "description": "One sentence: what is learned."}},
     "required": ["act", "text"],
 }
-
-CAMPAIGN_SYSTEM = """You are the Overseer, an unseen dungeon master for a small private World of Warcraft (1.12) server with one to three players. You are deciding in secret what one character's whole life on this server is about.
-
-Write a campaign: the spine of their story from now to level 60. It is a spine, not a script. The player chooses where to go and what to do; the zone chapters and mini-arcs written later turn it into events where the character actually is.
-
-- premise: two sentences on what the Overseer sees in this character.
-- question: the one question the story asks of them, such as "Will the hunter become what he hunts?"
-- stake: one sentence on what the Overseer itself wants from the answer.
-- acts: three to five, in order and without gaps between their level bands. The first contains the character's current level and the last ends at 60. An act's intent is one sentence on what changes for the character, never an event: "he learns the bandits are paid from inside the city", not "he kills VanCleef". thread names the thread of Azeroth's story as it stands in 1.12 that the act leans on, and zones lists where that thread runs for this character's faction. Do not assume the character will go there.
-- cast: three to six key players, each a real figure or faction of that era, with their role in this story.
-- reveals: two or three things to be learned, each pinned to an act by its number, not to an event.
-- If the character has history, the campaign starts from it: what has happened is the opening of the story, not something to overwrite.
-- One line on each other character's campaign is shown when there are any. Their stories may touch this one; do not copy them.
-- If the server owner gives a direction, build the campaign around it.
-- Established facts are shown when there are any. Never contradict one.
-- canon_add: up to two facts this campaign takes as true about the world, one sentence of at most 25 words each. Facts, not plans. Usually empty.
-
-This plan is never shown to the player.
-
-Respond by calling the submit_campaign tool exactly once. Do not reply with prose."""
 
 CAMPAIGN_TOOL = {
     "name": "submit_campaign",
@@ -281,25 +246,6 @@ ACT_REVIEW_TOOL = {
 MAX_LEVEL = 60
 CAMPAIGN_WORDS = 70     # the campaign block in a bounty prompt
 
-CHAPTER_SYSTEM = """You are the Overseer, an unseen dungeon master for a small private World of Warcraft (1.12) server with one to three players. You are deciding in secret how one character's story plays out in the zone they have settled in.
-
-Write a zone chapter: the stretch of their story that happens in this place. Mini-arcs, each a few levels long, are planned from its seeds in turn, and bounties from those.
-
-- premise: two or three sentences on how the character's story plays out here. Ground it in the zone's own story as its quests tell it, and follow the direction given: the campaign's current act when there is one, otherwise how their story stands. A reveal due in the current act may land here if this place suits it.
-- local_cast: up to four creature ids from the dossier's list of who gives quests: the people this chapter speaks through. They are favoured as heralds when they are near.
-- adversary: the local adversary, named. adversary_creature: the id of one creature from the dossier's enemies that stands for it.
-- seeds: two to four one-line ideas for mini-arcs, in order, each one a step the next can build on. Say what a stretch is about, not what the character will do: the player chooses that.
-- finale: one sentence on what ends the chapter, usually a named creature from the enemies or the zone's dungeon. finale_creature: its id when it is on the enemies list, otherwise null.
-- hooks: one sentence on where the story could go after this place.
-- Use the zone's real figures and factions as they are in 1.12, and keep them where the dossier places them.
-- If a chapter in this zone has finished before, this one is its sequel and must follow from how that one ended.
-- Established facts are shown when there are any. Never contradict one.
-- canon_add: up to two facts this chapter takes as true about the world, one sentence of at most 25 words each. Facts, not plans. Usually empty.
-
-This plan is never shown to the player.
-
-Respond by calling the submit_chapter tool exactly once. Do not reply with prose."""
-
 CHAPTER_TOOL = {
     "name": "submit_chapter",
     "description": "Submit the private zone chapter for this character.",
@@ -332,6 +278,14 @@ ARC_REACH = 10          # an arc's bands and its signature reward stay within th
 
 BEAT_STATE = ("done", "current", "later")
 CANON_PER_ANSWER = 2    # facts one piece of writing may establish
+
+# What a writer in the room leaves to the weaver: rewards, the log note and established facts.
+# The prompts for campaigns, chapters and arcs are in writers/ (see room.py); the tools stay here.
+DRAFT_OMITS = {
+    "campaign": ("dm_note", "canon_add"),
+    "chapter": ("dm_note", "canon_add"),
+    "arc": ("signature_reward", "previous_outcome", "dm_note", "canon_add"),
+}
 
 
 class ApproveFailed(Exception):
@@ -868,8 +822,9 @@ def propose_arc(db, who, seed, say, chapter=None):
         if not seed and seeds_left(chapter):
             seed_index = chapter["current_seed"]
     message = arc_message(db, who, books, seed, chapter, dossier, seed_index)
-    answer, usage = llm.ask_for_tool_call(ARC_SYSTEM, message, ARC_TOOL, max_tokens=4096)
+    answer, usage, record = room.write(db, "arc", message, ARC_TOOL, DRAFT_OMITS["arc"])
     arc = validate_arc(answer, [book["name"] for book in books], who["level"], enemies)
+    arc["room"] = record
     arc["seed"] = seed or ""
     arc["chapter"] = chapter["id"] if chapter else None
     arc["chapter_seed"] = seed_index
@@ -1053,9 +1008,10 @@ def campaign_message(db, who, books, seed):
 def propose_campaign(db, who, seed, say):
     """Ask the model for a campaign and store it as a proposal. Returns the proposal number."""
     books = world_query.reward_items(who, reach=MAX_LEVEL, limit=40)
-    answer, usage = llm.ask_for_tool_call(CAMPAIGN_SYSTEM, campaign_message(db, who, books, seed), CAMPAIGN_TOOL,
-                                          max_tokens=4096, model=llm.plan_model())
+    answer, usage, record = room.write(db, "campaign", campaign_message(db, who, books, seed), CAMPAIGN_TOOL,
+                                       DRAFT_OMITS["campaign"], model=llm.plan_model())
     campaign = validate_campaign(answer, who["level"])
+    campaign["room"] = record
     campaign["seed"] = seed or ""
     db.execute("INSERT INTO proposals (ts, guid, name, type, payload, dm_note, model, tokens_in, tokens_out) "
                "VALUES (?, ?, ?, 'campaign', ?, ?, ?, ?, ?)",
@@ -1328,9 +1284,10 @@ def validate_chapter(answer, dossier):
 
 def propose_chapter(db, who, dossier, say):
     """Ask the model for a chapter in the zone this character has settled in. Returns the proposal number."""
-    answer, usage = llm.ask_for_tool_call(CHAPTER_SYSTEM, chapter_message(db, who, dossier), CHAPTER_TOOL,
-                                          max_tokens=4096, model=llm.plan_model())
+    answer, usage, record = room.write(db, "chapter", chapter_message(db, who, dossier), CHAPTER_TOOL,
+                                       DRAFT_OMITS["chapter"], model=llm.plan_model())
     chapter = validate_chapter(answer, dossier)
+    chapter["room"] = record
     db.execute("INSERT INTO proposals (ts, guid, name, type, payload, dm_note, model, tokens_in, tokens_out) "
                "VALUES (?, ?, ?, 'chapter', ?, ?, ?, ?, ?)",
                (dm_state.now(), who["guid"], who["name"], json.dumps(chapter), chapter["dm_note"], usage.get("model"),
@@ -1778,6 +1735,8 @@ def tick(db, say=print):
             say(f"  {who['name']}: the model's answer was rejected ({error}); it will try again next tick")
         except llm.LLMError as error:
             say(f"  {who['name']}: model call failed ({error})")
+        except room.RoomError as error:
+            say(f"  {who['name']}: the writers' room cannot be used ({error}); check it with: python3 dm.py room")
         db.commit()
 
 
@@ -1808,6 +1767,8 @@ def show_proposal(db, row, reveal=False):
             print(f"Your direction: {campaign['seed']}")
         for fact in campaign.get("canon_add") or []:
             print(f"Establishes: {fact}")
+        for line in room.record_lines(campaign.get("room")):
+            print(line)
         print(f"Model's note: {row['dm_note']}   [{row['model']}, tokens {row['tokens_in']}/{row['tokens_out']}]")
         return
     if row["type"] == "act_review":
@@ -1831,6 +1792,8 @@ def show_proposal(db, row, reveal=False):
               f"adversary creature: {chapter['adversary_creature']}   finale creature: {chapter['finale_creature']}")
         for fact in chapter.get("canon_add") or []:
             print(f"Establishes: {fact}")
+        for line in room.record_lines(chapter.get("room")):
+            print(line)
         print(f"Model's note: {row['dm_note']}   [{row['model']}, tokens {row['tokens_in']}/{row['tokens_out']}]")
         return
     if row["type"] == "arc":
@@ -1841,6 +1804,8 @@ def show_proposal(db, row, reveal=False):
             print(f"Your direction: {arc['seed']}")
         for fact in arc.get("canon_add") or []:
             print(f"Establishes: {fact}")
+        for line in room.record_lines(arc.get("room")):
+            print(line)
         print(f"Model's note: {row['dm_note']}   [{row['model']}, tokens {row['tokens_in']}/{row['tokens_out']}]")
         return
     spec, target = json.loads(row["spec"]), json.loads(row["target"])
@@ -1954,7 +1919,7 @@ def cmd_arc(db, args):
             sys.exit(f"dm: arc proposal {waiting['id']} is already waiting; approve or reject it first")
         try:
             settle(db, propose_arc(db, who, args.seed, print, dm_state.active_chapter(db, who["guid"])), print)
-        except (write_quest.Rejected, llm.LLMError) as error:
+        except (write_quest.Rejected, llm.LLMError, room.RoomError) as error:
             sys.exit(f"dm: no arc written: {error}")
         db.commit()
         return
@@ -1990,7 +1955,7 @@ def cmd_campaign(db, args):
             sys.exit(f"dm: campaign proposal {waiting['id']} is already waiting; approve or reject it first")
         try:
             settle(db, propose_campaign(db, who, args.seed, print), print)
-        except (write_quest.Rejected, llm.LLMError) as error:
+        except (write_quest.Rejected, llm.LLMError, room.RoomError) as error:
             sys.exit(f"dm: no campaign written: {error}")
         db.commit()
         return
@@ -2339,6 +2304,32 @@ def cmd_canon(db, args):
               f"{dm_state.ago(row['ts'])} ago]")
 
 
+def cmd_room(db, args):
+    """Check the writers' rooms and list their members, or show the drafts behind one proposal."""
+    if args.number is None:
+        bad = [stage for stage, _found, error in room.check_all() if error]
+        room.main()
+        if bad:
+            sys.exit(f"dm: {len(bad)} room(s) cannot be used: {', '.join(bad)}")
+        return
+    row = db.execute("SELECT * FROM proposals WHERE id = ?", (args.number,)).fetchone()
+    if not row:
+        sys.exit(f"dm: no proposal {args.number}")
+    if row["type"] not in room.STAGES:
+        sys.exit(f"dm: proposal {args.number} is a {row['type']}; only campaigns, chapters and arcs have a room")
+    if row["type"] in sealed() and not args.reveal:
+        sys.exit(f"dm: {row['type']}s are sealed; --reveal to read the drafts")
+    record = json.loads(row["payload"]).get("room")
+    if not record:
+        print(f"Proposal {args.number} was written by the weaver alone; there are no drafts.")
+        return
+    print(f"=== The writers' room behind proposal {args.number}, a {row['type']} for {row['name']} ===")
+    for member in record["members"]:
+        cost = "reused" if member.get("cached") else f"tokens {member['tokens_in']}/{member['tokens_out']}"
+        print(f"  {member['name']:<12} {member['model']}, {cost}")
+    print("\n".join(room.record_lines(record, drafts=True)))
+
+
 def cmd_tick(db, _args):
     tick(db)
     db.commit()
@@ -2453,6 +2444,10 @@ def build_parser():
     canon.add_argument("--retire", type=int, metavar="ID", help="withdraw a fact")
     canon.add_argument("--reveal", action="store_true", help="include facts from sealed plans")
     canon.set_defaults(run=cmd_canon)
+    room_command = commands.add_parser("room", help="check the writers' rooms, or show the drafts behind a proposal")
+    room_command.add_argument("number", type=int, nargs="?", help="a campaign, chapter or arc proposal")
+    room_command.add_argument("--reveal", action="store_true", help="read the drafts even if that plan type is sealed")
+    room_command.set_defaults(run=cmd_room)
     parser.known = set(commands.choices)
     return parser
 

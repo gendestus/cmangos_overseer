@@ -102,6 +102,10 @@ CREATE TABLE IF NOT EXISTS chapters (
     created_at INTEGER, updated_at INTEGER, ended_at INTEGER,
     end_reason TEXT                              -- finale, seeds (they ran out)
 );
+CREATE TABLE IF NOT EXISTS room_drafts (         -- writers' drafts, reused when only the weaver must try again
+    key TEXT PRIMARY KEY,                        -- hash of prompt, model, token limit, tool and message
+    stage TEXT, writer TEXT, draft TEXT, model TEXT, created_at INTEGER
+);
 """
 
 # Columns added after the first release; applied to an existing state.db on open.

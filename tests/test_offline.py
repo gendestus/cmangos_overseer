@@ -25,6 +25,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
+os.environ["DM_WRITERS_ROOM"] = "off"     # one call per plan, as the stubs expect; RoomTests turn rooms on
 
 import apply_quest      # noqa: E402
 import console          # noqa: E402
@@ -34,6 +35,7 @@ import dm_console       # noqa: E402
 import dm_state         # noqa: E402
 import factions         # noqa: E402
 import hot_quest        # noqa: E402
+import room             # noqa: E402
 import world_query      # noqa: E402
 import write_quest      # noqa: E402
 
@@ -1706,6 +1708,25 @@ class Chapters(unittest.TestCase):
         self.assertEqual((arc["chapter"], arc["chapter_seed"], arc["adversary_creature"]), (chapter["id"], 0, 95))
         self.assertEqual(chapter["current_seed"], 1)
 
+    def test_with_the_writers_room_on_every_plan_is_drafted_then_woven(self):
+        db = self.fresh()
+        stub = tempfile.mkdtemp()
+        arc = dict(ARC, signature_reward="", adversary_creature=95,
+                   beats=[{"level_band": "3-5", "intent": "Ask."}, {"level_band": "5-8", "intent": "Answer."}])
+        for name, answer in (("draft_campaign", CAMPAIGN), ("draft_chapter", CHAPTER), ("draft_arc", arc),
+                             ("submit_chapter", CHAPTER), ("submit_arc", arc)):
+            with open(os.path.join(stub, name + ".json"), "w") as handle:
+                json.dump(answer, handle)
+        messages = []
+        with mock.patch.dict(os.environ, {"DM_WRITERS_ROOM": ""}):
+            self.run_ticks(db, self.who(), 3, stub, messages)
+        names = [name for name, _ in messages]
+        self.assertEqual(names, ["draft_campaign"] * 3 + ["submit_campaign"] + ["draft_chapter"] * 3
+                         + ["submit_chapter"] + ["draft_arc"] * 3 + ["submit_arc"])
+        self.assertIn("Draft from `trickster`", messages[11][1])
+        self.assertIn("Build this arc from seed 1: Learn who pays the bandits.", messages[8][1])   # writers see it too
+        self.assertIsNotNone(dm_state.active_arc(db, 1))
+
     def test_a_chapter_whose_seeds_run_out_finishes_and_a_sequel_follows(self):
         db = self.fresh()
         stub = tempfile.mkdtemp()
@@ -1928,6 +1949,138 @@ class Campaigns(unittest.TestCase):
         self.assertEqual(len(db.execute("SELECT * FROM proposals").fetchall()), 1)      # one campaign, no chapter
         self.assertTrue(any("waits for the campaign" in line for line in said))
         self.assertEqual(len(bounties), 3)                  # the arc in force kept the bounties coming
+
+
+class WritersRoom(unittest.TestCase):
+    """Campaigns, chapters and arcs written by one-sided writers and a weaver (room.py, writers/)."""
+
+    def setUp(self):
+        os.environ["DM_STATE"] = os.path.join(tempfile.mkdtemp(), "state.db")
+        self.db = dm_state.connect()
+        self.addCleanup(self.db.close)
+        self.who = dict(CONTEXT["character"], zone=40)
+        dm_state.save_character(self.db, self.who, [], [], [], first=True)
+        self.calls = []
+        self.fail = set()
+
+    def ask(self, system, message, tool, max_tokens=2048, model=None):
+        self.calls.append((tool["name"], system, message, tool))
+        if tool["name"] == "draft_campaign":
+            writer = next(w for w, said in (("champion", "advocate"), ("tormentor", "to suffer"),
+                                            ("trickster", "dramatic twist")) if said in system)
+            if writer in self.fail:
+                raise dm.llm.LLMError("the model replied without calling the tool")
+            return dict(CAMPAIGN, premise=f"The {writer}'s version."), {"input_tokens": 10, "output_tokens": 5,
+                                                                        "model": "m"}
+        return (dict(CAMPAIGN, spine="Tormentor",
+                     notes=[{"writer": "champion", "kept": "the ally.", "cut": "the easy win."},
+                            {"writer": "nobody", "kept": "x", "cut": "y"}]),
+                {"input_tokens": 100, "output_tokens": 50, "model": "m"})
+
+    def propose(self, room_setting=""):
+        with mock.patch.dict(os.environ, {"DM_WRITERS_ROOM": room_setting}), \
+                mock.patch.object(dm.llm, "ask_for_tool_call", self.ask), \
+                mock.patch.object(world_query, "reward_items", return_value=[]):
+            number = dm.propose_campaign(self.db, self.who, None, lambda _line: None)
+        return self.db.execute("SELECT * FROM proposals WHERE id = ?", (number,)).fetchone()
+
+    def names(self):
+        return [call[0] for call in self.calls]
+
+    def test_the_shipped_rooms_load(self):
+        with mock.patch.dict(os.environ, {"DM_WRITERS_ROOM": ""}):
+            for stage, found, error in room.check_all():
+                self.assertIsNone(error, stage)
+                self.assertEqual([w["name"] for w in found["writers"]], ["champion", "tormentor", "trickster"])
+
+    def test_writers_draft_then_the_weaver_writes_the_plan(self):
+        row = self.propose()
+        self.assertEqual(sorted(self.names()[:3]), ["draft_campaign"] * 3)
+        self.assertEqual(self.names()[3:], ["submit_campaign"])
+        draft_tool = self.calls[0][3]["input_schema"]
+        self.assertNotIn("dm_note", draft_tool["properties"])          # the weaver's alone
+        self.assertNotIn("dm_note", draft_tool["required"])
+        self.assertIn("premise", draft_tool["properties"])
+        self.assertTrue(self.calls[0][1].endswith("Respond by calling the draft_campaign tool exactly once. "
+                                                  "Do not reply with prose."))
+        weaver_message = self.calls[3][2]
+        self.assertIn("Draft from `tormentor`, who wants the character and their faction to suffer:", weaver_message)
+        self.assertIn("The trickster's version.", weaver_message)
+        self.assertIn("spine", self.calls[3][3]["input_schema"]["required"])
+        payload = json.loads(row["payload"])
+        self.assertEqual(payload["premise"], CAMPAIGN["premise"])     # the weaver's plan is what is proposed
+        self.assertEqual(payload["room"]["spine"], "tormentor")
+        self.assertEqual([n["writer"] for n in payload["room"]["notes"]], ["champion"])
+        self.assertEqual(set(payload["room"]["drafts"]), {"champion", "tormentor", "trickster"})
+        self.assertEqual((row["tokens_in"], row["tokens_out"]), (130, 65))
+
+    def test_a_retry_with_the_same_context_calls_only_the_weaver(self):
+        self.propose()
+        self.calls.clear()
+        row = self.propose()
+        self.assertEqual(self.names(), ["submit_campaign"])
+        self.assertEqual((row["tokens_in"], row["tokens_out"]), (100, 50))
+        self.assertTrue(all(m["cached"] for m in json.loads(row["payload"])["room"]["members"][:3]))
+
+    def test_a_failed_writer_fails_the_room_and_keeps_the_other_drafts(self):
+        self.fail = {"tormentor"}
+        with self.assertRaises(dm.llm.LLMError) as caught:
+            self.propose()
+        self.assertIn("writer tormentor", str(caught.exception))
+        self.fail = set()
+        self.calls.clear()
+        self.propose()
+        self.assertEqual(self.names(), ["draft_campaign", "submit_campaign"])
+
+    def test_with_the_room_off_the_weaver_writes_alone(self):
+        row = self.propose("off")
+        self.assertEqual(self.names(), ["submit_campaign"])
+        self.assertNotIn("spine", self.calls[0][3]["input_schema"]["properties"])
+        self.assertNotIn("Draft from", self.calls[0][2])
+        self.assertIsNone(json.loads(row["payload"])["room"])
+
+    def test_the_drafts_behind_a_proposal_can_be_read(self):
+        row = self.propose()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            dm.cmd_room(self.db, argparse.Namespace(number=row["id"], reveal=False))
+            dm.show_proposal(self.db, row)
+        self.assertIn("Draft from champion:", out.getvalue())
+        self.assertIn("Writers' room: built on tormentor", out.getvalue())
+        self.assertIn("champion: kept the ally. Cut: the easy win.", out.getvalue())
+
+    def room_folder(self, roster, files=("a.md",)):
+        folder = tempfile.mkdtemp()
+        for name in files:
+            with open(os.path.join(folder, name), "w") as handle:
+                handle.write("Some prompt.\n")
+        with open(os.path.join(folder, "arc.json"), "w") as handle:
+            json.dump(roster, handle)
+        return folder
+
+    def test_a_bad_room_is_refused_naming_the_member(self):
+        good = {"name": "w", "stance": "wants things", "prompts": ["a.md"], "max_tokens": 10}
+        weaver = {"name": "weaver", "prompts": ["a.md"], "max_tokens": 10}
+        for roster, says in (({"writers": [dict(good, max_token=5)], "weaver": weaver}, "unknown keys: max_token"),
+                             ({"writers": [dict(good, prompts=["b.md"])], "weaver": weaver}, "writer 1 (w): cannot read"),
+                             ({"writers": [good, good], "weaver": weaver}, "unique"),
+                             ({"writers": [dict(good, stance="")], "weaver": weaver}, "writer 1 (w) needs a stance"),
+                             ({"writers": [dict(good, max_tokens="10")], "weaver": weaver}, "needs max_tokens"),
+                             ({"writers": [good]}, "needs a weaver")):
+            with mock.patch.dict(os.environ, {"DM_WRITERS_ROOM": self.room_folder(roster)}):
+                with self.assertRaises(room.RoomError, msg=says) as caught:
+                    room.load("arc")
+                self.assertIn(says, str(caught.exception))
+
+    def test_a_room_with_no_writers_is_the_weaver_alone(self):
+        folder = self.room_folder({"writers": [], "weaver": {"name": "weaver", "prompts": ["a.md"], "max_tokens": 9}})
+        with mock.patch.dict(os.environ, {"DM_WRITERS_ROOM": folder}), \
+                mock.patch.object(dm.llm, "ask_for_tool_call",
+                                  return_value=({"x": 1}, {"input_tokens": 1, "output_tokens": 1})) as ask:
+            answer, _usage, record = room.write(self.db, "arc", "message", dm.ARC_TOOL)
+        self.assertEqual((answer, record), ({"x": 1}, None))
+        self.assertEqual(ask.call_args.kwargs["max_tokens"], 9)
+        self.assertTrue(ask.call_args.args[0].startswith("Some prompt."))
 
 
 class RunGroundwork(unittest.TestCase):
