@@ -16,6 +16,7 @@ Order follows the owner's ranking. Estimates are rough guesses for one person wo
 | 1 | The rest of richer bounties: chains, spell rewards, trial | A weekend | Next |
 | 2 | Overseer mail, both directions | A weekend | |
 | 3 | Extra rewards with a budget | A weekend | |
+| WR | Writers' rooms: campaigns, chapters and arcs drafted by one-sided writers and woven (`proposal_writers_room.md`) | An evening | Built |
 | 4b | Arc revision, grounding the adversary, signature rewards | An evening or two | |
 
 ## Decisions
@@ -28,6 +29,8 @@ Order follows the owner's ranking. Estimates are rough guesses for one person wo
 6. **Arcs are mini-arcs** (decided 2026-10-04): each covers about four to eight levels with two to four beats. It ends when its finale bounty is turned in or the character out-levels it, and the next is planned from how it actually ended.
 7. **The spec's own guardrails come before new content** (decided 2026-10-04). Reading `ai_dm_spec.md` back against the code turned up three things it asks for that the plan had dropped: narrow database users (spec section 3), a kill switch and a purge script (section 6). They became Phase 0.4 and were built first, because Phases 1 to 3 each widen what the DM writes.
 8. **Quest givers are chosen, not configured** (decided 2026-10-04). `DM_GIVERS` is gone. Friend or foe is read from the server's extracted faction files, which also replaces the old hostility heuristic for targets.
+
+9. **Plans are written by writers' rooms** (decided 2026-10-12). Testing the standalone story harness showed one-sided drafts woven by a head writer give more fulfilling stories than a single call, so campaigns, chapters and arcs all use rooms; bounties do not. Every member of a room runs on the model its stage already used. The rooms are data in `writers/`, editable without touching Python.
 
 ## Ground rules (unchanged)
 

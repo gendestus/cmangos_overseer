@@ -8,7 +8,7 @@ It runs beside a [cmangos-deploy](https://github.com/mserajnik/cmangos-deploy) s
 
 1. **Observe.** A tick forces a save and reads the game databases: who is online, where, what they finished, who they are grouped with.
 2. **Remember.** Anything new goes into the DM's own memory file, `state.db`: a chronicle per character, every bounty and how it ended, and a running story summary.
-3. **Plan.** When a character is first noticed, the model writes their **campaign**: what their whole story is about, the one question it asks of them, and three to five acts by level band, each an intent rather than an event. Once they settle in a zone, the model writes a private **chapter** for them there, grounded in that zone's own stock quests: who gives them and what they send players against. From the chapter's next seed it writes a mini-arc: what the Overseer wants them to become over the next few levels, the enemy the story turns toward, and two to four beats. When an arc ends, the next is planned from how it actually went, so the story can turn.
+3. **Plan.** When a character is first noticed, the model writes their **campaign**: what their whole story is about, the one question it asks of them, and three to five acts by level band, each an intent rather than an event. Once they settle in a zone, the model writes a private **chapter** for them there, grounded in that zone's own stock quests: who gives them and what they send players against. From the chapter's next seed it writes a mini-arc: what the Overseer wants them to become over the next few levels, the enemy the story turns toward, and two to four beats. When an arc ends, the next is planned from how it actually went, so the story can turn. Each of these plans is written by a **writers' room**: one-sided writers draft it, and a head writer weaves the drafts into the plan that is proposed.
 4. **Propose.** When a character has no bounty out, the model is given the arc, the story so far, and real NPCs, creatures and rewards. Creatures come with their rank, how many are alive, and the distance and compass bearing of the nearest one, in two tiers: nearby, and far enough to be worth a journey. A named elite is offered only to a character with company or a wide level margin, and the last two bounties' targets are left out. It picks a **kind** of bounty, which NPC the Overseer speaks through, and one or two objectives; the proposal is stored, not applied.
 5. **Approve.** You review and approve. Only then is the quest written to the game, reloaded through the server's remote console, and announced.
 
@@ -27,12 +27,14 @@ By default nothing reaches the game without `approve`. `DM_AUTO_APPROVE` can swi
 
 | Path | What it is |
 |---|---|
-| `dm.py` | The loop and its commands: `tick`, `run`, `pending`, `approve`, `reject`, `story`, `campaign`, `arc`, `chapter`, `context`, `canon`, `dossier` |
+| `dm.py` | The loop and its commands: `tick`, `run`, `pending`, `approve`, `reject`, `story`, `campaign`, `arc`, `chapter`, `room`, `context`, `canon`, `dossier` |
 | `dm_console.py` | The prompt `dm.py run` shows at a terminal, with ticks in the background |
 | `dm_state.py` | The memory file (`state.db`): schema, upgrades, helpers |
 | `world_query.py` | Read-only questions to the game databases |
 | `factions.py` | Friend or foe, read from the server's extracted faction files |
 | `write_quest.py` | One-off: have the model write a bounty for a character, without the story loop |
+| `room.py` | Writers' rooms: runs a stage's writers in parallel, then its weaver; `python3 room.py` checks the rooms |
+| `writers/` | The rooms as data: one JSON roster per stage (`campaign`, `chapter`, `arc`) and every prompt they use. Edit here, not in Python |
 | `llm.py` | The only place that calls a model. Add a provider here to switch models |
 | `hot_quest.py` | Checks a quest spec and renders it to SQL |
 | `apply_quest.py` | Puts a quest spec live, retires it, or removes it |
@@ -203,6 +205,8 @@ Under a service, a pipe or `nohup`, `run` is the plain loop; `--no-console` forc
 | `dm.py campaign <Character>` | The campaign in force: premise, question, acts and how the finished ones ended. The largest spoiler |
 | `dm.py campaign <Character> --seed "..."` | Have a new campaign written around your direction; it replaces the old one |
 | `dm.py chapter <Character>` | Every zone chapter, in force, paused and finished. A spoiler |
+| `dm.py room` | Check the writers' rooms and list who is in each; exits non-zero when one cannot be used |
+| `dm.py room <n> [--reveal]` | The drafts behind campaign, chapter or arc proposal `n`, and what each member cost |
 | `dm.py dossier <zone id> [--side horde] [--refresh]` | A zone's own story, as a chapter is shown it |
 | `dm.py context <Character>` | Exactly what the model would be told next. No model call |
 | `dm.py voices` | Every herald's settled voice note |
@@ -286,6 +290,19 @@ Each arc is planned from the chapter's next seed, and its adversary must be one 
 
 Campaigns, chapters and arcs are spoilers if you play on the server. List them in `DM_SEALED` (`campaign,act_review,chapter,arc` seals everything) and they go into force without review, while `pending`, `campaign`, `arc`, `chapter`, `context`, `canon` and the tick's log say only that they exist. Each of those commands takes `--reveal` to read them anyway. The model is always shown everything.
 
+## Writers' rooms
+
+Campaigns, chapters and arcs are each written by a room, not by a single call. Three writers draft the same plan in parallel, each from a deliberately one-sided point of view: the **champion** wants the character and their faction to succeed, the **tormentor** wants them to suffer, and the **trickster** wants a twist wherever one fits. A head writer, the **weaver**, then picks the strongest draft as the spine, grafts in the best of the others, cuts what does not fit the record, and makes the choices the writers were told to leave: rewards, the log note and established facts. Only the weaver's plan is checked and proposed. `dm.py pending` shows which draft it was built on and what was kept and cut from each; `dm.py room <n>` shows the drafts.
+
+The rooms are data in `writers/`, so changing them never means editing Python:
+
+- `campaign.json`, `chapter.json`, `arc.json`: each lists its writers (a name, a one-line stance the weaver is shown, the prompt files to join in order, `max_tokens`, and optionally `model`) and its weaver. Add, remove or rename writers here. With an empty `writers` list the weaver writes alone.
+- `shared.md` (what every member knows), `campaign.md`, `chapter.md`, `arc.md` (the rules for each plan), `writer.md`, one file per stance, and `weaver.md`.
+
+Rooms are read for every plan, so an edit takes effect on the next one without restarting `run`. `python3 dm.py room` checks them all: an unknown key, a missing prompt file or a repeated name is an error naming the file and the member. What a plan may contain is not in these files: the tool schemas and validators in `dm.py` are the contract with `state.db`, so a field a prompt asks for that they do not know is dropped.
+
+Every member uses the model the stage always has: `DM_PLAN_MODEL` for campaigns and chapters, `DM_MODEL` for arcs. A plan costs four calls instead of one. A writer's draft is kept for a week under a hash of its prompt, model and message, so when the weaver's answer is rejected the next attempt with the same context calls only the weaver. `DM_WRITERS_ROOM=off` goes back to one call per plan. The design is in `docs/proposal_writers_room.md`.
+
 ## Canon
 
 Every bounty, arc, chapter and campaign may establish up to two **facts**: one sentence each, in the world's terms ("Marshal McBride keeps a list of the paid kobolds"), never a plan. They are recorded on approval, so a rejected proposal establishes nothing, and each is tagged with the character, the zone and, for a bounty, the herald. A prompt is shown up to ten, newest first: the character's own, anyone's about the zone they are in or an NPC on their herald list, and any you stated with no tag at all. That is how one character's story can touch another's without contradicting it. `dm.py pending` shows what a proposal would establish. The design is in `docs/proposal_campaign_layer.md`.
@@ -313,6 +330,7 @@ All settings are read from the environment, or from `.env` in this folder.
 | `DM_SEALED` | empty | Plan types you do not want to read: `campaign`, `act_review`, `chapter`, `arc`. Approved without review and printed only with `--reveal` |
 | `DM_SETTLE_TICKS` | `3` | Ticks in one zone before a character counts as settled there |
 | `DM_PLAN_MODEL` | `DM_MODEL` | Model for the rare planning calls: campaigns, act reviews and chapters |
+| `DM_WRITERS_ROOM` | `writers/` | The writers' rooms folder, or `off` for one call per campaign, chapter and arc |
 | `DM_CHARACTERS` | empty | If set, the only characters the DM notices. Needed on a playerbot realm |
 | `DM_IGNORE_CHARACTERS` | empty | Names the DM should not track. Applied after `DM_CHARACTERS` |
 | `DM_MAIL_CHARACTER` | empty | A character the DM owns; mail to it is read as letters to the Overseer |
