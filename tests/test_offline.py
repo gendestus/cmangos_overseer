@@ -2032,6 +2032,27 @@ class WritersRoom(unittest.TestCase):
         self.propose()
         self.assertEqual(self.names(), ["draft_campaign", "submit_campaign"])
 
+    def test_a_refused_plan_goes_back_to_the_weaver_once_with_the_reason(self):
+        ask = self.ask
+        def long_first(system, message, tool, max_tokens=2048, model=None):
+            answer, usage = ask(system, message, tool, max_tokens, model)
+            if tool["name"] == "submit_campaign" and "It was refused" not in message:
+                answer = dict(answer, premise="x" * 501)
+            return answer, usage
+        self.ask = long_first
+        row = self.propose()
+        self.assertEqual(self.names()[3:], ["submit_campaign", "submit_campaign"])
+        self.assertIn("It was refused: campaign premise is missing or over 500 characters", self.calls[4][2])
+        self.assertEqual(json.loads(row["payload"])["premise"], CAMPAIGN["premise"])
+        self.assertEqual((row["tokens_in"], row["tokens_out"]), (230, 115))
+
+    def test_the_tools_state_the_limits_the_validators_enforce(self):
+        premise = dm.ARC_TOOL["input_schema"]["properties"]["premise"]
+        self.assertEqual(premise["maxLength"], dm.ARC_LIMITS["premise"])
+        self.assertIn("At most 400 characters.", premise["description"])
+        self.assertEqual(room.draft_tool("arc", dm.ARC_TOOL, ())["input_schema"]["properties"]["adversary"]["maxLength"],
+                         120)
+
     def test_with_the_room_off_the_weaver_writes_alone(self):
         row = self.propose("off")
         self.assertEqual(self.names(), ["submit_campaign"])

@@ -140,15 +140,27 @@ CANON_ADD = {
 TOOL["input_schema"]["properties"]["canon_add"] = CANON_ADD
 TOOL["input_schema"]["required"] += ["story_beat", "story_so_far", "beat_progress"]
 
+# Character limits on a plan's text fields: the tools state them and the validators enforce them.
+ARC_LIMITS = {"premise": 400, "lure": 400, "adversary": 120}
+BEAT_LIMIT = 300
+CAMPAIGN_LIMITS = {"premise": 500, "question": 200, "stake": 300}
+CHAPTER_LIMITS = {"premise": 600, "adversary": 120, "finale": 300, "hooks": 300}
+
+
+def limited(limit, description):
+    """A string field whose limit the model is told, both in words and in the schema."""
+    return {"type": "string", "maxLength": limit, "description": f"{description} At most {limit} characters."}
+
+
 ARC_TOOL = {
     "name": "submit_arc",
     "description": "Submit the private mini-arc for this character.",
     "input_schema": {
         "type": "object",
         "properties": {
-            "premise": {"type": "string", "description": "One or two sentences."},
-            "lure": {"type": "string", "description": "What the Overseer wants this character to become or do."},
-            "adversary": {"type": "string", "description": "The enemy group this stretch turns toward."},
+            "premise": limited(ARC_LIMITS["premise"], "One or two sentences."),
+            "lure": limited(ARC_LIMITS["lure"], "What the Overseer wants this character to become or do."),
+            "adversary": limited(ARC_LIMITS["adversary"], "The enemy group this stretch turns toward."),
             "adversary_creature": {"type": ["integer", "null"],
                                    "description": "With a chapter: the id of a creature from the dossier's enemies, "
                                                   "or the chapter's finale creature, that stands for the adversary. "
@@ -159,7 +171,7 @@ ARC_TOOL = {
                     "type": "object",
                     "properties": {
                         "level_band": {"type": "string", "description": "Levels this beat covers, like 6-9."},
-                        "intent": {"type": "string", "description": "One sentence: what this step does."},
+                        "intent": limited(BEAT_LIMIT, "One sentence: what this step does."),
                     },
                     "required": ["level_band", "intent"],
                 },
@@ -197,9 +209,9 @@ CAMPAIGN_TOOL = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "premise": {"type": "string", "description": "Two sentences."},
-            "question": {"type": "string", "description": "The one question the story asks of them."},
-            "stake": {"type": "string", "description": "What the Overseer wants from the answer."},
+            "premise": limited(CAMPAIGN_LIMITS["premise"], "Two sentences."),
+            "question": limited(CAMPAIGN_LIMITS["question"], "The one question the story asks of them."),
+            "stake": limited(CAMPAIGN_LIMITS["stake"], "What the Overseer wants from the answer."),
             "acts": {"type": "array", "items": ACT_FIELDS, "minItems": 3, "maxItems": 5},
             "cast": {"type": "array", "minItems": 3, "maxItems": 6,
                      "items": {"type": "object",
@@ -252,18 +264,18 @@ CHAPTER_TOOL = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "premise": {"type": "string", "description": "Two or three sentences."},
+            "premise": limited(CHAPTER_LIMITS["premise"], "Two or three sentences."),
             "local_cast": {"type": "array", "items": {"type": "integer"}, "maxItems": 4,
                            "description": "Creature ids from the dossier's quest givers."},
-            "adversary": {"type": "string", "description": "The local adversary, named."},
+            "adversary": limited(CHAPTER_LIMITS["adversary"], "The local adversary, named."),
             "adversary_creature": {"type": ["integer", "null"],
                                    "description": "Id of a creature from the dossier's enemies that stands for it."},
             "seeds": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 4,
                       "description": "One-line ideas for mini-arcs, in order."},
-            "finale": {"type": "string", "description": "One sentence: what ends the chapter."},
+            "finale": limited(CHAPTER_LIMITS["finale"], "One sentence: what ends the chapter."),
             "finale_creature": {"type": ["integer", "null"],
                                 "description": "Id of the finale creature from the dossier's enemies, or null."},
-            "hooks": {"type": "string", "description": "One sentence: where the story could go next."},
+            "hooks": limited(CHAPTER_LIMITS["hooks"], "One sentence: where the story could go next."),
             "dm_note": {"type": "string", "description": "One sentence for the log: why this chapter for this character."},
             "canon_add": CANON_ADD,
         },
@@ -713,7 +725,7 @@ def validate_arc(answer, book_names, level=None, enemies=None):
     enemies: with a chapter, the creature ids its adversary may be; None when the arc has no chapter.
     """
     arc = {}
-    for field, limit in (("premise", 400), ("lure", 400), ("adversary", 120)):
+    for field, limit in ARC_LIMITS.items():
         text = " ".join(str(answer.get(field, "")).split())
         if not text or len(text) > limit:
             raise write_quest.Rejected(f"arc {field} is missing or over {limit} characters")
@@ -725,7 +737,7 @@ def validate_arc(answer, book_names, level=None, enemies=None):
     for beat in beats:
         band = "".join(str(beat.get("level_band", "")).split()) if isinstance(beat, dict) else ""
         intent = " ".join(str(beat.get("intent", "")).split()) if isinstance(beat, dict) else ""
-        if not re.fullmatch(r"\d{1,2}-\d{1,2}", band) or not intent or len(intent) > 300:
+        if not re.fullmatch(r"\d{1,2}-\d{1,2}", band) or not intent or len(intent) > BEAT_LIMIT:
             raise write_quest.Rejected("each beat needs a level band like 6-9 and one sentence of intent")
         low, high = (int(part) for part in band.split("-"))
         if low > high or (level is not None and high > level + ARC_REACH):
@@ -822,8 +834,10 @@ def propose_arc(db, who, seed, say, chapter=None):
         if not seed and seeds_left(chapter):
             seed_index = chapter["current_seed"]
     message = arc_message(db, who, books, seed, chapter, dossier, seed_index)
-    answer, usage, record = room.write(db, "arc", message, ARC_TOOL, DRAFT_OMITS["arc"])
-    arc = validate_arc(answer, [book["name"] for book in books], who["level"], enemies)
+    names = [book["name"] for book in books]
+    answer, usage, record = room.write(db, "arc", message, ARC_TOOL, DRAFT_OMITS["arc"],
+                                       check=lambda found: validate_arc(found, names, who["level"], enemies))
+    arc = validate_arc(answer, names, who["level"], enemies)
     arc["room"] = record
     arc["seed"] = seed or ""
     arc["chapter"] = chapter["id"] if chapter else None
@@ -896,7 +910,7 @@ def validate_reveals(reveals, first, last, fewest, most):
 def validate_campaign(answer, level):
     """Check the model's campaign and return it in stored form. Raises write_quest.Rejected."""
     campaign = {}
-    for field, limit in (("premise", 500), ("question", 200), ("stake", 300)):
+    for field, limit in CAMPAIGN_LIMITS.items():
         text = " ".join(str(answer.get(field, "")).split())
         if not text or len(text) > limit:
             raise write_quest.Rejected(f"campaign {field} is missing or over {limit} characters")
@@ -1009,7 +1023,8 @@ def propose_campaign(db, who, seed, say):
     """Ask the model for a campaign and store it as a proposal. Returns the proposal number."""
     books = world_query.reward_items(who, reach=MAX_LEVEL, limit=40)
     answer, usage, record = room.write(db, "campaign", campaign_message(db, who, books, seed), CAMPAIGN_TOOL,
-                                       DRAFT_OMITS["campaign"], model=llm.plan_model())
+                                       DRAFT_OMITS["campaign"], model=llm.plan_model(),
+                                       check=lambda found: validate_campaign(found, who["level"]))
     campaign = validate_campaign(answer, who["level"])
     campaign["room"] = record
     campaign["seed"] = seed or ""
@@ -1251,8 +1266,8 @@ def chapter_message(db, who, dossier):
 def validate_chapter(answer, dossier):
     """Check the model's chapter against the zone's dossier and return it in stored form. Raises write_quest.Rejected."""
     chapter = {"zone": dossier["zone"], "side": dossier["side"]}
-    for field, limit, needed in (("premise", 600, True), ("adversary", 120, True), ("finale", 300, True),
-                                 ("hooks", 300, False)):
+    for field, limit in CHAPTER_LIMITS.items():
+        needed = field != "hooks"
         text = " ".join(str(answer.get(field, "") or "").split())
         if (needed and not text) or len(text) > limit:
             raise write_quest.Rejected(f"chapter {field} is missing or over {limit} characters")
@@ -1285,7 +1300,8 @@ def validate_chapter(answer, dossier):
 def propose_chapter(db, who, dossier, say):
     """Ask the model for a chapter in the zone this character has settled in. Returns the proposal number."""
     answer, usage, record = room.write(db, "chapter", chapter_message(db, who, dossier), CHAPTER_TOOL,
-                                       DRAFT_OMITS["chapter"], model=llm.plan_model())
+                                       DRAFT_OMITS["chapter"], model=llm.plan_model(),
+                                       check=lambda found: validate_chapter(found, dossier))
     chapter = validate_chapter(answer, dossier)
     chapter["room"] = record
     db.execute("INSERT INTO proposals (ts, guid, name, type, payload, dm_note, model, tokens_in, tokens_out) "

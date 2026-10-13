@@ -29,8 +29,9 @@ validators in dm.py are the contract with state.db. A writer's tool is the
 stage's own, with the fields only the weaver decides taken out.
 
 A writer's draft is kept in state.db under a hash of everything that could
-change it: prompt, model, token limit, tool and message. When the weaver's
-answer is rejected, the next attempt with the same context calls only the
+change it: prompt, model, token limit, tool and message. When the stage's
+validator refuses the weaver's plan, the weaver is shown why and asked once
+more; if that fails too, the next attempt with the same context calls only the
 weaver. Drafts are kept for DRAFT_DAYS.
 
 Settings:
@@ -47,6 +48,7 @@ import os
 import sys
 
 import llm
+import write_quest
 
 STAGES = ("campaign", "chapter", "arc")
 DEFAULT_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "writers")
@@ -199,11 +201,31 @@ def clean_notes(notes, names):
     return found
 
 
-def write(db, stage, message, tool, omit=(), model=None):
+def weave(weaver, tool, message, model, check):
+    """The weaver's answer and its usage, asked a second time with the reason when check refuses the first."""
+    system = system_for(weaver, tool)
+    chosen = weaver.get("model") or model
+    answer, usage = llm.ask_for_tool_call(system, message, tool, max_tokens=weaver["max_tokens"], model=chosen)
+    if not check:
+        return answer, usage
+    try:
+        check(answer)
+        return answer, usage
+    except write_quest.Rejected as error:
+        retry = (message + "\n\nYou submitted this plan:\n\n" + fenced(answer)
+                 + f"\n\nIt was refused: {error}. Submit it again with that fixed, changing nothing else.")
+    again, more = llm.ask_for_tool_call(system, retry, tool, max_tokens=weaver["max_tokens"], model=chosen)
+    usage = dict(more, input_tokens=(usage.get("input_tokens") or 0) + (more.get("input_tokens") or 0),
+                 output_tokens=(usage.get("output_tokens") or 0) + (more.get("output_tokens") or 0))
+    return again, usage
+
+
+def write(db, stage, message, tool, omit=(), model=None, check=None):
     """Have the stage's room write a plan. Returns (answer, usage, record).
 
-    answer is the weaver's tool arguments, for the stage's own validator. usage totals the tokens
-    of every call made (a cached draft costs none) under the weaver's model. record is None when
+    answer is the weaver's tool arguments, for the stage's own validator. check, when given, is that
+    validator (raising write_quest.Rejected): a refused plan goes back to the weaver once, with the reason.
+    usage totals the tokens of every call made (a cached draft costs none) under the weaver's model. record is None when
     the weaver wrote alone; otherwise it holds the spine, the notes, each draft and each member's cost.
     Raises RoomError, or llm.LLMError when any call fails (drafts that did finish are kept).
     """
@@ -211,8 +233,7 @@ def write(db, stage, message, tool, omit=(), model=None):
     writers = room["writers"] if writers_on() else []
     weaver = room["weaver"]
     if not writers:
-        answer, usage = llm.ask_for_tool_call(system_for(weaver, tool), message, tool,
-                                              max_tokens=weaver["max_tokens"], model=weaver.get("model") or model)
+        answer, usage = weave(weaver, tool, message, model, check)
         return answer, usage, None
 
     drafting = draft_tool(stage, tool, omit)
@@ -260,8 +281,7 @@ def write(db, stage, message, tool, omit=(), model=None):
         parts.append(f"Draft from `{writer['name']}`, who {writer['stance']}:\n\n" + fenced(drafts[writer["name"]]))
     parts.append("Write the plan that will be played.")
     woven = weaver_tool(tool, names)
-    answer, usage = llm.ask_for_tool_call(system_for(weaver, woven), "\n\n".join(parts), woven,
-                                          max_tokens=weaver["max_tokens"], model=weaver.get("model") or model)
+    answer, usage = weave(weaver, woven, "\n\n".join(parts), model, check)
     members.append({"name": weaver["name"], "model": usage.get("model"),
                     "tokens_in": usage.get("input_tokens") or 0, "tokens_out": usage.get("output_tokens") or 0,
                     "cached": False})
